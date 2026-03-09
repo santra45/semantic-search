@@ -107,10 +107,12 @@ def validate_license_key(token: str, db: Session) -> dict:
 
     client_id  = payload.get("client_id")
     license_id = payload.get("license_id")
+    expires    = datetime.fromtimestamp(payload.get("exp")).isoformat()
 
     # Step 2 — check license is active in MySQL
     result = db.execute(text("""
-        SELECT lk.is_active, lk.expires_at,
+        SELECT lk.is_active, lk.expires_at, lk.product_limit,
+               lk.search_limit_per_month,
                c.is_active as client_active, c.name
         FROM license_keys lk
         JOIN clients c ON c.id = lk.client_id
@@ -135,9 +137,10 @@ def validate_license_key(token: str, db: Session) -> dict:
         "license_id":    license_id,
         "plan":          payload.get("plan"),
         "domain":        payload.get("domain"),
-        "product_limit": payload.get("product_limit"),
-        "search_limit":  payload.get("search_limit"),
-        "client_name":   result.name
+        "product_limit": result.product_limit,
+        "search_limit":  result.search_limit_per_month,
+        "client_name":   result.name,
+        "license_expires": expires
     }
 
 

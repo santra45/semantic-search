@@ -249,5 +249,5 @@ def status_check(
         "product_limit":   client["product_limit"],
         "search_limit":    client["search_limit"],
         "indexed_count":   indexed_count,
-        "license_expires": None   # add expiry field to JWT later
+        "license_expires": client["license_expires"]
     }
