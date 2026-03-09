@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List
 from sqlalchemy.orm import Session
 from backend.app.services.embedder import embed_document
-from backend.app.services.qdrant_service import upsert_product
+from backend.app.services.qdrant_service import upsert_product, get_client_product_count
 from backend.app.services.license_service import validate_license_key, increment_ingest_count
 from backend.app.services.database import get_db
 from backend.app.services.cache_service import invalidate_client_results
@@ -105,7 +105,6 @@ def sync_status(license_key: str, db: Session = Depends(get_db)):
     except ValueError as e:
         raise HTTPException(status_code=403, detail=str(e))
 
-    from app.services.qdrant_service import get_client_product_count
     count = get_client_product_count(license_data["client_id"])
 
     return {
