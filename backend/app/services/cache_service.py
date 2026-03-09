@@ -15,8 +15,9 @@ def make_key(prefix: str, text: str) -> str:
     """
     Hash the text so long queries don't become huge keys.
     'blue dress for a party' → 'search:client_A:a3f2b1...'
+    Uses SHA-256 for better collision resistance with minimal performance cost.
     """
-    text_hash = hashlib.md5(text.lower().strip().encode()).hexdigest()
+    text_hash = hashlib.sha256(text.lower().strip().encode()).hexdigest()
     return f"{prefix}:{text_hash}"
 
 
