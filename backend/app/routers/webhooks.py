@@ -23,22 +23,6 @@ def verify_signature(body: bytes, signature: str) -> bool:
     expected = base64.b64encode(mac.digest()).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
-
-async def parse_webhook_body(request: Request) -> tuple:
-    body         = await request.body()
-    content_type = request.headers.get("content-type", "")
-
-    if "application/json" not in content_type:
-        return body, None
-    if not body:
-        return body, None
-
-    try:
-        return body, json.loads(body)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
-
-
 def process_upsert(product: dict, action: str, client_id: str, db: Session) -> dict:
     """
     Shared logic for created + updated webhooks.
