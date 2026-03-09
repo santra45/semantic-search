@@ -59,8 +59,6 @@ def invalidate_client_results(client_id: str):
     Called when a product is added/updated/deleted via webhook
     so stale results don't get served.
     """
-    pattern = make_key(f"search:{client_id}", "*")
-
     # Scan for matching keys and delete them
     cursor = 0
     deleted = 0
@@ -72,5 +70,5 @@ def invalidate_client_results(client_id: str):
         if cursor == 0:
             break
 
-    print(f"🗑️  Cache: cleared {deleted} cached results for {client_id}")
+    print(f" Cache: cleared {deleted} cached results for {client_id}")
     return deleted
