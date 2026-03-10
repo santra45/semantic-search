@@ -4,3 +4,5 @@ __pycache__
 */__pycache__
 /chroma_db_cloud_2
 /chroma_db_local
+/.agents
+/.windsurf

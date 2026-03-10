@@ -15,11 +15,10 @@ from backend.app.services.database import get_db
 from backend.app.services.product_service import build_product_text, extract_payload  # ← import
 
 router    = APIRouter()
-WC_SECRET = os.getenv("WC_WEBHOOK_SECRET", "mysecretkey123")
 
 
-def verify_signature(body: bytes, signature: str) -> bool:
-    mac      = hmac.new(WC_SECRET.encode("utf-8"), body, hashlib.sha256)
+def verify_signature(body: bytes, signature: str, secret: str) -> bool:
+    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256)
     expected = base64.b64encode(mac.digest()).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
@@ -84,7 +83,8 @@ async def product_created(
 ):
      # Verify client exists and is active
     client = db.execute(text("""
-        SELECT id FROM clients
+        SELECT id, webhook_secret
+        FROM clients
         WHERE id = :client_id AND is_active = 1
     """), {"client_id": client_id}).fetchone()
 
@@ -102,7 +102,12 @@ async def product_created(
         raise HTTPException(status_code=401, detail="Webhook signature header missing")
 
     # Verify webhook signature - REQUIRED for security
-    if not verify_signature(body, x_wc_webhook_signature):
+    secret = client.webhook_secret
+
+    if not secret:
+        raise HTTPException(status_code=500, detail="Webhook secret not registered")
+
+    if not verify_signature(body, x_wc_webhook_signature, secret):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     try:
@@ -126,7 +131,8 @@ async def product_updated(
 ):
     # Verify client exists and is active
     client = db.execute(text("""
-        SELECT id FROM clients
+        SELECT id, webhook_secret
+        FROM clients
         WHERE id = :client_id AND is_active = 1
     """), {"client_id": client_id}).fetchone()
 
@@ -143,7 +149,12 @@ async def product_updated(
         raise HTTPException(status_code=401, detail="Webhook signature header missing")
 
     # Verify webhook signature - REQUIRED for security
-    if not verify_signature(body, x_wc_webhook_signature):
+    secret = client.webhook_secret
+
+    if not secret:
+        raise HTTPException(status_code=500, detail="Webhook secret not registered")
+
+    if not verify_signature(body, x_wc_webhook_signature, secret):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     try:
@@ -167,7 +178,8 @@ async def product_deleted(
 ):
     # Verify client exists and is active
     client = db.execute(text("""
-        SELECT id FROM clients
+        SELECT id, webhook_secret
+        FROM clients
         WHERE id = :client_id AND is_active = 1
     """), {"client_id": client_id}).fetchone()
 
@@ -184,7 +196,12 @@ async def product_deleted(
         raise HTTPException(status_code=401, detail="Webhook signature header missing")
 
     # Verify webhook signature - REQUIRED for security
-    if not verify_signature(body, x_wc_webhook_signature):
+    secret = client.webhook_secret
+
+    if not secret:
+        raise HTTPException(status_code=500, detail="Webhook secret not registered")
+
+    if not verify_signature(body, x_wc_webhook_signature, secret):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     product_id = str(product.get("id", ""))

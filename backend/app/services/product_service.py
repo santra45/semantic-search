@@ -1,5 +1,6 @@
 import re
 from typing import Any
+import html
 
 
 # ─── HTML ──────────────────────────────────────────────────────────────────────
@@ -177,10 +178,16 @@ def build_product_text(p: dict) -> str:
         parts.append(f"Description: {desc}")
 
     # ── 7. Price (useful for price-based queries) ──────────────────────────
-    price = str(p.get("price", "")).strip()
-    symbol = p.get("currency_symbol", "")
-    if price and price != "0":
-        parts.append(f"Price: {symbol}{price}")
+    price = float(p.get("price", 0))
+
+    if price > 0:
+        if price.is_integer():
+            price_str = str(int(price))
+        else:
+            price_str = str(price)
+
+        currency_symbol = html.unescape(p.get("currency_symbol", ""))
+        parts.append(f"Price: {currency_symbol}{price_str}")
 
     return "\n".join(parts)
 
