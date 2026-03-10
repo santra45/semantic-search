@@ -80,7 +80,7 @@ async def product_created(
     request: Request,
     client_id: str = Query(...),   # ← reads ?client_id= from URL
     db: Session = Depends(get_db),
-    x_wc_webhook_signature: str = Header(..., description="WooCommerce webhook signature")
+    x_wc_webhook_signature: Optional[str] = Header(None)
 ):
      # Verify client exists and is active
     client = db.execute(text("""
@@ -96,6 +96,10 @@ async def product_created(
     # Ping request — just acknowledge
     if product is None:
         return {"status": "ok", "reason": "ping"}
+    
+    # Webhook signature is required for security
+    if not x_wc_webhook_signature:
+        raise HTTPException(status_code=401, detail="Webhook signature header missing")
 
     # Verify webhook signature - REQUIRED for security
     if not verify_signature(body, x_wc_webhook_signature):
@@ -118,7 +122,7 @@ async def product_updated(
     request: Request,
     client_id: str = Query(...),   # ← reads ?client_id= from URL
     db: Session = Depends(get_db),
-    x_wc_webhook_signature: str = Header(..., description="WooCommerce webhook signature")
+    x_wc_webhook_signature: Optional[str] = Header(None)
 ):
     # Verify client exists and is active
     client = db.execute(text("""
@@ -133,6 +137,10 @@ async def product_updated(
 
     if product is None:
         return {"status": "ok", "reason": "ping"}
+    
+    # Webhook signature is required for security
+    if not x_wc_webhook_signature:
+        raise HTTPException(status_code=401, detail="Webhook signature header missing")
 
     # Verify webhook signature - REQUIRED for security
     if not verify_signature(body, x_wc_webhook_signature):
@@ -155,7 +163,7 @@ async def product_deleted(
     request: Request,
     client_id: str = Query(...),   # ← reads ?client_id= from URL
     db: Session = Depends(get_db),
-    x_wc_webhook_signature: str = Header(..., description="WooCommerce webhook signature")
+    x_wc_webhook_signature: Optional[str] = Header(None)
 ):
     # Verify client exists and is active
     client = db.execute(text("""
@@ -170,6 +178,10 @@ async def product_deleted(
 
     if product is None:
         return {"status": "ok", "reason": "ping"}
+    
+    # Webhook signature is required for security
+    if not x_wc_webhook_signature:
+        raise HTTPException(status_code=401, detail="Webhook signature header missing")
 
     # Verify webhook signature - REQUIRED for security
     if not verify_signature(body, x_wc_webhook_signature):
