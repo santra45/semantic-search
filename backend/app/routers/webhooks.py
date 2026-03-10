@@ -3,6 +3,7 @@ import hashlib
 import base64
 import os
 import json
+import anyio
 from fastapi import APIRouter, Request, HTTPException, Header, Query, Depends
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -75,7 +76,7 @@ async def parse_webhook_body(request: Request) -> tuple:
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.post("/webhook/product-created")
-async def product_created(
+def product_created(
     request: Request,
     client_id: str = Query(...),   # ← reads ?client_id= from URL
     db: Session = Depends(get_db),
@@ -91,7 +92,7 @@ async def product_created(
     if not client:
         raise HTTPException(status_code=403, detail="Invalid client")
     
-    body, product = await parse_webhook_body(request)
+    body, product = anyio.from_thread.run(parse_webhook_body, request)
 
     # Ping request — just acknowledge
     if product is None:
@@ -123,7 +124,7 @@ async def product_created(
 
 
 @router.post("/webhook/product-updated")
-async def product_updated(
+def product_updated(
     request: Request,
     client_id: str = Query(...),   # ← reads ?client_id= from URL
     db: Session = Depends(get_db),
@@ -139,7 +140,7 @@ async def product_updated(
     if not client:
         raise HTTPException(status_code=403, detail="Invalid client")
     
-    body, product = await parse_webhook_body(request)
+    body, product = anyio.from_thread.run(parse_webhook_body, request)
 
     if product is None:
         return {"status": "ok", "reason": "ping"}
@@ -170,7 +171,7 @@ async def product_updated(
 
 
 @router.post("/webhook/product-deleted")
-async def product_deleted(
+def product_deleted(
     request: Request,
     client_id: str = Query(...),   # ← reads ?client_id= from URL
     db: Session = Depends(get_db),
@@ -186,7 +187,7 @@ async def product_deleted(
     if not client:
         raise HTTPException(status_code=403, detail="Invalid client")
     
-    body, product = await parse_webhook_body(request)
+    body, product = anyio.from_thread.run(parse_webhook_body, request)
 
     if product is None:
         return {"status": "ok", "reason": "ping"}
