@@ -5,6 +5,8 @@ from backend.app.services.embedder import embed_query
 from backend.app.services.qdrant_service import search_products
 from backend.app.services.cache_service import (get_cached_embedding, set_cached_embedding,
     get_cached_results,   set_cached_results)
+from backend.app.services.wordpress_service import search_wordpress_fallback, should_trigger_fallback
+from backend.app.services.intent_service import analyze_intent
 import time
 from backend.app.services.license_service import (
     validate_license_key,
@@ -24,7 +26,7 @@ class SearchRequest(BaseModel):
 
 
 @router.post("/search")
-def search(req: SearchRequest, request: Request, db: Session = Depends(get_db)):
+async def search(req: SearchRequest, request: Request, db: Session = Depends(get_db)):
     start_time = time.time()
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
@@ -74,17 +76,50 @@ def search(req: SearchRequest, request: Request, db: Session = Depends(get_db)):
             "results": cached_results
         }
 
+    # ─── NEW: INTENT ANALYSIS ───────────────────────────────────────────────
+    # We do this BEFORE embedding because we need to know IF we need filters.
+    # Note: You might want to cache this too if Gemini gets expensive/slow.
+    intent = analyze_intent(query)
+    print(f"🧠 Intent Extracted: {intent.clean_query} | Max: {intent.max_price}")
+    # ────────────────────────────────────────────────────────────────────────
+
     # Step 4 — check embedding cache
-    query_vector = get_cached_embedding(query)
+    query_vector = get_cached_embedding(intent.clean_query)
     if query_vector is not None:
-        print(f"⚡ Cache HIT (embedding): '{query}'")
+        print(f"⚡ Cache HIT (embedding): '{intent.clean_query}'")
     else:
-        print(f"🌐 Cache MISS: '{query}' — calling Gemini")
-        query_vector = embed_query(req.query)
+        print(f"🌐 Cache MISS: '{intent.clean_query}' — calling Gemini")
+        query_vector = embed_query(intent.clean_query)
         set_cached_embedding(query, query_vector)
 
     # Step 5 — search Qdrant
-    results = search_products(client_id, query_vector, req.limit)
+    results = results = search_products(
+        client_id=client_id,
+        query_vector=query_vector,
+        limit=req.limit,
+        min_price=intent.min_price,
+        max_price=intent.max_price,
+        only_in_stock=intent.only_in_stock
+    )
+
+    # Step 5a — check if fallback should be triggered
+    if should_trigger_fallback(results):
+        print(f"🔄 Triggering WordPress fallback for query: '{query}' (max score: {max(r['score'] for r in results) if results else 0})")
+        
+        # Try WordPress fallback search
+        fallback_results = await search_wordpress_fallback(
+            client_id=client_id,
+            query=req.query,
+            license_key=req.license_key,
+            limit=req.limit
+        )
+        
+        if fallback_results:
+            print(f"✅ WordPress fallback returned {len(fallback_results)} results")
+            results = fallback_results
+        else:
+            print(f"❌ WordPress fallback returned no results, using empty result set")
+            results = []
 
     # Step 6 — cache results
     set_cached_results(client_id, query, results)
