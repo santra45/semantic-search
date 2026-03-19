@@ -232,6 +232,43 @@ def log_search(
     db.commit()
 
 
+# ─── License Lookup ────────────────────────────────────────────────────────────
+
+def get_client_license(db: Session, client_id: str) -> dict:
+    """
+    Get active license data for a client by client_id.
+    Raises ValueError if no active license found.
+    """
+    result = db.execute(text("""
+        SELECT lk.id, lk.is_active, lk.expires_at, lk.product_limit,
+               lk.search_limit_per_month, lk.allowed_domain,
+               c.name as client_name
+        FROM license_keys lk
+        JOIN clients c ON c.id = lk.client_id
+        WHERE lk.client_id = :client_id
+        AND   lk.is_active = 1
+        AND   c.is_active = 1
+        ORDER BY lk.expires_at DESC
+        LIMIT 1
+    """), {"client_id": client_id}).fetchone()
+
+    if not result:
+        raise ValueError("No active license found for client")
+
+    if result.expires_at and result.expires_at < datetime.utcnow():
+        raise ValueError("License has expired")
+
+    return {
+        "license_id": result.id,
+        "client_id": client_id,
+        "client_name": result.client_name,
+        "domain": result.allowed_domain,
+        "product_limit": result.product_limit,
+        "search_limit": result.search_limit_per_month,
+        "license_expires": result.expires_at.isoformat() if result.expires_at else None
+    }
+
+
 # ─── Ingest Logging ────────────────────────────────────────────────────────────
 
 def increment_ingest_count(db: Session, client_id: str, count: int = 1):

@@ -9,9 +9,9 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from backend.app.services.embedder import embed_document
-from backend.app.services.qdrant_service import upsert_product, delete_product
+from backend.app.services.qdrant_service import upsert_product, delete_product, get_client_product_count
 from backend.app.services.cache_service import invalidate_client_results
-from backend.app.services.license_service import increment_ingest_count
+from backend.app.services.license_service import increment_ingest_count, validate_license_key, get_client_license
 from backend.app.services.database import get_db
 from backend.app.services.product_service import build_product_text, extract_payload  # ← import
 
@@ -38,6 +38,22 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session) -> d
         invalidate_client_results(client_id)
         print(f"🗑️  Webhook [{action}]: removed product {product_id}")
         return {"status": "removed", "product_id": product_id}
+
+    # CRITICAL: Check product limit before indexing
+    try:
+        license_data = get_client_license(db, client_id)
+        current_count = get_client_product_count(client_id)
+        
+        # For updates, check if we're adding a new product or updating existing
+        # If product doesn't exist in vector store, count it as new
+        if current_count >= license_data["product_limit"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Product limit exceeded. Current: {current_count}, Limit: {license_data['product_limit']}"
+            )
+    except ValueError as e:
+        # License validation failed
+        raise HTTPException(status_code=403, detail=str(e))
 
     # Uses product_service — raw WooCommerce format with nested categories/tags/attributes
     text    = build_product_text(product)
@@ -118,6 +134,9 @@ def product_created(
             client_id=client_id,
             db=db
         )
+    except HTTPException as e:
+        # Re-raise HTTPExceptions to preserve status codes
+        raise e
     except Exception as e:
         print(f"❌ Webhook [created] error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -165,6 +184,9 @@ def product_updated(
             client_id=client_id,
             db=db
         )
+    except HTTPException as e:
+        # Re-raise HTTPExceptions to preserve status codes
+        raise e
     except Exception as e:
         print(f"❌ Webhook [updated] error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

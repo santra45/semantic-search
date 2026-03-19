@@ -72,6 +72,17 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
                 detail=f"Domain not authorized. License valid for: {allowed_domain}"
             )
     
+    # CRITICAL: Check total indexed count + incoming count against plan limit
+    current_count = get_client_product_count(client_id)
+    incoming_count = len(req.products)
+    total_after_ingest = current_count + incoming_count
+    
+    if total_after_ingest > license_data["product_limit"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Product limit exceeded. Current: {current_count}, Incoming: {incoming_count}, Limit: {license_data['product_limit']}"
+        )
+    
     success_ids = []
     failed_ids  = []
 
