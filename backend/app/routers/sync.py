@@ -85,8 +85,8 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
             # product_service handles flat string format from plugin
             text    = build_product_text(p)
 
-            if len(success_ids) > 0:
-                time.sleep(0.5)
+            # if len(success_ids) > 0:
+            #     time.sleep(0.5)
 
             vector  = embed_document(text)
             payload = extract_payload(p)

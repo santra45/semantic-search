@@ -6,9 +6,9 @@ load_dotenv()
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
 QDRANT_HOST     = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT     = int(os.getenv("QDRANT_PORT", 6333))
-QDRANT_COLL     = os.getenv("QDRANT_COLLECTION", "local_shared_products_BGE")
+# QDRANT_COLL removed — each client now has its own collection: products_{client_id}
 EMBED_MODEL     = "gemini-embedding-001"
-EMBED_DIM       = 3072
+EMBED_DIM       = 768
 
 # WordPress fallback configuration
 WORDPRESS_API_URL = os.getenv("WC_LOCAL_URL")
