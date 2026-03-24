@@ -8,6 +8,21 @@ qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny, Range
 
+def product_exists(client_id: str, product_id: str) -> bool:
+    point_uuid = str(uuid.uuid5(
+        uuid.NAMESPACE_DNS,
+        f"{client_id}-{product_id}"
+    ))
+
+    result = qdrant.retrieve(
+        collection_name=QDRANT_COLL,
+        ids=[point_uuid],
+        with_payload=False,
+        with_vectors=False
+    )
+
+    return len(result) > 0
+
 def search_products(
     client_id: str, 
     query_vector: list, 

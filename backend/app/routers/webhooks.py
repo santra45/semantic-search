@@ -9,7 +9,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from backend.app.services.embedder import embed_document
-from backend.app.services.qdrant_service import upsert_product, delete_product, get_client_product_count
+from backend.app.services.qdrant_service import upsert_product, delete_product, get_client_product_count, product_exists
 from backend.app.services.cache_service import invalidate_client_results
 from backend.app.services.license_service import increment_ingest_count, validate_license_key, get_client_license
 from backend.app.services.database import get_db
@@ -43,14 +43,22 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session) -> d
     try:
         license_data = get_client_license(db, client_id)
         current_count = get_client_product_count(client_id)
-        
-        # For updates, check if we're adding a new product or updating existing
-        # If product doesn't exist in vector store, count it as new
-        if current_count >= license_data["product_limit"]:
+
+        exists = product_exists(client_id, product_id)
+
+        # Only block NEW products
+        if not exists and current_count >= license_data["product_limit"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"Product limit exceeded. Current: {current_count}, Limit: {license_data['product_limit']}"
             )
+        # For updates, check if we're adding a new product or updating existing
+        # If product doesn't exist in vector store, count it as new
+        # if current_count >= license_data["product_limit"]:
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=f"Product limit exceeded. Current: {current_count}, Limit: {license_data['product_limit']}"
+        #     )
     except ValueError as e:
         # License validation failed
         raise HTTPException(status_code=403, detail=str(e))
@@ -63,7 +71,8 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session) -> d
 
     upsert_product(client_id, product_id, vector, payload)
     invalidate_client_results(client_id)
-    increment_ingest_count(db, client_id, count=1)
+    if not exists:
+        increment_ingest_count(db, client_id, count=1)
     print(f"✅ Webhook [{action}]: indexed {product_id} - {product.get('name')}")
 
     return {"status": action, "product_id": product_id}
