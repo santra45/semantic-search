@@ -1,108 +1,146 @@
 import json
+import time
+import re
 from typing import List, Dict, Optional
+
 from google import genai
-from backend.app.config import GEMINI_API_KEY
-import os
+from openai import OpenAI
+import anthropic
 
-# Configure Gemini
-client = genai.Client(api_key=GEMINI_API_KEY)
+def extract_json_array(text: str):
+    start = text.find('[')
+    end = text.rfind(']')
+    if start != -1 and end != -1 and end > start:
+        return text[start:end+1]
+    return None
 
-def llm_rerank_products(query: str, products: List[Dict], limit: int = 10) -> List[Dict]:
-    """
-    Uses LLM to re-rank products based on relevance to the customer query.
-    Only returns products that are genuinely relevant to the query.
-    """
-    
-    if not products or not GEMINI_API_KEY:
-        return products[:limit] if products else []
-    
-    # Prepare product summaries for LLM analysis
+def llm_rerank_products(
+    query: str,
+    products: List[Dict],
+    limit: int = 10,
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
+    llm_api_key: Optional[str] = None,
+) -> List[Dict]:
+
+    provider = llm_provider or "gemini"
+
+    if provider == "gemini":
+        model = llm_model or "gemini-1.5-flash"
+    elif provider == "openai":
+        model = llm_model or "gpt-4o-mini"
+    elif provider == "anthropic":
+        model = llm_model or "claude-3-5-haiku-20241022"
+    else:
+        model = llm_model or "gemini-1.5-flash"
+
+    api_key = llm_api_key
+
+    if not products:
+        return []
+
+    if not api_key:
+        return products[:limit]
+
     product_summaries = []
     product_map = {}
+
     for product in products[:25]:
         p_id = str(product.get("product_id") or product.get("id"))
-        if not p_id: continue
-        
+        if not p_id:
+            continue
+
         summary = {
             "id": p_id,
             "name": product.get("name", ""),
             "category": product.get("categories", ""),
             "price": product.get("price", 0),
         }
+
         product_summaries.append(summary)
         product_map[p_id] = product
-    
-    # Create the LLM prompt
+
     prompt = f"""
-    You are an expert e-commerce product recommendation assistant. Your task is to analyze customer queries and product data to determine which products are genuinely relevant.
-    Customer search query:
+    You are an expert e-commerce product recommendation assistant.
+
+    Customer query:
     {query}
 
     Products:
     {json.dumps(product_summaries)}
 
     Task:
-    Select products that clearly match the customer's search intent.
+    - Select ONLY relevant products
+    - Ignore wrong category/gender
+    - Prefer exact matches over partial
+    - Rank by relevance (best first)
 
-    Rules:
-    - Ignore products with wrong gender or category
-    - Ignore loosely related products
-    - If none match, return []
-
-   Return ONLY a JSON array of product IDs. Example: ["123", "456"] or []
+    Return ONLY JSON array of product IDs.
+    Example: ["123", "456"] or []
     """
 
     try:
-        # Call Gemini API
-        model_id = "gemma-3-27b-it"
-        response = client.models.generate_content(model=model_id, contents=prompt)
-        
-        # Parse the response
-        response_text = response.text.strip()
-        
-        # Try to extract JSON array from response
-        if "[" in response_text and "]" in response_text:
-            json_start = response_text.find("[")
-            json_end = response_text.rfind("]") + 1
-            relevant_ids = json.loads(response_text[json_start:json_end])
-            
-            # Validate indices and get corresponding products
+        if provider == "gemini":
+            gemini_client = genai.Client(api_key=api_key)
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            response_text = response.text.strip()
+
+        elif provider == "openai":
+            openai_client = OpenAI(api_key=api_key)
+            response = openai_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            response_text = response.choices[0].message.content.strip()
+
+        elif provider == "anthropic":
+            anthropic_client = anthropic.Anthropic(api_key=api_key)
+            response = anthropic_client.messages.create(
+                model=model,
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            response_text = response.content[0].text.strip()
+
+        else:
+            return products[:limit]
+
+        json_text = extract_json_array(response_text)
+
+        if json_text:
+            relevant_ids = json.loads(json_text)
             relevant_products = []
             for p_id in relevant_ids:
                 p_id_str = str(p_id)
                 if p_id_str in product_map:
                     relevant_products.append(product_map[p_id_str])
-            
-            # Apply original limit
+
             if relevant_products:
                 return relevant_products[:limit]
-        
+
         return []
-        
-    except Exception as e:
-        print(f"LLM re-ranking error: {e}")
-        # Fallback to original order if LLM fails
+
+    except Exception:
         return products[:limit]
 
+
 def should_use_llm_reranking(query: str, products: List[Dict]) -> bool:
-    """
-    Determines if LLM re-ranking should be applied based on query complexity and result quality.
-    """
-    
-    # Don't use LLM for very simple queries
     simple_indicators = ["shirt", "pants", "dress", "shoes", "bag", "watch"]
     query_lower = query.lower()
-    
+
     if any(indicator in query_lower for indicator in simple_indicators) and len(query.split()) <= 2:
         return False
-    
-    # Use LLM for complex queries or when we have many results
+
     if len(products) > 5 or len(query.split()) > 3:
         return True
-    
-    # Use LLM for queries with specific requirements
+
     complex_indicators = ["for", "with", "that", "which", "under", "over", "between", "size", "color", "material"]
+
     if any(indicator in query_lower for indicator in complex_indicators):
         return True
-    
+
     return False
