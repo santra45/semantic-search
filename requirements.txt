@@ -12,12 +12,17 @@ pymysql==1.1.0
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
+crypto
+pycrypto
+pycryptodome
 
 # Vector Database & Search
 qdrant-client==1.6.4
 
 # AI / Embeddings
-google-generativeai==0.3.2
+google-genai
+openai
+anthropic
 
 # Data Validation
 pydantic==2.5.0
@@ -37,3 +42,4 @@ pytest==7.4.3
 pytest-asyncio==0.21.1
 black==23.11.0
 flake8==6.1.0
+pydantic[email]
