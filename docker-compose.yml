@@ -18,8 +18,8 @@ services:
     networks:
       - backend
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
-      interval: 30s
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 120s
       timeout: 10s
       retries: 5
     logging:
@@ -31,7 +31,7 @@ services:
       - .:/app
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.17.1
     container_name: qdrant
     volumes:
       - qdrant_data:/qdrant/storage
@@ -41,8 +41,8 @@ services:
     expose:
       - "6333"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/collections"]
-      interval: 30s
+      test: ["CMD", "./qdrant", "--healthcheck"]
+      interval: 120s
       timeout: 10s
       retries: 5
     logging:
@@ -64,7 +64,7 @@ services:
       - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
+      interval: 120s
       timeout: 5s
       retries: 5
     logging:
@@ -88,7 +88,7 @@ services:
       - "3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 30s
+      interval: 120s
       timeout: 10s
       retries: 5
     logging:
