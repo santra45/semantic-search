@@ -268,7 +268,7 @@ def get_client_license(db: Session, client_id: str) -> dict:
     Raises ValueError if no active license found.
     """
     result = db.execute(text("""
-        SELECT lk.id, lk.is_active, lk.expires_at, lk.product_limit,
+        SELECT lk.id, lk.license_key, lk.is_active, lk.expires_at, lk.product_limit,
                lk.search_limit_per_month, lk.allowed_domain,
                c.name as client_name
         FROM license_keys lk
@@ -289,6 +289,7 @@ def get_client_license(db: Session, client_id: str) -> dict:
     return {
         "license_id": result.id,
         "client_id": client_id,
+        "license_key": result.license_key,
         "client_name": result.client_name,
         "domain": result.allowed_domain,
         "product_limit": result.product_limit,
