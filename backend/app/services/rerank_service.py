@@ -417,4 +417,4 @@ def filter_and_rerank(results: list, keywords: dict, original_limit: int) -> lis
 
     # ── Sort by final score, return up to original_limit ─────────────────────
     passed.sort(key=lambda r: r.get("score", 0), reverse=True)
-    return passed[:original_limit]
+    return passed[:25]

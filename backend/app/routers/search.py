@@ -104,11 +104,11 @@ async def search(req: SearchRequest, request: Request, db: Session = Depends(get
     # ────────────────────────────────────────────────────────────────────────
 
     # Step 4 — check embedding cache
-    query_vector = get_cached_embedding(clean_query)
+    query_vector = get_cached_embedding(query)
     if query_vector is not None:
-        print(f"⚡ Cache HIT (embedding): '{clean_query}'")
+        print(f"⚡ Cache HIT (embedding): '{query}'")
     else:
-        print(f"🌐 Cache MISS: '{clean_query}' — calling Gemini")
+        print(f"🌐 Cache MISS: '{query}' — calling Gemini")
         
         # Decrypt embedding API key if provided
         if req.llm_api_key_encrypted:
@@ -121,7 +121,7 @@ async def search(req: SearchRequest, request: Request, db: Session = Depends(get
             print(f"Embedding API key not provided, using default")
             embedding_api_key = None
             
-        query_vector = embed_query(clean_query, embedding_api_key)
+        query_vector = embed_query(query, embedding_api_key)
         set_cached_embedding(query, query_vector)
 
     # Step 5 — search Qdrant
