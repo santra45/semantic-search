@@ -133,6 +133,40 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
     )
 
 
+@router.post("/sync/cancel")
+def cancel_sync(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    license_key: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    token = extract_license_key_from_authorization(authorization) or license_key
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    try:
+        license_data = validate_license_key(token, db)
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+    # CRITICAL: Enforce secure domain authorization
+    authorizer = DomainAuthorizer(db)
+    authorizer.validate_request(request, license_data)
+    
+    # In a real implementation, you might want to:
+    # 1. Set a flag in database/cache to indicate cancellation
+    # 2. Signal any running batch processes to stop
+    # 3. Clean up any temporary state
+    
+    # For now, we'll just return success since the WordPress plugin
+    # handles the actual cancellation by updating its local state
+    
+    return {
+        "success": True,
+        "message": "Sync cancellation request received"
+    }
+
+
 @router.get("/sync/status")
 def sync_status(
     request: Request,
