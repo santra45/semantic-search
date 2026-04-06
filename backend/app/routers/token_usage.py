@@ -410,12 +410,15 @@ def get_my_hourly_usage(
         sql = text(f"""
         SELECT 
             DATE_FORMAT(created_at, '%Y-%m-%d %H:00:00') as hour,
+            llm_provider,
+            llm_model,
+            query_type,
             COUNT(*) as request_count,
             SUM(total_tokens) as total_tokens,
             SUM(total_cost) as total_cost
         FROM token_usage_tracking
         {where_clause}
-        GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d %H:00:00')
+        GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d %H:00:00'), llm_provider, llm_model, query_type
         ORDER BY hour ASC
         """)
 
@@ -425,6 +428,9 @@ def get_my_hourly_usage(
         for row in rows:
             hourly_data.append({
                 "hour": row.hour,
+                "llm_provider": row.llm_provider,
+                "llm_model": row.llm_model,
+                "query_type": row.query_type,
                 "request_count": row.request_count,
                 "total_tokens": row.total_tokens,
                 "total_cost": float(row.total_cost or 0),
