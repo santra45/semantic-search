@@ -17,7 +17,7 @@ pycrypto
 pycryptodome
 
 # Vector Database & Search
-qdrant-client==1.6.4
+qdrant-client==1.17.0
 
 # AI / Embeddings
 google-genai
