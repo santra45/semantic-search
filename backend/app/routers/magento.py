@@ -296,6 +296,39 @@ def magento_sync_batch(
     }
 
 
+@router.get("/magento/sync/quota")
+def magento_sync_quota(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    db: Session = Depends(get_db)
+):
+    headers = resolve_headers(authorization, x_api_key, None, None, None)
+    if not headers["license_key"]:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    try:
+        license_data = validate_license_key(headers["license_key"], db)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    client_id = license_data["client_id"]
+    domain = license_data["domain"]
+
+    authorizer = DomainAuthorizer(db)
+    authorizer.validate_request(request, license_data, api_key=headers["api_key"])
+
+    current_count = get_client_product_count(client_id, domain)
+    product_limit = license_data["product_limit"]
+
+    return {
+        "current_count": current_count,
+        "product_limit": product_limit,
+        "remaining": product_limit - current_count,
+        "exceeded": current_count > product_limit
+    }
+
+
 @router.post("/magento/sync/delete")
 def magento_sync_delete(
     req: MagentoDeleteRequest,
