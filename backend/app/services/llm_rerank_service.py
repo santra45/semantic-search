@@ -222,9 +222,9 @@ def estimate_cost(model: str, usage: Dict) -> float:
 # ---------------------------
 # Main Function
 # ---------------------------
-def llm_rerank_products(
+def llm_rerank_content(
     query: str,
-    products: List[Dict],
+    content: List[Dict],
     limit: int = 10,
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
@@ -245,48 +245,83 @@ def llm_rerank_products(
 
     api_key = llm_api_key
 
-    if not products:
+    if not content:
         return []
 
     if not api_key:
-        logger.warning("⚠️ No API key provided. Returning top products without reranking.")
-        return products[:limit]
+        logger.warning("⚠️ No API key provided. Returning top results without reranking.")
+        return content[:limit]
 
-    product_summaries = []
-    product_map = {}
+    content_summaries = []
+    content_map = {}
 
-    for product in products[:25]:
-        p_id = str(product.get("product_id") or product.get("id"))
-        if not p_id:
+    # Process mixed content types (products, pages, posts)
+    for item in content[:25]:
+        content_type = item.get("content_type", "product")
+        
+        # Generate unique ID based on content type
+        if content_type == "product":
+            item_id = str(item.get("product_id") or item.get("id"))
+        elif content_type == "page":
+            item_id = f"page_{item.get('page_id')}"
+        elif content_type == "post":
+            item_id = f"post_{item.get('post_id')}"
+        else:
+            continue
+        
+        if not item_id:
             continue
 
-        summary = {
-            "id": p_id,
-            "name": product.get("name", ""),
-            "category": product.get("categories", ""),
-            "price": product.get("price", 0),
-        }
+        # Build summary based on content type
+        if content_type == "product":
+            summary = {
+                "id": item_id,
+                "type": "product",
+                "name": item.get("name", ""),
+                "category": item.get("categories", ""),
+                "price": item.get("price", 0),
+            }
+        elif content_type == "page":
+            summary = {
+                "id": item_id,
+                "type": "page",
+                "title": item.get("title", ""),
+                "excerpt": item.get("excerpt", "")[:200],  # Truncate excerpt
+            }
+        elif content_type == "post":
+            summary = {
+                "id": item_id,
+                "type": "post",
+                "title": item.get("title", ""),
+                "excerpt": item.get("excerpt", "")[:200],
+                "categories": item.get("categories", ""),
+                "tags": item.get("tags", ""),
+            }
+        else:
+            continue
 
-        product_summaries.append(summary)
-        product_map[p_id] = product
+        content_summaries.append(summary)
+        content_map[item_id] = item
 
     prompt = f"""
-    You are an expert e-commerce product recommendation assistant.
+    You are an expert content recommendation assistant for an e-commerce website.
 
     Customer query:
     {query}
 
-    Products:
-    {json.dumps(product_summaries)}
+    Available content (products, pages, blog posts):
+    {json.dumps(content_summaries)}
 
     Task:
-    - Select ONLY relevant products
-    - Ignore wrong category/gender
+    - Select ONLY relevant content (products, pages, or posts)
+    - For products: ignore wrong category/gender
+    - For pages/posts: match the topic/theme of the query
     - Prefer exact matches over partial
     - Rank by relevance (best first)
+    - Include a mix of content types if relevant
 
-    Return ONLY JSON array of product IDs.
-    Example: ["123", "456"] or []
+    Return ONLY JSON array of content IDs.
+    Example: ["123", "page_456", "post_789"] or []
     """
 
     try:
@@ -337,7 +372,7 @@ def llm_rerank_products(
             response_text = response.content[0].text.strip()
 
         else:
-            return products[:limit]
+            return content[:limit]
 
         # ---------------------------
         # TOKEN USAGE & COST
@@ -352,7 +387,7 @@ def llm_rerank_products(
         try:
             track_usage(
                 client_id=client_id,
-                query_type="product_rerank",
+                query_type="content_rerank",
                 llm_provider=provider,
                 llm_model=model,
                 input_tokens=usage["input"],
@@ -372,34 +407,34 @@ def llm_rerank_products(
 
         if json_text:
             relevant_ids = json.loads(json_text)
-            relevant_products = []
-            for p_id in relevant_ids:
-                p_id_str = str(p_id)
-                if p_id_str in product_map:
-                    relevant_products.append(product_map[p_id_str])
+            relevant_content = []
+            for item_id in relevant_ids:
+                item_id_str = str(item_id)
+                if item_id_str in content_map:
+                    relevant_content.append(content_map[item_id_str])
 
-            if relevant_products:
-                return relevant_products[:limit]
+            if relevant_content:
+                return relevant_content[:limit]
 
-        logger.warning("⚠️ No relevant products found after reranking.")
+        logger.warning("⚠️ No relevant content found after reranking.")
         return []
 
     except Exception as e:
         logger.error(f"❌ Error during LLM reranking: {str(e)}", exc_info=True)
-        return products[:limit]
+        return content[:limit]
 
 
 # ---------------------------
 # Smart Trigger
 # ---------------------------
-def should_use_llm_reranking(query: str, products: List[Dict]) -> bool:
+def should_use_llm_reranking(query: str, content: List[Dict]) -> bool:
     simple_indicators = ["shirt", "pants", "dress", "shoes", "bag", "watch"]
     query_lower = query.lower()
 
     if any(indicator in query_lower for indicator in simple_indicators) and len(query.split()) <= 2:
         return False
 
-    if len(products) > 5 or len(query.split()) > 3:
+    if len(content) > 5 or len(query.split()) > 3:
         return True
 
     complex_indicators = [
@@ -412,3 +447,27 @@ def should_use_llm_reranking(query: str, products: List[Dict]) -> bool:
         return True
 
     return False
+
+
+# ---------------------------
+# Backward Compatibility Wrapper
+# ---------------------------
+def llm_rerank_products(
+    query: str,
+    products: List[Dict],
+    limit: int = 10,
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
+    llm_api_key: Optional[str] = None,
+    client_id: str = "anonymous"
+) -> List[Dict]:
+    """Backward compatibility wrapper for llm_rerank_content."""
+    return llm_rerank_content(
+        query=query,
+        content=products,
+        limit=limit,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_api_key=llm_api_key,
+        client_id=client_id
+    )
