@@ -10,7 +10,7 @@ from backend.app.services.embedder import embed_query, embed_document
 from backend.app.services.intent_service import analyze_intent
 from backend.app.services.license_service import validate_license_key, check_search_quota, increment_search_count, log_search, increment_ingest_count, extract_license_key_from_authorization
 from backend.app.services.llm_key_service import decrypt_key
-from backend.app.services.llm_rerank_service import llm_rerank_products, should_use_llm_reranking
+from backend.app.services.llm_rerank_service import llm_rerank_products, should_use_llm_reranking, recommend_categories
 from backend.app.services.product_service import build_product_text, extract_payload
 from backend.app.services.qdrant_service import search_products, upsert_product, delete_product, get_client_product_count
 from backend.app.services.rerank_service import extract_keywords, filter_and_rerank
@@ -27,6 +27,7 @@ class MagentoSearchRequest(BaseModel):
     llm_provider: str = None
     llm_model: str = None
     llm_api_key_encrypted: Optional[str] = None
+    categories: List[dict] = Field(default_factory=list)
 
 
 class MagentoProduct(BaseModel):
@@ -194,8 +195,8 @@ async def magento_search(
             print(f"API key not getting from DB")
             llm_api_key = None
         llm_results = llm_rerank_products(
-            req.query, 
-            results, 
+            req.query,
+            results,
             req.limit,
             llm_provider=req.llm_provider,
             llm_model=req.llm_model,
@@ -211,13 +212,48 @@ async def magento_search(
     else:
         print(f"⚡ Skipping LLM re-ranking for simple query: '{req.query}'")
 
+    # Step 5d — Category recommendation
+    # Uses LLM to recommend relevant categories based on query
+    recommended_categories = []
+    if req.categories:
+        print(f"🧠 Applying category recommendation for query: '{req.query}' with {len(req.categories)} categories")
+        if headers["llm_api_key_encrypted"]:
+            try:
+                llm_api_key = decrypt_key(headers["llm_api_key_encrypted"], headers["license_key"])
+            except Exception as e:
+                print(f"❌ Decryption failed for category recommendation: {e}")
+                llm_api_key = None
+        else:
+            llm_api_key = None
+
+        recommended_categories = recommend_categories(
+            query=req.query,
+            categories=req.categories,
+            provider=req.llm_provider or "gemini",
+            model=req.llm_model or "gemini-1.5-flash",
+            api_key=llm_api_key,
+            client_id=client_id,
+            limit=10
+        )
+        print(f"Category recommendation took: {time.time() - start_time}")
+        if recommended_categories:
+            print(f"✅ LLM recommended {len(recommended_categories)} categories")
+        else:
+            print(f"⚠️ No categories recommended")
+
     set_cached_results(f"{client_id}_{domain}", query, results)
 
     response_time = int((time.time() - start_time) * 1000)
     increment_search_count(db, client_id)
     log_search(db, client_id, query, len(results), response_time, cached=False)
 
-    return {"query": req.query, "count": len(results), "cached": False, "results": results}
+    return {
+        "query": req.query,
+        "count": len(results),
+        "cached": False,
+        "results": results,
+        "recommended_categories": recommended_categories
+    }
 
 
 @router.post("/magento/sync/batch")

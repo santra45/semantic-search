@@ -387,7 +387,7 @@ def llm_rerank_content(
         try:
             track_usage(
                 client_id=client_id,
-                query_type="content_rerank",
+                query_type="product_rerank",
                 llm_provider=provider,
                 llm_model=model,
                 input_tokens=usage["input"],
@@ -471,3 +471,180 @@ def llm_rerank_products(
         llm_api_key=llm_api_key,
         client_id=client_id
     )
+
+
+# ---------------------------
+# Category Recommendation
+# ---------------------------
+def recommend_categories(
+    query: str,
+    categories: List[Dict],
+    provider: str = "gemini",
+    model: str = "gemini-1.5-flash",
+    api_key: str = None,
+    client_id: str = "anonymous",
+    limit: int = 10
+) -> List[Dict]:
+    """
+    Use LLM to recommend relevant categories based on customer query.
+    
+    Args:
+        query: Customer search query
+        categories: List of category dictionaries with 'id' and 'name' keys
+        provider: LLM provider (gemini, openai, anthropic)
+        model: LLM model name
+        api_key: API key for the LLM provider
+        client_id: Client ID for tracking
+        limit: Maximum number of categories to return
+    
+    Returns:
+        List of relevant category dictionaries with 'id' and 'name' keys
+    """
+    if not categories:
+        return []
+    
+    try:
+        # Build category summary for LLM
+        category_summaries = []
+        category_map = {}
+        
+        for cat in categories:
+            cat_id = str(cat.get('id', ''))
+            cat_name = cat.get('name', '')
+            
+            if cat_id and cat_name:
+                category_summaries.append({
+                    "id": cat_id,
+                    "name": cat_name
+                })
+                category_map[cat_id] = cat
+        
+        # Build prompt for category recommendation
+        prompt = f"""
+You are an expert e-commerce category recommendation assistant.
+
+Customer query:
+{query}
+
+Available categories:
+{json.dumps(category_summaries, indent=2)}
+
+Task:
+Select the most relevant categories for this customer's search query.
+Consider the customer's intent and select categories that would help them find what they're looking for.
+
+Return ONLY a JSON array of category IDs (as strings) that are most relevant to the query.
+Example format: ["123", "456", "789"]
+
+Select at most {limit} categories.
+"""
+        
+        logger.info(f"🧠 LLM Category Recommendation for query: '{query}' with {len(categories)} categories")
+        
+        # ---------------------------
+        # GEMINI
+        # ---------------------------
+        if provider == "gemini":
+            if api_key:
+                client = genai.Client(api_key=api_key)
+            else:
+                client = genai.Client()
+            
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={"temperature": 0.3}
+            )
+            response_text = response.text.strip()
+        
+        # ---------------------------
+        # OPENAI
+        # ---------------------------
+        elif provider == "openai":
+            if not api_key:
+                logger.warning("OpenAI API key not provided, skipping category recommendation")
+                return categories[:limit]
+            
+            client = OpenAI(
+                api_key=api_key,
+                http_client=make_http_client(),
+            )
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            response_text = response.choices[0].message.content.strip()
+        
+        # ---------------------------
+        # ANTHROPIC
+        # ---------------------------
+        elif provider == "anthropic":
+            if not api_key:
+                logger.warning("Anthropic API key not provided, skipping category recommendation")
+                return categories[:limit]
+            
+            client = anthropic.Anthropic(
+                api_key=api_key,
+                http_client=make_http_client(),
+            )
+            response = client.messages.create(
+                model=model,
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            response_text = response.content[0].text.strip()
+        
+        else:
+            logger.warning(f"Unknown provider: {provider}, returning top categories")
+            return categories[:limit]
+        
+        # ---------------------------
+        # TOKEN USAGE & COST
+        # ---------------------------
+        usage = get_token_usage(provider, response, prompt, response_text)
+        cost = estimate_cost(model, usage)
+        
+        logger.info(f"🔢 Token Usage (category recommendation): {usage}")
+        logger.info(f"💰 Estimated Cost (category recommendation): ${round(cost, 8)}")
+        
+        # Track token usage
+        try:
+            track_usage(
+                client_id=client_id,
+                query_type="category_rerank",
+                llm_provider=provider,
+                llm_model=model,
+                input_tokens=usage["input"],
+                output_tokens=usage["output"],
+                input_cost=usage["input"] * MODEL_PRICING.get(model, {}).get("input", 0),
+                output_cost=usage["output"] * MODEL_PRICING.get(model, {}).get("output", 0),
+                request_text_length=len(prompt),
+                response_text_length=len(response_text)
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to track token usage for category recommendation: {e}")
+        
+        # ---------------------------
+        # Parse & Return Relevant Categories
+        # ---------------------------
+        json_text = extract_json_array(response_text)
+        
+        if json_text:
+            relevant_ids = json.loads(json_text)
+            relevant_categories = []
+            for cat_id in relevant_ids:
+                cat_id_str = str(cat_id)
+                if cat_id_str in category_map:
+                    relevant_categories.append(category_map[cat_id_str])
+            
+            if relevant_categories:
+                logger.info(f"✅ LLM recommended {len(relevant_categories)} categories out of {len(categories)}")
+                return relevant_categories[:limit]
+        
+        logger.warning("⚠️ No relevant categories found after LLM recommendation, returning top categories")
+        return categories[:limit]
+    
+    except Exception as e:
+        logger.error(f"❌ Error during category recommendation: {str(e)}", exc_info=True)
+        return categories[:limit]

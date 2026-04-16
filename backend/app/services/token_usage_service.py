@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 QUERY_TYPES = {
     'embed_search': 'embed_search',
     'embed_document': 'embed_document', 
-    'product_rerank': 'product_rerank'
+    'product_rerank': 'product_rerank',
+    'category_rerank': 'category_rerank'
 }
 
 class TokenUsageTracker:
