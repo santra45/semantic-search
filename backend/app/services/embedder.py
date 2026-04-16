@@ -69,7 +69,12 @@ def get_client(api_key: str = None):
 # ---------------------------
 # Embed Query
 # ---------------------------
-def embed_query(text: str, api_key: str = None, client_id: str = "anonymous") -> list[float]:
+def embed_query(
+    text: str,
+    api_key: str = None,
+    client_id: str = "anonymous",
+    query_type: str = "embed_search",
+) -> list[float]:
     """
     Embed a search query using the new SDK.
     Logs token usage and estimated cost.
@@ -108,7 +113,7 @@ def embed_query(text: str, api_key: str = None, client_id: str = "anonymous") ->
     try:
         track_usage(
             client_id=client_id,
-            query_type="embed_search",
+            query_type=query_type,
             llm_provider="google",
             llm_model=EMBED_MODEL,
             input_tokens=token_count,
@@ -127,7 +132,12 @@ def embed_query(text: str, api_key: str = None, client_id: str = "anonymous") ->
 # ---------------------------
 # Embed Document
 # ---------------------------
-def embed_document(text: str, api_key: str = None, client_id: str = "anonymous") -> list[float]:
+def embed_document(
+    text: str,
+    api_key: str = None,
+    client_id: str = "anonymous",
+    query_type: str = "embed_document",
+) -> list[float]:
     """
     Embed a product document for indexing.
     Logs token usage and estimated cost.
@@ -166,7 +176,7 @@ def embed_document(text: str, api_key: str = None, client_id: str = "anonymous")
     try:
         track_usage(
             client_id=client_id,
-            query_type="embed_document",
+            query_type=query_type,
             llm_provider="google",
             llm_model=EMBED_MODEL,
             input_tokens=token_count,

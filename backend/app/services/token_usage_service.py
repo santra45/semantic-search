@@ -21,7 +21,10 @@ QUERY_TYPES = {
     'embed_search': 'embed_search',
     'embed_document': 'embed_document', 
     'product_rerank': 'product_rerank',
-    'category_rerank': 'category_rerank'
+    'content_rerank': 'content_rerank',
+    'chat_answer': 'chat_answer',
+    'chat_context': 'chat_context',
+    'chat_rewrite': 'chat_rewrite',
 }
 
 class TokenUsageTracker:
@@ -261,13 +264,13 @@ class TokenUsageTracker:
                 },
                 'unique_clients': row.unique_clients,
                 'total_requests': row.total_requests,
-                'total_input_tokens': row.total_input_tokens,
-                'total_output_tokens': row.total_output_tokens,
-                'total_tokens': row.total_tokens,
-                'total_input_cost': float(row.total_input_cost),
-                'total_output_cost': float(row.total_output_cost),
-                'total_cost': float(row.total_cost),
-                'avg_cost_per_request': float(row.avg_cost_per_request)
+                'total_input_tokens': row.total_input_tokens or 0,
+                'total_output_tokens': row.total_output_tokens or 0,
+                'total_tokens': row.total_tokens or 0,
+                'total_input_cost': float(row.total_input_cost or 0),
+                'total_output_cost': float(row.total_output_cost or 0),
+                'total_cost': float(row.total_cost or 0),
+                'avg_cost_per_request': float(row.avg_cost_per_request or 0)
             }
             
         except Exception as e:
