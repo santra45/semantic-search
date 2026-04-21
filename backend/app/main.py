@@ -14,6 +14,12 @@ from backend.app.routers import (
     webhook_secret,
     webhooks,
 )
+from backend.app.magento.chatbot.routers import (
+    admin_dashboard as magento_chatbot_admin,
+    agent as magento_chatbot_agent,
+    export as magento_chatbot_export,
+    sync as magento_chatbot_sync,
+)
 
 app = FastAPI(
     title="Semantic Search API",
@@ -37,6 +43,13 @@ app.include_router(token_usage.router, prefix="/api")
 app.include_router(magento.router, prefix="/api")
 app.include_router(chatbot.router, prefix="/api")
 app.include_router(onboarding.router)
+
+# Multi-agent Magento chatbot (LangGraph + per-tenant Magento REST).
+# New endpoint prefix — /api/magento/chatbot/agent/*
+app.include_router(magento_chatbot_agent.router, prefix="/api")
+app.include_router(magento_chatbot_sync.router, prefix="/api")
+app.include_router(magento_chatbot_admin.router, prefix="/api")
+app.include_router(magento_chatbot_export.router, prefix="/api")
 
 @app.get("/")
 def root():

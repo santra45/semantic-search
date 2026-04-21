@@ -9,9 +9,11 @@ python-multipart==0.0.6
 # Database & ORM
 sqlalchemy==2.0.23
 pymysql==1.1.0
+psycopg[binary,pool]==3.1.18
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
+cryptography>=41.0.0
 crypto
 pycrypto
 pycryptodome
@@ -24,6 +26,20 @@ google-genai
 openai
 anthropic
 tiktoken
+
+# LangChain / LangGraph multi-agent
+langchain==0.3.7
+langchain-core==0.3.21
+langchain-google-genai==2.0.6
+langchain-openai==0.2.10
+langchain-anthropic==0.3.0
+langgraph==0.2.53
+langgraph-checkpoint-postgres==2.0.8
+numpy==1.26.4
+beautifulsoup4==4.12.3
+
+# Server-side export (chat history PDF)
+weasyprint==62.3
 
 # Data Validation
 pydantic==2.5.0
