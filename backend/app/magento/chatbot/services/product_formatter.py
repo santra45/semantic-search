@@ -424,7 +424,10 @@ def format_product(
     if type_id:
         parts.append(f"Product type: {type_id}")
 
-    # Flatten variant attributes into filter keys + embed a readable summary
+    # Flatten variant attributes into filter keys + embed a readable summary.
+    # Also seed attr_map so the parent product inherits human-readable top-level
+    # fields (`color: "Red, Blue, Green"`, `size: "S, M, L"`) — otherwise the
+    # parent row ended up with no attribute fields even though its children did.
     if variant_attrs:
         summary_chunks: list[str] = []
         child_skus: list[str] = []
@@ -435,6 +438,8 @@ def format_product(
             # "Color: Red, Blue, Green"
             readable = ", ".join(v for v in values if v)
             summary_chunks.append(f"{attr_code.replace('_', ' ').title()}: {readable}")
+            if readable and key not in attr_map:
+                attr_map[key] = readable
             for raw_value in values:
                 value_key = normalize_token(raw_value)
                 if value_key:
