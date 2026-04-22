@@ -8,10 +8,11 @@ Design goals:
       attr_{name}_{value} = True   (e.g. attr_color_red)
       cat_{id}             = True  (e.g. cat_37)
     so the product agent can build structured Qdrant filters from vocabulary hits.
-  * HTML strips via BeautifulSoup where available, else a regex fallback.
+  * HTML strips via BeautifulSoup where available, plus a final regex pass so
+    residual tags / entities never reach the embedder or the admin UI.
 
 Merges:
-  * magento_chatbot/services/vector_store.py  (attr_*/cat_* metadata, HTML structuring)
+  * magento_chatbot/services/vector_store.py  (attr_*/cat_* metadata, variant handling, HTML structuring)
   * semantic-search/backend/app/services/product_service.py  (shortcode expansion, price bucket)
 """
 
@@ -31,8 +32,30 @@ except Exception:  # pragma: no cover
 # ── HTML helpers ─────────────────────────────────────────────────────────────
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
+_NEWLINES_RE = re.compile(r"\n{3,}")
+
+
+def _final_clean(text: str) -> str:
+    """Guarantee no HTML tags or raw entities survive.
+
+    Even when BeautifulSoup runs first we defensively:
+      * re-strip any `<...>` pattern (handles malformed markup BS4 left behind)
+      * decode HTML entities (`&amp;`, `&nbsp;`, etc.)
+      * collapse whitespace
+    """
+    if not text:
+        return ""
+    text = html_mod.unescape(text)
+    text = _TAG_RE.sub(" ", text)
+    text = _WHITESPACE_RE.sub(" ", text)
+    text = _NEWLINES_RE.sub("\n\n", text)
+    return text.strip()
+
+
 def _strip_html_simple(value: str) -> str:
-    return re.sub(r"<[^>]+>", " ", value or "").strip()
+    return _final_clean(value or "")
 
 
 def html_to_structured_text(html: str) -> str:
@@ -65,8 +88,8 @@ def html_to_structured_text(html: str) -> str:
                 parts.append(" | ".join(cells))
 
     if not parts:
-        return soup.get_text(" ", strip=True)
-    return "\n".join(parts)
+        parts.append(soup.get_text(" ", strip=True))
+    return _final_clean("\n".join(parts))
 
 
 # ── Token normalization ──────────────────────────────────────────────────────
@@ -118,6 +141,31 @@ def _price_bucket(price: float) -> str:
     return "luxury high end"
 
 
+# ── Gender detection from category names ────────────────────────────────────
+
+_GENDER_PATTERNS = [
+    ("women", re.compile(r"\b(women|womens|women[' ]?s|ladies|lady|female)\b", re.I)),
+    ("men",   re.compile(r"\b(men|mens|men[' ]?s|male|gentlemen)\b", re.I)),
+    ("girls", re.compile(r"\b(girls?|girls[' ]?)\b", re.I)),
+    ("boys",  re.compile(r"\b(boys?|boys[' ]?)\b", re.I)),
+    ("kids",  re.compile(r"\b(kids?|children|child|infant|baby|babies|toddler)\b", re.I)),
+    ("unisex", re.compile(r"\bunisex\b", re.I)),
+]
+
+
+def _infer_gender(category_names: list[str], existing_gender: str = "") -> str:
+    """Pick the most specific gender signal from the product's category names."""
+    if existing_gender:
+        return existing_gender
+    blob = " ".join(category_names or [])
+    if not blob.strip():
+        return ""
+    for label, pattern in _GENDER_PATTERNS:
+        if pattern.search(blob):
+            return label
+    return ""
+
+
 # ── Attribute expansion ──────────────────────────────────────────────────────
 
 def _iter_attributes(attributes: Any) -> list[tuple[str, list[str]]]:
@@ -151,25 +199,67 @@ def _iter_attributes(attributes: Any) -> list[tuple[str, list[str]]]:
     return out
 
 
-def _resolve_list_or_string(value: Any, key: str = "name") -> tuple[str, list[tuple[str, str]]]:
-    """Return (joined_name_string, [(id,name)...]) from either list of dicts or comma-string."""
+def _resolve_categories(product: Dict[str, Any]) -> tuple[str, list[tuple[str, str]], list[str]]:
+    """Return (joined_names_for_embed, [(id, name)...], [name_strings]) from the product.
+
+    Accepts every shape the Magento module (and the WooCommerce legacy ingest) may send:
+      * [{id, name}, ...]
+      * ["1", "2", "3"]        (IDs only — names remain empty but cat_{id} still indexed)
+      * "Cats > Subcat"         (already-joined string)
+      * product['metadata']['categories'] with any of the above
+    """
+
+    raw = product.get("categories")
+    if raw in (None, "", []):
+        meta = product.get("metadata") or {}
+        if isinstance(meta, dict):
+            raw = meta.get("categories")
+
     pairs: list[tuple[str, str]] = []
+    names: list[str] = []
+
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                cid = str(item.get("id") or "").strip()
+                cname = str(item.get("name") or "").strip()
+                if cid:
+                    pairs.append((cid, cname))
+                if cname:
+                    names.append(cname)
+            elif item not in (None, ""):
+                token = str(item).strip()
+                if token.isdigit():
+                    pairs.append((token, ""))
+                else:
+                    names.append(token)
+    elif isinstance(raw, str) and raw.strip():
+        for token in re.split(r"[,>]", raw):
+            token = token.strip()
+            if token:
+                if token.isdigit():
+                    pairs.append((token, ""))
+                else:
+                    names.append(token)
+
+    joined = ", ".join(names)
+    return joined, pairs, names
+
+
+def _resolve_tags(value: Any) -> str:
     if isinstance(value, list):
-        names: list[str] = []
+        out = []
         for item in value:
             if isinstance(item, dict):
-                name = str(item.get(key) or "").strip()
-                cid = str(item.get("id") or "").strip()
+                name = item.get("name") or ""
                 if name:
-                    names.append(name)
-                if cid:
-                    pairs.append((cid, name))
+                    out.append(str(name))
             elif item:
-                names.append(str(item))
-        return ", ".join(names), pairs
+                out.append(str(item))
+        return ", ".join(out)
     if isinstance(value, str):
-        return value, []
-    return "", []
+        return value
+    return ""
 
 
 def _resolve_image(value: Any) -> str:
@@ -179,6 +269,72 @@ def _resolve_image(value: Any) -> str:
     if isinstance(value, str):
         return value
     return ""
+
+
+# ── Variant (configurable children) handling ────────────────────────────────
+
+
+def _pull_children(product: Dict[str, Any]) -> list[dict]:
+    """Find the configurable-children list wherever the provider stashed it."""
+    for key in ("children", "configurable_children", "variants"):
+        val = product.get(key)
+        if isinstance(val, list) and val:
+            return val
+
+    meta = product.get("metadata") or {}
+    if isinstance(meta, dict):
+        for key in ("children", "configurable_children", "variants"):
+            val = meta.get(key)
+            if isinstance(val, list) and val:
+                return val
+    return []
+
+
+def _aggregate_variant_attrs(children: list[dict]) -> dict[str, list[str]]:
+    """{attribute_code: [distinct_values...]} across all child products."""
+    agg: dict[str, set[str]] = {}
+    skip = {"sku", "name", "price", "regular_price", "stock", "stock_status", "image", "image_url"}
+    for child in children:
+        attributes = child.get("attributes") if isinstance(child, dict) else None
+        if isinstance(attributes, dict):
+            for code, value in attributes.items():
+                if not code or code in skip or value in (None, "", []):
+                    continue
+                agg.setdefault(code, set()).add(str(value))
+        elif isinstance(child, dict):
+            for code, value in child.items():
+                if code in skip or value in (None, "", []):
+                    continue
+                if not isinstance(value, (str, int, float, bool)):
+                    continue
+                agg.setdefault(code, set()).add(str(value))
+    return {k: sorted(v) for k, v in agg.items()}
+
+
+def _clean_children_for_payload(children: list[dict]) -> list[dict]:
+    """Keep child records small enough to store as Qdrant payload."""
+    cleaned: list[dict] = []
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        attributes = child.get("attributes")
+        if isinstance(attributes, dict):
+            attrs = {
+                str(k): str(v)
+                for k, v in attributes.items()
+                if v not in (None, "", []) and isinstance(v, (str, int, float, bool))
+            }
+        else:
+            attrs = {}
+        cleaned.append({
+            "sku": str(child.get("sku") or ""),
+            "name": str(child.get("name") or ""),
+            "price": float(child.get("price") or 0),
+            "regular_price": float(child.get("regular_price") or child.get("price") or 0),
+            "stock_status": str(child.get("stock_status") or "instock"),
+            "attributes": attrs,
+        })
+    return cleaned
 
 
 # ── Product ──────────────────────────────────────────────────────────────────
@@ -201,20 +357,24 @@ def format_product(
     sku = str(product.get("sku") or "").strip()
     if sku:
         parts.append(f"SKU: {sku}")
-    name = str(product.get("name") or "").strip()
+    name = str(product.get("name") or product.get("title") or "").strip()
     if name:
         parts.append(f"Product: {name}")
     brand = str(product.get("brand") or "").strip()
     if brand:
         parts.append(f"Brand: {brand}")
-    gender = str(product.get("gender") or "").strip()
+
+    # Categories — accept list of {id,name}, list of IDs, or comma string.
+    cats_str, cat_pairs, cat_names = _resolve_categories(product)
+    if cats_str:
+        parts.append(f"Category: {cats_str}")
+
+    # Gender — explicit field wins; otherwise infer from category names.
+    gender = _infer_gender(cat_names, str(product.get("gender") or "").strip())
     if gender:
         parts.append(f"Gender: {gender}")
 
-    cats_str, cat_pairs = _resolve_list_or_string(product.get("categories"))
-    if cats_str:
-        parts.append(f"Category: {cats_str}")
-    tags_str, _ = _resolve_list_or_string(product.get("tags"))
+    tags_str = _resolve_tags(product.get("tags"))
     if tags_str:
         parts.append(f"Tags: {tags_str}")
 
@@ -233,17 +393,62 @@ def format_product(
                     attribute_vocab_sink.setdefault(key, set()).add(value_key)
 
     for cid, cname in cat_pairs:
-        if cid:
-            payload[f"cat_{cid}"] = True
-            if category_vocab_sink is not None and cname:
-                category_vocab_sink[cid] = {"id": cid, "name": normalize_token(cname)}
+        if not cid:
+            continue
+        payload[f"cat_{cid}"] = True
+        if category_vocab_sink is not None and cname:
+            category_vocab_sink[cid] = {"id": cid, "name": normalize_token(cname)}
 
-    short = html_to_structured_text(product.get("short_description") or "")
+    # HTML stripping — always route through html_to_structured_text, then _final_clean
+    # in case the upstream store already stripped tags but left entities/stray markers.
+    short = html_to_structured_text(product.get("short_description") or product.get("summary") or "")
     if short:
         parts.append(f"Summary: {short}")
-    long_desc = html_to_structured_text(product.get("description") or "")
+    long_desc = html_to_structured_text(product.get("description") or product.get("content") or "")
     if long_desc:
         parts.append(f"Description: {long_desc[:600]}")
+
+    # ── Product type + configurable children ─────────────────────────────────
+    meta = product.get("metadata") if isinstance(product.get("metadata"), dict) else {}
+    type_id = str(
+        product.get("type_id")
+        or product.get("product_type")
+        or (meta.get("type_id") if isinstance(meta, dict) else "")
+        or "simple"
+    ).strip().lower()
+    children = _pull_children(product)
+    variant_attrs = _aggregate_variant_attrs(children) if children else {}
+    has_variants = bool(children)
+    is_configurable = type_id == "configurable" or has_variants
+
+    if type_id:
+        parts.append(f"Product type: {type_id}")
+
+    # Flatten variant attributes into filter keys + embed a readable summary
+    if variant_attrs:
+        summary_chunks: list[str] = []
+        child_skus: list[str] = []
+        for attr_code, values in variant_attrs.items():
+            key = normalize_token(attr_code)
+            if not key:
+                continue
+            # "Color: Red, Blue, Green"
+            readable = ", ".join(v for v in values if v)
+            summary_chunks.append(f"{attr_code.replace('_', ' ').title()}: {readable}")
+            for raw_value in values:
+                value_key = normalize_token(raw_value)
+                if value_key:
+                    payload[f"attr_{key}_{value_key}"] = True
+                    if attribute_vocab_sink is not None and value_key != "none":
+                        attribute_vocab_sink.setdefault(key, set()).add(value_key)
+        for ch in children:
+            if isinstance(ch, dict) and ch.get("sku"):
+                child_skus.append(str(ch["sku"]))
+
+        if summary_chunks:
+            parts.append("Available variants: " + " | ".join(summary_chunks))
+        if child_skus:
+            parts.append("Variant SKUs: " + ", ".join(child_skus[:60]))
 
     raw_price = product.get("price")
     try:
@@ -274,15 +479,27 @@ def format_product(
             "sale_price": float(product.get("sale_price") or 0),
             "on_sale": bool(product.get("on_sale", False)),
             "categories": cats_str,
+            "category_ids": [cid for cid, _ in cat_pairs],
             "tags": tags_str,
             "image_url": image_url,
             "stock_status": product.get("stock_status") or "instock",
             "average_rating": float(product.get("average_rating") or 0),
+            # Product-type metadata
+            "type_id": type_id,
+            "is_configurable": is_configurable,
+            "has_variants": has_variants,
+            "variant_attributes": variant_attrs,           # { color: [Red, Blue], size: [S, M] }
+            "children": _clean_children_for_payload(children),  # [{sku, name, price, ...}, ...]
+            "child_skus": ",".join(
+                str(c.get("sku")) for c in children if isinstance(c, dict) and c.get("sku")
+            ),
             **attr_map,
         }
     )
 
-    return "\n".join(parts), payload
+    # Final safety pass — make sure no HTML leaks into the embedded text.
+    embedded_text = _final_clean("\n".join(p for p in parts if p))
+    return embedded_text, payload
 
 
 # ── CMS page / block / widget / store config ─────────────────────────────────
@@ -309,7 +526,7 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         "permalink": page.get("permalink") or "",
         "status": page.get("status") or "active",
     }
-    return "\n".join(parts), payload
+    return _final_clean("\n".join(parts)), payload
 
 
 def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -329,7 +546,7 @@ def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         "content": content[:2000],
         "status": block.get("status") or "active",
     }
-    return "\n".join(parts), payload
+    return _final_clean("\n".join(parts)), payload
 
 
 def format_widget(widget: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -352,7 +569,7 @@ def format_widget(widget: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         "description": description,
         "content": content[:1500],
     }
-    return "\n".join(parts), payload
+    return _final_clean("\n".join(parts)), payload
 
 
 def format_store_config(info: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -375,7 +592,7 @@ def format_store_config(info: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         "label": label,
         "value": value[:1500],
     }
-    return "\n".join(parts), payload
+    return _final_clean("\n".join(parts)), payload
 
 
 # ── Dispatcher ───────────────────────────────────────────────────────────────
@@ -405,6 +622,6 @@ def format_item(
     title = str(item.get("title") or item.get("name") or item.get("identifier") or "")
     content = html_to_structured_text(item.get("content") or item.get("description") or "")
     return (
-        f"{content_type}: {title}\n{content[:1500]}",
+        _final_clean(f"{content_type}: {title}\n{content[:1500]}"),
         {"title": title, "content": content[:1500], "content_type": content_type},
     )

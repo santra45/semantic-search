@@ -41,7 +41,7 @@ def list_chats(
     store_code: Optional[str] = Query(None),
     customer_id: Optional[str] = Query(None),
     guest_session_id: Optional[str] = Query(None),
-    kind: Optional[str] = Query(None, regex=r"^(customer|guest|all)?$"),
+    kind: Optional[str] = Query(None, pattern=r"^(customer|guest|all)?$"),
     since: Optional[str] = Query(None),
     until: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
