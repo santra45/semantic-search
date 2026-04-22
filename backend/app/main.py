@@ -15,9 +15,7 @@ from backend.app.routers import (
     webhooks,
 )
 from backend.app.magento.chatbot.routers import (
-    admin_dashboard as magento_chatbot_admin,
     agent as magento_chatbot_agent,
-    export as magento_chatbot_export,
     sync as magento_chatbot_sync,
 )
 
@@ -45,11 +43,10 @@ app.include_router(chatbot.router, prefix="/api")
 app.include_router(onboarding.router)
 
 # Multi-agent Magento chatbot (LangGraph + per-tenant Magento REST).
-# New endpoint prefix — /api/magento/chatbot/agent/*
+# Chat history now lives in the Magento DB — this backend owns only the
+# stateless agent endpoints and the sync ingest endpoints.
 app.include_router(magento_chatbot_agent.router, prefix="/api")
 app.include_router(magento_chatbot_sync.router, prefix="/api")
-app.include_router(magento_chatbot_admin.router, prefix="/api")
-app.include_router(magento_chatbot_export.router, prefix="/api")
 
 @app.get("/")
 def root():

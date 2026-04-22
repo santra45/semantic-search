@@ -8,7 +8,10 @@ POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_DB = os.getenv("POSTGRES_DB", "chatbot_state")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "chatbot")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
-POSTGRES_CHECKPOINTER_ENABLED = os.getenv("POSTGRES_CHECKPOINTER_ENABLED", "true").lower() == "true"
+# Off by default — chat history lives on the Magento side for privacy reasons.
+# Setting it to "true" would only be useful for debugging graph runs; it never
+# persists anything the storefront should store.
+POSTGRES_CHECKPOINTER_ENABLED = os.getenv("POSTGRES_CHECKPOINTER_ENABLED", "false").lower() == "true"
 
 MAX_CHAT_HISTORY_MESSAGES = int(os.getenv("MAX_CHAT_HISTORY_MESSAGES", "8"))
 
