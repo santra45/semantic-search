@@ -15,7 +15,7 @@ from backend.app.routers import (
     webhooks,
 )
 from backend.app.magento.chatbot.routers import (
-    agent as magento_chatbot_agent,
+    retrieve as magento_chatbot_retrieve,
     sync as magento_chatbot_sync,
 )
 
@@ -42,10 +42,11 @@ app.include_router(magento.router, prefix="/api")
 app.include_router(chatbot.router, prefix="/api")
 app.include_router(onboarding.router)
 
-# Multi-agent Magento chatbot (LangGraph + per-tenant Magento REST).
-# Chat history now lives in the Magento DB — this backend owns only the
-# stateless agent endpoints and the sync ingest endpoints.
-app.include_router(magento_chatbot_agent.router, prefix="/api")
+# Magento chatbot backend — now pure retrieval.
+# All routing / agent dispatch happens on the Magento side; this backend only
+# answers three questions: "give me matching products", "give me matching
+# content", and optionally "summarize these sources" (admin-toggled).
+app.include_router(magento_chatbot_retrieve.router, prefix="/api")
 app.include_router(magento_chatbot_sync.router, prefix="/api")
 
 @app.get("/")
