@@ -295,10 +295,7 @@ def retrieve_answer(
     )
 
     sources_blob = "\n\n".join(
-        f"[{s.get('content_type') or 'source'}] "
-        f"{s.get('title') or s.get('name') or s.get('identifier') or ''}\n"
-        f"{(s.get('summary') or s.get('content') or s.get('description') or '')[:800]}"
-        for s in req.sources[:6]
+        _format_source_for_prompt(s) for s in req.sources[:6]
     )
 
     prompt = (
@@ -361,6 +358,81 @@ def retrieve_answer(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _format_source_for_prompt(s: dict) -> str:
+    """Flatten one source into the text block the RAG summarizer sees.
+
+    For products we surface the variant breakdown, price, stock, and parent
+    SKU — otherwise the summarizer only sees a name and will say things like
+    'the sources don't list the available sizes' even though the data was
+    right there in the payload.
+    """
+    ct = (s.get("content_type") or "").lower()
+    title = s.get("title") or s.get("name") or s.get("identifier") or s.get("sku") or ""
+
+    if ct == "product" or s.get("sku") or s.get("type_id"):
+        return _format_product_source(s, title)
+
+    body = (s.get("summary") or s.get("content") or s.get("description") or "")[:800]
+    return f"[{ct or 'source'}] {title}\n{body}"
+
+
+def _format_product_source(s: dict, title: str) -> str:
+    parts: list[str] = [f"[product] {title}"]
+    sku = s.get("sku")
+    if sku:
+        parts.append(f"SKU: {sku}")
+    type_id = s.get("type_id")
+    if type_id:
+        parts.append(f"Type: {type_id}")
+    if s.get("stock_status"):
+        parts.append(f"Stock: {s.get('stock_status')}")
+
+    price = s.get("price")
+    if price:
+        currency = s.get("currency") or ""
+        parts.append(f"Price: {price} {currency}".strip())
+
+    categories = s.get("categories")
+    if categories:
+        parts.append(f"Categories: {categories}")
+
+    # The critical bit: variant attributes + children so the LLM can
+    # answer "what sizes does this come in".
+    variant_attrs = s.get("variant_attributes") or {}
+    if isinstance(variant_attrs, dict) and variant_attrs:
+        lines = []
+        for attr_code, values in variant_attrs.items():
+            if not values:
+                continue
+            vals = values if isinstance(values, list) else [values]
+            lines.append(f"  - {attr_code}: {', '.join(str(v) for v in vals)}")
+        if lines:
+            parts.append("Available variants:\n" + "\n".join(lines))
+
+    children = s.get("children") or []
+    if isinstance(children, list) and children:
+        # Show up to 20 child SKUs with their attributes and stock.
+        child_lines = []
+        for ch in children[:20]:
+            if not isinstance(ch, dict):
+                continue
+            attrs = ch.get("attributes") or {}
+            attr_bits = ", ".join(f"{k}={v}" for k, v in attrs.items()) if attrs else ""
+            stock = ch.get("stock_status") or ""
+            price_c = ch.get("price") or ""
+            child_lines.append(
+                f"  - {ch.get('sku', '')}  {attr_bits}  {price_c}  {stock}".strip()
+            )
+        if child_lines:
+            parts.append("Child SKUs:\n" + "\n".join(child_lines))
+
+    desc = (s.get("description") or s.get("short_description") or s.get("summary") or "")
+    if desc:
+        parts.append(f"Description: {str(desc)[:600]}")
+
+    return "\n".join(parts)
 
 
 def _extract_text(content: Any) -> str:
