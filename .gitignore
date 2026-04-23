@@ -8,3 +8,4 @@ __pycache__
 /.windsurf
 /local_models
 /venv
+/logs

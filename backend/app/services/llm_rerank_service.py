@@ -8,6 +8,7 @@ from google import genai
 from openai import OpenAI
 import anthropic
 from backend.app.services.token_usage_service import track_usage
+from backend.app.utils.llm_logger import log_llm_interaction
 
 # ---------------------------
 # Logger Setup
@@ -382,7 +383,20 @@ def llm_rerank_content(
 
         logger.info(f"🔢 Token Usage: {usage}")
         logger.info(f"💰 Estimated Cost: ${round(cost, 8)}")
-        
+
+        log_llm_interaction(
+            provider=provider,
+            model=model,
+            purpose="product_rerank",
+            prompt=prompt,
+            response_text=response_text,
+            input_tokens=usage["input"],
+            output_tokens=usage["output"],
+            cost=cost,
+            client_id=client_id,
+            extra={"items": len(content_summaries)},
+        )
+
         # Track token usage
         try:
             track_usage(
@@ -421,6 +435,17 @@ def llm_rerank_content(
 
     except Exception as e:
         logger.error(f"❌ Error during LLM reranking: {str(e)}", exc_info=True)
+        try:
+            log_llm_interaction(
+                provider=provider,
+                model=model,
+                purpose="product_rerank",
+                prompt=prompt,
+                client_id=client_id,
+                error=str(e),
+            )
+        except Exception:
+            pass
         return content[:limit]
 
 
@@ -607,7 +632,20 @@ Select at most {limit} categories.
         
         logger.info(f"🔢 Token Usage (category recommendation): {usage}")
         logger.info(f"💰 Estimated Cost (category recommendation): ${round(cost, 8)}")
-        
+
+        log_llm_interaction(
+            provider=provider,
+            model=model,
+            purpose="category_rerank",
+            prompt=prompt,
+            response_text=response_text,
+            input_tokens=usage["input"],
+            output_tokens=usage["output"],
+            cost=cost,
+            client_id=client_id,
+            extra={"categories": len(category_summaries)},
+        )
+
         # Track token usage
         try:
             track_usage(

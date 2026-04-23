@@ -27,6 +27,7 @@ from backend.app.services.qdrant_service import (
     search_products as qdrant_search_products,
 )
 from backend.app.services.token_usage_service import TokenUsageTracker
+from backend.app.utils.llm_logger import log_llm_call
 
 from backend.app.magento.chatbot.routers.common import (
     authorize_request,
@@ -310,14 +311,31 @@ def retrieve_answer(
 
     from langchain_core.messages import HumanMessage
 
-    try:
-        resp = llm.invoke([HumanMessage(content=prompt)])
-    except Exception as exc:
-        logger.warning("retrieve/answer LLM invoke failed: %s", exc)
-        raise HTTPException(status_code=502, detail="LLM unavailable")
+    provider_name = (req.llm_provider or "google").lower()
+    model_name    = req.llm_model or "gemini-2.0-flash-lite"
 
-    answer_text = _extract_text(resp.content).strip()
-    usage = getattr(resp, "usage_metadata", None) or {}
+    with log_llm_call(
+        provider=provider_name,
+        model=model_name,
+        purpose="chat_answer",
+        prompt=prompt,
+        client_id=license_data["client_id"],
+    ) as _log_ctx:
+        try:
+            resp = llm.invoke([HumanMessage(content=prompt)])
+        except Exception as exc:
+            logger.warning("retrieve/answer LLM invoke failed: %s", exc)
+            raise HTTPException(status_code=502, detail="LLM unavailable")
+
+        answer_text = _extract_text(resp.content).strip()
+        usage = getattr(resp, "usage_metadata", None) or {}
+        _log_ctx.record(
+            response_text=answer_text,
+            input_tokens=int(usage.get("input_tokens", 0) or 0),
+            output_tokens=int(usage.get("output_tokens", 0) or 0),
+            cost=0.0,
+            extra={"sources": len(req.sources or [])},
+        )
     try:
         TokenUsageTracker(db).create_usage_record(
             client_id=license_data["client_id"],

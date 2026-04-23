@@ -21,7 +21,7 @@ def create_token_usage_table():
         id BIGINT AUTO_INCREMENT PRIMARY KEY,
         client_id VARCHAR(36) NOT NULL,
         request_id VARCHAR(255) NOT NULL UNIQUE,
-        query_type ENUM('embed_search', 'embed_document', 'product_rerank') NOT NULL,
+        query_type ENUM('embed_search', 'embed_document', 'embed_query', 'product_rerank', 'content_rerank', 'chat_answer', 'chat_context', 'chat_rewrite') NOT NULL,
         llm_provider VARCHAR(50) NOT NULL,
         llm_model VARCHAR(100) NOT NULL,
         

@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
+
+from backend.app.middleware.logging_middleware import APILoggingMiddleware
 from backend.app.routers import (
     chatbot,
     dashboard,
@@ -24,6 +26,9 @@ app = FastAPI(
     title="Semantic Search API",
     version="0.1.0"
 )
+
+# Unified request/response logger → logs/api.log
+app.add_middleware(APILoggingMiddleware)
 
 # Template setup
 templates = Jinja2Templates(directory="backend/app/templates")
