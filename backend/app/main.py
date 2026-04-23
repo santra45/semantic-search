@@ -17,6 +17,7 @@ from backend.app.routers import (
 from backend.app.magento.chatbot.routers import (
     retrieve as magento_chatbot_retrieve,
     sync as magento_chatbot_sync,
+    usage as magento_chatbot_usage,
 )
 
 app = FastAPI(
@@ -48,6 +49,7 @@ app.include_router(onboarding.router)
 # content", and optionally "summarize these sources" (admin-toggled).
 app.include_router(magento_chatbot_retrieve.router, prefix="/api")
 app.include_router(magento_chatbot_sync.router, prefix="/api")
+app.include_router(magento_chatbot_usage.router, prefix="/api")
 
 @app.get("/")
 def root():
