@@ -38,13 +38,7 @@ _NEWLINES_RE = re.compile(r"\n{3,}")
 
 
 def _final_clean(text: str) -> str:
-    """Guarantee no HTML tags or raw entities survive.
-
-    Even when BeautifulSoup runs first we defensively:
-      * re-strip any `<...>` pattern (handles malformed markup BS4 left behind)
-      * decode HTML entities (`&amp;`, `&nbsp;`, etc.)
-      * collapse whitespace
-    """
+    """Guarantee no HTML tags or raw entities survive."""
     if not text:
         return ""
     text = html_mod.unescape(text)
@@ -141,7 +135,7 @@ def _price_bucket(price: float) -> str:
     return "luxury high end"
 
 
-# ── Gender detection from category names ────────────────────────────────────
+# ── Gender detection ─────────────────────────────────────────────────────────
 
 _GENDER_PATTERNS = [
     ("women", re.compile(r"\b(women|womens|women[' ]?s|ladies|lady|female)\b", re.I)),
@@ -153,11 +147,15 @@ _GENDER_PATTERNS = [
 ]
 
 
-def _infer_gender(category_names: list[str], existing_gender: str = "") -> str:
-    """Pick the most specific gender signal from the product's category names."""
+def _infer_gender(category_paths: list[str], existing_gender: str = "") -> str:
+    """Pick the most specific gender signal from the product's full category paths.
+
+    Receives full path strings like "Default Category > Women > Tops > Hoodies"
+    so every ancestor node contributes to the match — not just the leaf name.
+    """
     if existing_gender:
         return existing_gender
-    blob = " ".join(category_names or [])
+    blob = " ".join(category_paths or [])
     if not blob.strip():
         return ""
     for label, pattern in _GENDER_PATTERNS:
@@ -199,51 +197,71 @@ def _iter_attributes(attributes: Any) -> list[tuple[str, list[str]]]:
     return out
 
 
-def _resolve_categories(product: Dict[str, Any]) -> tuple[str, list[tuple[str, str]], list[str]]:
-    """Return (joined_names_for_embed, [(id, name)...], [name_strings]) from the product.
+def _resolve_categories(
+    product: Dict[str, Any],
+) -> tuple[str, list[tuple[str, str, str]], list[str]]:
+    """Parse category data from the product dict.
 
-    Accepts every shape the Magento module (and the WooCommerce legacy ingest) may send:
-      * [{id, name}, ...]
-      * ["1", "2", "3"]        (IDs only — names remain empty but cat_{id} still indexed)
-      * "Cats > Subcat"         (already-joined string)
+    Returns:
+        joined_paths_for_embed  – full paths joined for the embedding line,
+                                  e.g. "Default Category > Women > Tops > Hoodies"
+        triples                 – [(id, leaf_name, full_path), ...]
+        path_strings            – [full_path, ...] used for gender inference
+
+    Accepts every shape the Magento module may send:
+      * [{id, name, path}, ...]   ← NEW preferred shape from updated PHP
+      * [{id, name}, ...]         ← legacy (no path field)
+      * ["1", "2", ...]           ← IDs only
+      * "Cats > Subcat"           ← pre-joined string
       * product['metadata']['categories'] with any of the above
     """
-
     raw = product.get("categories")
     if raw in (None, "", []):
         meta = product.get("metadata") or {}
         if isinstance(meta, dict):
             raw = meta.get("categories")
 
-    pairs: list[tuple[str, str]] = []
-    names: list[str] = []
+    triples: list[tuple[str, str, str]] = []   # (id, leaf_name, full_path)
+    path_strings: list[str] = []
 
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, dict):
-                cid = str(item.get("id") or "").strip()
-                cname = str(item.get("name") or "").strip()
+                cid       = str(item.get("id") or "").strip()
+                leaf_name = str(item.get("name") or "").strip()
+                # `path` is the full breadcrumb, e.g. "Default Category > Women > Tops > Hoodies"
+                full_path = str(item.get("path") or "").strip()
+
+                # Fall back: if no path sent, use leaf name as the path
+                # (keeps backward-compat with pre-update PHP versions)
+                if not full_path and leaf_name:
+                    full_path = leaf_name
+
                 if cid:
-                    pairs.append((cid, cname))
-                if cname:
-                    names.append(cname)
+                    triples.append((cid, leaf_name, full_path))
+                if full_path:
+                    path_strings.append(full_path)
+
             elif item not in (None, ""):
                 token = str(item).strip()
                 if token.isdigit():
-                    pairs.append((token, ""))
+                    triples.append((token, "", ""))
                 else:
-                    names.append(token)
+                    path_strings.append(token)
+
     elif isinstance(raw, str) and raw.strip():
-        for token in re.split(r"[,>]", raw):
+        # Pre-joined string — treat each segment as its own path
+        for token in re.split(r"[,]", raw):
             token = token.strip()
             if token:
                 if token.isdigit():
-                    pairs.append((token, ""))
+                    triples.append((token, "", ""))
                 else:
-                    names.append(token)
+                    path_strings.append(token)
 
-    joined = ", ".join(names)
-    return joined, pairs, names
+    # Build the embedding string from full paths (richer than leaf names alone)
+    joined = " | ".join(p for p in path_strings if p)
+    return joined, triples, path_strings
 
 
 def _resolve_tags(value: Any) -> str:
@@ -345,11 +363,7 @@ def format_product(
     attribute_vocab_sink: Optional[Dict[str, set[str]]] = None,
     category_vocab_sink: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Return (embedding_text, qdrant_payload) for a single product.
-
-    If vocab sinks are provided, attribute values and category ids get collected — used
-    by the sync router to persist a per-client vocabulary to MySQL after a batch.
-    """
+    """Return (embedding_text, qdrant_payload) for a single product."""
 
     parts: list[str] = []
     payload: Dict[str, Any] = {}
@@ -364,13 +378,17 @@ def format_product(
     if brand:
         parts.append(f"Brand: {brand}")
 
-    # Categories — accept list of {id,name}, list of IDs, or comma string.
-    cats_str, cat_pairs, cat_names = _resolve_categories(product)
+    # ── Categories ────────────────────────────────────────────────────────────
+    # cats_str    → full paths joined for embedding ("Default Cat > Women > Tops | Default Cat > Women > Sale")
+    # triples     → [(id, leaf_name, full_path), ...]
+    # path_strings→ [full_path, ...] — fed to gender inference so every ancestor
+    #               node contributes ("Women" is visible even if leaf is "Hoodies")
+    cats_str, cat_triples, path_strings = _resolve_categories(product)
     if cats_str:
         parts.append(f"Category: {cats_str}")
 
-    # Gender — explicit field wins; otherwise infer from category names.
-    gender = _infer_gender(cat_names, str(product.get("gender") or "").strip())
+    # Gender — explicit field wins; otherwise infer from full category paths.
+    gender = _infer_gender(path_strings, str(product.get("gender") or "").strip())
     if gender:
         parts.append(f"Gender: {gender}")
 
@@ -392,15 +410,24 @@ def format_product(
                 if attribute_vocab_sink is not None and value_key != "none":
                     attribute_vocab_sink.setdefault(key, set()).add(value_key)
 
-    for cid, cname in cat_pairs:
+    # Emit cat_{id} filter keys + feed category vocab sink.
+    # Now uses the triple (id, leaf_name, full_path) so the vocab sink stores
+    # the leaf name while the full path is what the embedder sees.
+    for cid, leaf_name, full_path in cat_triples:
         if not cid:
             continue
         payload[f"cat_{cid}"] = True
-        if category_vocab_sink is not None and cname:
-            category_vocab_sink[cid] = {"id": cid, "name": normalize_token(cname)}
+        if category_vocab_sink is not None:
+            # Prefer leaf_name for the display label; fall back to last segment of path.
+            display_name = leaf_name or (full_path.split(">")[-1].strip() if full_path else "")
+            if display_name:
+                category_vocab_sink[cid] = {
+                    "id": cid,
+                    "name": normalize_token(display_name),
+                    "path": full_path,          # ← store full path so downstream can re-infer
+                }
 
-    # HTML stripping — always route through html_to_structured_text, then _final_clean
-    # in case the upstream store already stripped tags but left entities/stray markers.
+    # HTML stripping
     short = html_to_structured_text(product.get("short_description") or product.get("summary") or "")
     if short:
         parts.append(f"Summary: {short}")
@@ -424,10 +451,6 @@ def format_product(
     if type_id:
         parts.append(f"Product type: {type_id}")
 
-    # Flatten variant attributes into filter keys + embed a readable summary.
-    # Also seed attr_map so the parent product inherits human-readable top-level
-    # fields (`color: "Red, Blue, Green"`, `size: "S, M, L"`) — otherwise the
-    # parent row ended up with no attribute fields even though its children did.
     if variant_attrs:
         summary_chunks: list[str] = []
         child_skus: list[str] = []
@@ -435,7 +458,6 @@ def format_product(
             key = normalize_token(attr_code)
             if not key:
                 continue
-            # "Color: Red, Blue, Green"
             readable = ", ".join(v for v in values if v)
             summary_chunks.append(f"{attr_code.replace('_', ' ').title()}: {readable}")
             if readable and key not in attr_map:
@@ -471,6 +493,9 @@ def format_product(
 
     image_url = _resolve_image(product.get("images") or product.get("image_url") or "")
 
+    # ── Build payload ─────────────────────────────────────────────────────────
+    # `categories` stored as full path strings so any future re-indexing or
+    # agent that reads the payload can still infer gender without re-fetching.
     payload.update(
         {
             "sku": sku,
@@ -483,18 +508,19 @@ def format_product(
             "regular_price": float(product.get("regular_price") or price_val or 0),
             "sale_price": float(product.get("sale_price") or 0),
             "on_sale": bool(product.get("on_sale", False)),
+            # Store full paths in the payload so the agent can display breadcrumbs.
             "categories": cats_str,
-            "category_ids": [cid for cid, _ in cat_pairs],
+            "category_paths": path_strings,                    # ← NEW: list of full paths
+            "category_ids": [cid for cid, _, _ in cat_triples],
             "tags": tags_str,
             "image_url": image_url,
             "stock_status": product.get("stock_status") or "instock",
             "average_rating": float(product.get("average_rating") or 0),
-            # Product-type metadata
             "type_id": type_id,
             "is_configurable": is_configurable,
             "has_variants": has_variants,
-            "variant_attributes": variant_attrs,           # { color: [Red, Blue], size: [S, M] }
-            "children": _clean_children_for_payload(children),  # [{sku, name, price, ...}, ...]
+            "variant_attributes": variant_attrs,
+            "children": _clean_children_for_payload(children),
             "child_skus": ",".join(
                 str(c.get("sku")) for c in children if isinstance(c, dict) and c.get("sku")
             ),
@@ -502,7 +528,6 @@ def format_product(
         }
     )
 
-    # Final safety pass — make sure no HTML leaks into the embedded text.
     embedded_text = _final_clean("\n".join(p for p in parts if p))
     return embedded_text, payload
 
@@ -623,7 +648,6 @@ def format_item(
         return format_widget(item)
     if content_type == "store_config":
         return format_store_config(item)
-    # Unknown type — treat as a generic blob, don't fail the whole batch.
     title = str(item.get("title") or item.get("name") or item.get("identifier") or "")
     content = html_to_structured_text(item.get("content") or item.get("description") or "")
     return (
