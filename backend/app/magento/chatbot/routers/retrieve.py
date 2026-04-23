@@ -15,7 +15,7 @@ import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from backend.app.services.database import get_db
@@ -55,12 +55,71 @@ class ProductRetrieveRequest(BaseModel):
     limit: int = 8
     rerank: bool = False  # admin-toggled — small LLM rerank of top-N
 
+    @field_validator("attribute_filters", mode="before")
+    @classmethod
+    def _coerce_attribute_filters(cls, value):
+        """PHP json-encodes empty arrays as `[]`, which doesn't match a `dict`
+        schema. Accept `None`/`[]`/list-of-{name,value}-dicts and coerce."""
+        if value in (None, "", [], {}):
+            return {}
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items() if v not in (None, "")}
+        if isinstance(value, list):
+            out: dict[str, str] = {}
+            for entry in value:
+                if isinstance(entry, dict):
+                    name = entry.get("name") or entry.get("key") or entry.get("code")
+                    val  = entry.get("value") or entry.get("option")
+                    if name and val:
+                        out[str(name)] = str(val)
+            return out
+        return {}
+
+    @field_validator("skus", "content_types", mode="before")
+    @classmethod
+    def _coerce_string_list(cls, value):
+        if value in (None, "", [], {}):
+            return []
+        if isinstance(value, str):
+            return [s.strip() for s in value.split(",") if s.strip()]
+        if isinstance(value, list):
+            return [str(v) for v in value if v not in (None, "")]
+        return []
+
+    @field_validator("min_price", "max_price", mode="before")
+    @classmethod
+    def _coerce_optional_float(cls, value):
+        if value in (None, "", [], {}):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("category_id", mode="before")
+    @classmethod
+    def _coerce_optional_str(cls, value):
+        if value in (None, "", [], {}):
+            return None
+        return str(value)
+
 
 class ContentRetrieveRequest(BaseModel):
     license_key: Optional[str] = None
     query: str
     content_types: list[str] = Field(default_factory=lambda: ["cms_page", "cms_block"])
     limit: int = 5
+
+    @field_validator("content_types", mode="before")
+    @classmethod
+    def _coerce_types(cls, value):
+        if value in (None, "", [], {}):
+            return ["cms_page", "cms_block"]
+        if isinstance(value, str):
+            return [s.strip() for s in value.split(",") if s.strip()]
+        if isinstance(value, list):
+            return [str(v) for v in value if v not in (None, "")]
+        return ["cms_page", "cms_block"]
 
 
 class AnswerRequest(BaseModel):
