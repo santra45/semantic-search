@@ -54,6 +54,11 @@ class ProductRetrieveRequest(BaseModel):
     category_id: Optional[str] = None
     limit: int = 8
     rerank: bool = False  # admin-toggled — small LLM rerank of top-N
+    # When `rerank=True` the reranker uses these to pick the right provider/model
+    # (otherwise falls back to the service's defaults, which may not match the
+    # tenant's billing config and will lose cost tracking).
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
 
     @field_validator("attribute_filters", mode="before")
     @classmethod
@@ -211,6 +216,8 @@ def retrieve_products(
                 hits,
                 license_data=license_data,
                 llm_api_key=embedding_api_key,
+                llm_provider=req.llm_provider,
+                llm_model=req.llm_model,
                 db=db,
             )
             mode = "semantic+rerank"
@@ -400,6 +407,8 @@ def _llm_rerank(
     *,
     license_data: dict,
     llm_api_key: Optional[str],
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
     db: Session,
 ) -> list[dict]:
     """Delegate to the existing llm_rerank_service already used by the /magento/search endpoint."""
@@ -409,8 +418,8 @@ def _llm_rerank(
         query,
         hits,
         len(hits),
-        llm_provider=None,
-        llm_model=None,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
         llm_api_key=llm_api_key,
         client_id=license_data["client_id"],
     ) or hits
