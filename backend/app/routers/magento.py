@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Request, Header
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, List, Optional
 from sqlalchemy.orm import Session
 
 from backend.app.services.cache_service import get_cached_embedding, get_cached_results, set_cached_embedding, set_cached_results, invalidate_client_results
@@ -11,9 +11,13 @@ from backend.app.services.intent_service import analyze_intent
 from backend.app.services.license_service import validate_license_key, check_search_quota, increment_search_count, log_search, increment_ingest_count, extract_license_key_from_authorization
 from backend.app.services.llm_key_service import decrypt_key
 from backend.app.services.llm_rerank_service import llm_rerank_products, should_use_llm_reranking
-from backend.app.services.product_service import build_product_text, extract_payload
 from backend.app.services.qdrant_service import search_products, upsert_product, delete_product, get_client_product_count
 from backend.app.services.rerank_service import extract_keywords, filter_and_rerank
+# Magento has richer product structure (configurables, variants, super-attrs)
+# than the generic WooCommerce format. Reuse the chatbot's Magento-aware
+# formatter so sync produces a payload with attr_*/cat_* filter keys, variant
+# rollups, and full category paths for downstream filtering and reranking.
+from backend.app.magento.chatbot.services.product_formatter import format_product
 import time
 
 router = APIRouter()
@@ -29,11 +33,31 @@ class MagentoSearchRequest(BaseModel):
     llm_api_key_encrypted: Optional[str] = None
 
 
+class MagentoChild(BaseModel):
+    """One configurable variant. attributes is {code: label}."""
+    product_id: str = ""
+    sku: str = ""
+    name: str = ""
+    price: float = 0
+    regular_price: float = 0
+    stock_status: str = "instock"
+    attributes: dict = Field(default_factory=dict)
+
+
 class MagentoProduct(BaseModel):
+    """Single Magento product.
+
+    All new fields are optional so older Magento module versions that send the
+    legacy shape (string `categories`, no `children`, etc.) still validate.
+    """
     product_id: str
     name: str
-    categories: str = ""
-    tags: str = ""
+    sku: str = ""
+    brand: str = ""
+    gender: str = ""
+    # Accepts legacy "Cat1 > Sub, Cat2" string OR new [{id,name,path},...] list.
+    categories: Any = Field(default_factory=list)
+    tags: Any = ""
     description: str = ""
     short_description: str = ""
     price: float = 0
@@ -47,6 +71,12 @@ class MagentoProduct(BaseModel):
     stock_status: str = "instock"
     average_rating: float = 0
     attributes: list = Field(default_factory=list)
+    # Configurable / variant data (empty for simple products)
+    type_id: str = "simple"
+    is_configurable: bool = False
+    has_variants: bool = False
+    children: List[MagentoChild] = Field(default_factory=list)
+    variant_attributes: dict = Field(default_factory=dict)
 
 
 class MagentoSyncBatchRequest(BaseModel):
@@ -276,9 +306,12 @@ def magento_sync_batch(
     for product in req.products:
         try:
             p = product.model_dump()
-            text = build_product_text(p)
+            # format_product returns (embedding_text, qdrant_payload). The
+            # payload includes attr_{code}_{value}=True, cat_{id}=True, and
+            # rollups (variant_attributes, children, child_skus) the search
+            # filters and the popup rely on.
+            text, payload = format_product(p)
             vector = embed_document(text, embedding_api_key, client_id)
-            payload = extract_payload(p)
             payload["embedded_text"] = text
             upsert_product(client_id, domain, product.product_id, vector, payload)
             success_ids.append(product.product_id)
