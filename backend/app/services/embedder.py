@@ -12,7 +12,7 @@ logger = logging.getLogger("embed_logger")
 # ── Pricing (per-token) ─────────────────────────────────────────────────────
 
 EMBED_PRICING = {
-    "gemini-embedding-001": {"input": 0.000000149},  # $0.149 per 1M tokens
+    "gemini-embedding-001": {"input": 0.00000015},  # $0.15 per 1M tokens
 }
 
 
