@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.services.cache_service import invalidate_client_results, r as redis_client
 from backend.app.services.database import get_db
-from backend.app.services.embedder import embed_document
+from backend.app.services.embedder import embed_document, embed_documents_batch
 from backend.app.services.license_service import increment_ingest_count
 from backend.app.services.qdrant_service import (
     delete_content_item,
@@ -161,6 +161,11 @@ def sync_batch(
     failed_ids: list[str] = []
     success_by_type: dict[str, int] = defaultdict(int)
 
+    # ── Phase 1: format every item, dedup-skip, collect for batched embed ──
+    # We do all the formatting and Redis dedup BEFORE calling Gemini, so the
+    # subsequent embed call only contains items that actually need work.
+    items_to_embed: list[tuple[SyncItem, str, dict[str, Any]]] = []
+
     for item in req.items:
         if item.content_type not in SUPPORTED_TYPES:
             failed_ids.append(item.entity_id)
@@ -187,9 +192,52 @@ def sync_batch(
             )
             payload["embedded_text"] = text_for_embed
             payload["store_code"] = item.store_code or req.store_code
+            items_to_embed.append((item, text_for_embed, payload))
+        except Exception:
+            failed_ids.append(item.entity_id)
 
-            vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
+    # ── Phase 2: batch-embed every surviving item in ONE Gemini call ───────
+    # Gemini's free tier counts a batched embed as a single request, so 50
+    # inputs cost 1 RPD instead of 50 RPD. On batch failure (e.g. one text
+    # exceeds the model's input token cap and Gemini rejects the whole call)
+    # we fall back to per-item embeds so partial failures are isolated.
+    vectors_by_index: list[Optional[list[float]]] = []
+    if items_to_embed:
+        texts = [tup[1] for tup in items_to_embed]
+        try:
+            vectors_by_index = list(
+                embed_documents_batch(
+                    texts,
+                    embedding_api_key,
+                    license_data["client_id"],
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Batch embed failed (%d items), falling back to per-item: %s",
+                len(items_to_embed),
+                exc,
+            )
+            vectors_by_index = []
+            for item, text, _ in items_to_embed:
+                try:
+                    vectors_by_index.append(
+                        embed_document(text, embedding_api_key, license_data["client_id"])
+                    )
+                except Exception as inner_exc:
+                    logger.error(
+                        "Per-item embed fallback failed for %s: %s",
+                        item.entity_id,
+                        inner_exc,
+                    )
+                    vectors_by_index.append(None)
 
+    # ── Phase 3: upsert each item with its embedding ───────────────────────
+    for (item, _text, payload), vector in zip(items_to_embed, vectors_by_index):
+        if vector is None:
+            failed_ids.append(item.entity_id)
+            continue
+        try:
             upsert_content_item(
                 client_id=license_data["client_id"],
                 domain=license_data["domain"],
