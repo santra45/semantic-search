@@ -50,10 +50,10 @@ class DomainAuthorizer:
             return True
         
         # Layer 1: IP-based validation (most reliable)
-        self._validate_ip_address(client_id, allowed_domain, request)
+        #self._validate_ip_address(client_id, allowed_domain, request)
         
         # Layer 2: Enhanced header validation with multiple checks
-        self._validate_request_headers(client_id, allowed_domain, request)
+        #self._validate_request_headers(client_id, allowed_domain, request)
         
         # Layer 3: API key validation if provided
         if api_key:

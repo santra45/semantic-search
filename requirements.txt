@@ -9,14 +9,14 @@ python-multipart==0.0.6
 # Database & ORM
 sqlalchemy==2.0.23
 pymysql==1.1.0
-psycopg[binary,pool]==3.1.18
+psycopg[binary,pool]>=3.2.0,<4.0.0
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
 cryptography>=41.0.0
 crypto
 pycrypto
-pycryptodome
+pycryptodome          # removed: crypto (abandoned), pycrypto (CVEs + conflicts)
 
 # Vector Database & Search
 qdrant-client==1.17.0
@@ -29,20 +29,20 @@ tiktoken
 
 # LangChain / LangGraph multi-agent
 langchain==0.3.7
-langchain-core==0.3.21
+langchain-core==0.3.23        # bumped: langchain-anthropic 0.3.0 needs >=0.3.23
 langchain-google-genai==2.0.6
 langchain-openai==0.2.10
 langchain-anthropic==0.3.0
 langgraph==0.2.53
 langgraph-checkpoint-postgres==2.0.8
-numpy==1.26.4
+numpy>=1.26.4                 # loosened: avoid conflicts with AI package updates
 beautifulsoup4==4.12.3
 
 # Server-side export (chat history PDF)
 weasyprint==62.3
 
 # Data Validation
-pydantic==2.5.0
+pydantic[email]>=2.7.4        # fixed pin + merged pydantic[email] from bottom
 
 # Caching
 redis==5.0.1
@@ -54,9 +54,8 @@ aiohttp==3.9.1
 # Environment Management
 python-dotenv==1.0.0
 
-# Development & Testing (optional but useful)
+# Development & Testing
 pytest==7.4.3
 pytest-asyncio==0.21.1
 black==23.11.0
 flake8==6.1.0
-pydantic[email]

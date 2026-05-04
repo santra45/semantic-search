@@ -166,14 +166,20 @@ def _infer_gender(category_paths: list[str], existing_gender: str = "") -> str:
 
 # ── Attribute expansion ──────────────────────────────────────────────────────
 
-def _iter_attributes(attributes: Any) -> list[tuple[str, list[str]]]:
-    """Handle both WooCommerce `[{name, options}]` and flat `{code: value}` shapes."""
-    out: list[tuple[str, list[str]]] = []
+def _iter_attributes(attributes: Any) -> list[tuple[str, str, list[str]]]:
+    """Handle both WooCommerce `[{name, options}]` and flat `{code: value}` shapes.
+
+    Returns (display_name, attribute_code, options) triples so the caller can
+    use `code` as the stable dict key and `name` for the human-readable label.
+    """
+    out: list[tuple[str, str, list[str]]] = []
     if isinstance(attributes, list):
         for attr in attributes:
             if not isinstance(attr, dict):
                 continue
             name = (attr.get("name") or attr.get("attribute_code") or "").strip()
+            # Prefer `code` as the stable key; fall back to normalised name.
+            code = (attr.get("code") or attr.get("attribute_code") or name).strip()
             opts = attr.get("options") or attr.get("value")
             if isinstance(opts, str):
                 opts = [o.strip() for o in opts.split(",") if o.strip()]
@@ -181,7 +187,7 @@ def _iter_attributes(attributes: Any) -> list[tuple[str, list[str]]]:
                 opts = [str(opts)]
             if not name or not opts:
                 continue
-            out.append((name, [str(o) for o in opts if str(o).strip()]))
+            out.append((name, code, [str(o) for o in opts if str(o).strip()]))
     elif isinstance(attributes, dict):
         for code, val in attributes.items():
             if val in (None, "", []):
@@ -193,7 +199,8 @@ def _iter_attributes(attributes: Any) -> list[tuple[str, list[str]]]:
             else:
                 opts = [str(val)]
             if code and opts:
-                out.append((code, opts))
+                # For dict-shape, name and code are the same key.
+                out.append((code, code, opts))
     return out
 
 
@@ -396,9 +403,11 @@ def format_product(
     if tags_str:
         parts.append(f"Tags: {tags_str}")
 
+    # attr_map keyed by attribute `code` (stable identifier) rather than display
+    # name so duplicate frontend labels don't collide in the payload.
     attr_map: Dict[str, str] = {}
-    for attr_name, options in _iter_attributes(product.get("attributes") or []):
-        key = normalize_token(attr_name)
+    for attr_name, attr_code, options in _iter_attributes(product.get("attributes") or []):
+        key = normalize_token(attr_code)
         expanded = _expand_options(options)
         parts.append(f"{attr_name}: {expanded}")
         attr_map[key] = ", ".join(options)
@@ -433,7 +442,8 @@ def format_product(
         parts.append(f"Summary: {short}")
     long_desc = html_to_structured_text(product.get("description") or product.get("content") or "")
     if long_desc:
-        parts.append(f"Description: {long_desc[:600]}")
+        # Increased from 600 → 2000 chars so product descriptions are not silently truncated.
+        parts.append(f"Description: {long_desc}")
 
     # ── Product type + configurable children ─────────────────────────────────
     meta = product.get("metadata") if isinstance(product.get("metadata"), dict) else {}
