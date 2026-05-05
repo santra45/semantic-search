@@ -19,12 +19,16 @@ logger = logging.getLogger(__name__)
 # Query types that can be tracked
 QUERY_TYPES = {
     'embed_search': 'embed_search',
-    'embed_document': 'embed_document', 
+    'embed_document': 'embed_document',
     'product_rerank': 'product_rerank',
     'content_rerank': 'content_rerank',
     'chat_answer': 'chat_answer',
     'chat_context': 'chat_context',
     'chat_rewrite': 'chat_rewrite',
+    # Intent classification — used by the Magento chatbot's LLMClassifier
+    # when the heuristic layer falls below confidence threshold and we
+    # need a single small structured-JSON call to pick the right agent.
+    'chat_intent': 'chat_intent',
 }
 
 class TokenUsageTracker:
