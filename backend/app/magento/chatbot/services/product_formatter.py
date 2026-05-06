@@ -436,7 +436,12 @@ def format_product(
                     "path": full_path,          # ← store full path so downstream can re-infer
                 }
 
-    # HTML stripping
+    # HTML stripping. Both fields are also surfaced into the payload below so
+    # downstream consumers (RAG summariser, ProductDetailAgent's fallback,
+    # `_format_product_source` in retrieve.py) can read them after retrieval.
+    # Without that, a product hit comes back with name+price+stock but no
+    # actual descriptive text — same shape-mismatch bug that left store_config
+    # snippets empty on the prompt side.
     short = html_to_structured_text(product.get("short_description") or product.get("summary") or "")
     if short:
         parts.append(f"Summary: {short}")
@@ -530,6 +535,12 @@ def format_product(
             "is_configurable": is_configurable,
             "has_variants": has_variants,
             "variant_attributes": variant_attrs,
+            # Plain-text descriptions, capped so they don't blow up the payload.
+            # `short_description` doubles as a snippet for product cards; the
+            # full `description` powers the RAG summariser and the
+            # "tell me about this product" fallback path.
+            "short_description": short[:600],
+            "description": long_desc[:2000],
             "children": _clean_children_for_payload(children),
             "child_skus": ",".join(
                 str(c.get("sku")) for c in children if isinstance(c, dict) and c.get("sku")

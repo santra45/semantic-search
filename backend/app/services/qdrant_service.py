@@ -111,18 +111,27 @@ def _format_hit(hit: Any) -> dict[str, Any]:
     payload = dict(hit.payload or {})
     content_type = payload.get("content_type", "product")
     entity_id_key = _type_specific_id_key(content_type)
+    # `label` covers store_config rows (whose human title lives there, not in
+    # `title`/`name`); leaving it out caused store_config search results to
+    # arrive at the RAG summarizer with an empty title and snippet, and the
+    # LLM correctly refused with the "I don't see that in our policies" line.
     title = (
         payload.get("title")
         or payload.get("name")
+        or payload.get("label")
         or payload.get("question")
         or payload.get("identifier")
         or ""
     )
+    # `value` is the store_config payload's actual answer text (e.g. the
+    # phone number, the address). Same reason: without it the snippet is
+    # empty for any /retrieve/content hit on store info.
     snippet = (
         payload.get("summary")
         or payload.get("excerpt")
         or payload.get("content")
         or payload.get("description")
+        or payload.get("value")
         or payload.get("short_description")
         or ""
     )

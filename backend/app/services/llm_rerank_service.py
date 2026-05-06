@@ -196,19 +196,19 @@ MODEL_PRICING = {
     "gemini-2.5-flash":          {"input": 0.0000003,    "output": 0.0000025},
     "gemini-2.5-flash-lite":     {"input": 0.0000001,    "output": 0.0000004},
     "gemma-3-27b-it":            {"input": 0.00000008,   "output": 0.00000016},
-    "gemma-4-31b-it":            {"input": 0.00000013,   "output": 0.00000038},
+    "gemma-4-31B-it":            {"input": 0.00000013,   "output": 0.00000038},
 
     # ── OpenAI ────────────────────────────────────────────────────────────────
-    "gpt-5.4":                    {"input": 0.0000025,    "output": 0.00001},
-    "gpt-5.4-mini":               {"input": 0.00000075,   "output": 0.0000045},
-    "gpt-5.4-nano":               {"input": 0.00000005,   "output": 0.0000004},
-    "gpt-5.2":                    {"input": 0.00000175,   "output": 0.000014},
+    "gpt-5.5":                   {"input": 0.000005,     "output": 0.00003},
+    "gpt-5.4-mini":              {"input": 0.00000075,   "output": 0.0000045},
+    "gpt-5.4-nano":              {"input": 0.0000002,    "output": 0.00000125},
+    "gpt-5.2":                   {"input": 0.00000175,   "output": 0.000014},
 
     # ── Anthropic ─────────────────────────────────────────────────────────────
-    "claude-opus-4-6":            {"input": 0.000005,     "output": 0.000025},
-    "claude-sonnet-4-6":          {"input": 0.000003,     "output": 0.000015},
-    "claude-haiku-4-5-20251001":  {"input": 0.000001,     "output": 0.000005},
-    "claude-3-5-sonnet-20241022": {"input": 0.000003, "output": 0.000015},
+    "claude-opus-4-6":           {"input": 0.000005,     "output": 0.000025},
+    "claude-sonnet-4-6":         {"input": 0.000003,     "output": 0.000015},
+    "claude-haiku-4-5-20251001": {"input": 0.000001,     "output": 0.000005},
+    "claude-3-5-sonnet-20241022":{"input": 0.000003,     "output": 0.000015},
 }
 
 def estimate_cost(model: str, usage: Dict) -> float:
