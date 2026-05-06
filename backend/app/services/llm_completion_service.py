@@ -48,13 +48,16 @@ def complete(
     api_key: Optional[str] = None,
     client_id: str = "anonymous",
     query_type: str = "chat_intent",
-) -> str:
+) -> tuple[str, dict]:
     """
-    Single-shot completion. Returns the raw text response — caller is
-    responsible for parsing (e.g. JSON.parse for classifier replies).
+    Single-shot completion. Returns ``(text, usage)`` where ``usage`` is
+    ``{"input": int, "output": int, "cost": float, "provider": str, "model": str}``.
 
     Tracks one row per call in token_usage_tracking with the supplied
-    query_type so cost rolls up alongside the other LLM operations.
+    query_type so cost rolls up alongside the other LLM operations. Callers
+    that want to surface per-call cost to a downstream client (e.g. the
+    Magento chatbot's per-message billing column) can use the returned
+    ``usage`` dict directly.
     """
     provider = (provider or "gemini").lower()
     model = model or DEFAULT_MODELS.get(provider, DEFAULT_MODELS["gemini"])
@@ -151,4 +154,10 @@ def complete(
     except Exception as e:
         logger.warning(f"⚠️ Failed to track usage for {query_type}: {e}")
 
-    return response_text
+    return response_text, {
+        "input":    int(usage["input"]),
+        "output":   int(usage["output"]),
+        "cost":     float(cost),
+        "provider": provider,
+        "model":    model,
+    }

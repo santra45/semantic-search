@@ -183,8 +183,8 @@ def build_product_text(p: dict) -> str:
     gender = p.get("gender", "").strip()
     if gender:
         parts.append(f"Gender: {gender}")
-        print(f"Gender: {gender}")
-    
+
+
     # ── 2. Categories (store owner already categorized correctly) ──────────
     cats_str = resolve_list_or_string(p.get("categories", []))
     if cats_str:

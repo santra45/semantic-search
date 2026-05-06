@@ -77,7 +77,7 @@ def classify(
     query_type = req.query_type if req.query_type in _ALLOWED_QUERY_TYPES else "chat_intent"
 
     try:
-        text = complete(
+        text, usage = complete(
             req.prompt,
             json_mode=req.json_mode,
             max_tokens=req.max_tokens,
@@ -96,4 +96,7 @@ def classify(
         # fall back to heuristic-only routing.
         raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}")
 
-    return {"text": text}
+    # `usage` carries input/output tokens, cost, provider, and model so the
+    # Magento side can persist a per-message billing row (matches the shape
+    # /retrieve/answer returns).
+    return {"text": text, "usage": usage}

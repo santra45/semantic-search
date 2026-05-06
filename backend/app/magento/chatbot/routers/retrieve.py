@@ -299,11 +299,17 @@ def retrieve_answer(
     )
 
     prompt = (
-        "You are a concise store assistant. Answer the user's question "
-        "using ONLY the sources below. If the sources don't answer it, say so honestly.\n\n"
-        f"User question: {req.query.strip()}\n\n"
-        f"Sources:\n{sources_blob}\n\n"
-        "Answer in 2-4 sentences. No markdown headings. No lists unless the user asked for one."
+        "You are a concise store assistant. Answer the customer's question using ONLY the sources below.\n\n"
+        "Rules:\n"
+        " - If the sources do not contain the answer, reply EXACTLY: "
+        "\"I don't see that in our policies — please contact support and they'll be able to help.\" Do not guess.\n"
+        " - Keep the answer to 1-2 short sentences.\n"
+        " - Put any concrete number, timeframe, or money value in **bold** (e.g. **30 days**, **$50**).\n"
+        " - Never invent SKUs, prices, dates, or policy terms that aren't in the sources.\n"
+        " - No markdown headings. No bulleted lists unless the customer explicitly asked for a list.\n"
+        " - Plain prose only — write the way a helpful human store assistant would.\n\n"
+        f"Customer question: {req.query.strip()}\n\n"
+        f"Sources:\n{sources_blob}"
     )
 
     from langchain_core.messages import HumanMessage
@@ -326,11 +332,24 @@ def retrieve_answer(
 
         answer_text = _extract_text(resp.content).strip()
         usage = getattr(resp, "usage_metadata", None) or {}
+        input_tokens  = int(usage.get("input_tokens",  0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+
+        # Cost is computed from the model pricing table — matches what the
+        # /classify endpoint returns so the Magento per-message billing row
+        # can sum cost across both call types without per-shape branches.
+        from backend.app.services.llm_rerank_service import MODEL_PRICING
+        pricing = MODEL_PRICING.get(model_name, {})
+        cost = (
+            input_tokens  * pricing.get("input",  0.0)
+            + output_tokens * pricing.get("output", 0.0)
+        )
+
         _log_ctx.record(
             response_text=answer_text,
-            input_tokens=int(usage.get("input_tokens", 0) or 0),
-            output_tokens=int(usage.get("output_tokens", 0) or 0),
-            cost=0.0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=float(cost),
             extra={"sources": len(req.sources or [])},
         )
     try:
@@ -339,8 +358,8 @@ def retrieve_answer(
             query_type="chat_answer",
             llm_provider=req.llm_provider or "google",
             llm_model=req.llm_model or "gemini-2.0-flash-lite",
-            input_tokens=int(usage.get("input_tokens", 0) or 0),
-            output_tokens=int(usage.get("output_tokens", 0) or 0),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             request_text_length=len(prompt),
             response_text_length=len(answer_text),
         )
@@ -351,8 +370,11 @@ def retrieve_answer(
         "answer": answer_text,
         "grounded": True,
         "usage": {
-            "input": int(usage.get("input_tokens", 0) or 0),
-            "output": int(usage.get("output_tokens", 0) or 0),
+            "input":    input_tokens,
+            "output":   output_tokens,
+            "cost":     float(cost),
+            "provider": provider_name,
+            "model":    model_name,
         },
     }
 
