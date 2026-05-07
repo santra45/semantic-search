@@ -412,8 +412,13 @@ def _format_cms_source(s: dict, ct: str, title: str) -> str:
     The LLM benefits from seeing the page's display heading and URL — both
     let it write a more specific answer ("see our **Return Policy** page
     for full details"). meta_description is added explicitly so it doesn't
-    get truncated when the body is long. Body cap raised from 800 → 1500
-    so multi-section policy pages are visible in full.
+    get truncated when the body is long.
+
+    Body cap is 4000 chars per source. With up to 6 sources passed to the
+    summariser, the prompt body block can grow to ~24000 chars — roughly
+    6000 tokens, comfortable inside any modern LLM's context window. If
+    you find the LLM losing the early sources to "lost in the middle",
+    drop this back to 2500-3000.
     """
     parts: list[str] = [f"[{ct}] {title}"]
 
@@ -436,7 +441,7 @@ def _format_cms_source(s: dict, ct: str, title: str) -> str:
     body = s.get("content") or s.get("summary") or ""
     if body:
         parts.append("")
-        parts.append(str(body)[:1500])
+        parts.append(str(body)[:4000])
 
     return "\n".join(parts)
 

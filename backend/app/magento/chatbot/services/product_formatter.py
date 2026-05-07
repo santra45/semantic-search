@@ -587,10 +587,27 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
       - content_heading is the on-page display heading, often more
         descriptive than the URL-friendly title.
 
-    Length budget — embedding sees up to ~3000 chars of body content (was
-    1500), payload keeps the full 4000. That gives long policy pages enough
-    room to be indexed in full while keeping the embedding focused on the
-    front of the document where the answer usually lives.
+    Length budget (rationale — see also the cms_block formatter below):
+
+      - Embedding text capped at 6000 chars (~1500 tokens). Sits well under
+        Gemini embedding-001's 2048-token ceiling, leaving room for the
+        title / heading / keywords lines that prefix the body. Any longer
+        and the front of the page dominates the embedding so heavily that
+        a query about the LAST paragraph of a policy stops matching.
+        Beyond ~6000 chars, chunking (one Qdrant point per section) is the
+        right answer rather than further bumping this cap.
+
+      - Payload `content` capped at 15000 chars. This is what the LLM reads
+        via _format_cms_source. Keeping more here than the embedding sees
+        means a page can be indexed by its first 6000 chars, but once
+        retrieved the LLM gets enough context to answer about later
+        sections too. 15000 chars is comfortable for one source inside a
+        prompt that ships up to 6 sources.
+
+      - Pages longer than ~15000 chars: the tail is silently dropped from
+        the payload too. If your store routinely has pages that long,
+        chunking — a separate Qdrant point per logical section, sharing
+        title/permalink — is the next refactor.
     """
     title            = str(page.get("title") or page.get("name") or "").strip()
     identifier       = str(page.get("identifier") or "").strip()
@@ -623,7 +640,7 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     if meta_keywords:
         parts.append(f"Keywords: {meta_keywords}")
     if content:
-        parts.append(f"Content: {content[:3000]}")
+        parts.append(f"Content: {content[:6000]}")
 
     payload = {
         "title":            title,
@@ -632,7 +649,11 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         "meta_description": meta_description,
         "meta_keywords":    meta_keywords,
         "identifier":       identifier,
-        "content":          content[:4000],
+        # 15000-char payload cap — what the LLM gets to read at retrieval
+        # time. Bigger than the embedding cap on purpose: the embedding
+        # only needs enough to hit a similarity match, the LLM needs enough
+        # to actually answer detail questions about later parts of the page.
+        "content":          content[:15000],
         "summary":          summary[:600],
         "permalink":        str(page.get("permalink") or ""),
         "status":           str(page.get("status") or "active"),
@@ -641,6 +662,18 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 
 
 def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Build (embedding_text, payload) for one CMS block.
+
+    Length budget — half the cms_page caps because blocks are usually
+    short reusable snippets (footer copy, banner text, contact-info widgets)
+    rather than full articles. Bumping these too high just dilutes the
+    embedding without buying retrieval quality.
+
+      - Embedding text capped at 3000 chars (~750 tokens).
+      - Payload content capped at 8000 chars — the LLM gets the full block
+        text even for unusually long blocks (FAQ blocks, multi-paragraph
+        legal disclaimers).
+    """
     title = str(block.get("title") or block.get("name") or "").strip()
     identifier = str(block.get("identifier") or "").strip()
     content = html_to_structured_text(block.get("content") or "")
@@ -649,12 +682,13 @@ def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     if identifier:
         parts.append(f"Identifier: {identifier}")
     if content:
-        parts.append(f"Content: {content[:1200]}")
+        parts.append(f"Content: {content[:3000]}")
 
     payload = {
         "title": title,
         "identifier": identifier,
-        "content": content[:2000],
+        "content": content[:8000],
+        "summary": content[:300],
         "status": block.get("status") or "active",
     }
     return _final_clean("\n".join(parts)), payload
