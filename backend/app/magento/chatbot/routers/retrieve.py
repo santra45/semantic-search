@@ -301,11 +301,13 @@ def retrieve_answer(
     prompt = (
         "You are a concise store assistant. Answer the customer's question using ONLY the sources below.\n\n"
         "Rules:\n"
-        " - If the sources do not contain the answer, reply EXACTLY: "
-        "\"I don't see that in our policies — please contact support and they'll be able to help.\" Do not guess.\n"
-        " - Keep the answer to 1-2 short sentences.\n"
-        " - Put any concrete number, timeframe, or money value in **bold** (e.g. **30 days**, **$50**).\n"
-        " - Never invent SKUs, prices, dates, or policy terms that aren't in the sources.\n"
+        " - If the sources don't contain the answer, say honestly in one sentence that you don't have that "
+        "specific information and suggest the customer check the product page or contact support. Do not guess "
+        "or invent details.\n"
+        " - Keep the answer to 1-2 short sentences. For \"tell me about\" requests, you may use 2-3 sentences.\n"
+        " - Put any concrete number, measurement, timeframe, or money value in **bold** (e.g. **30 days**, "
+        "**$50**, **1.5 kg**).\n"
+        " - Never invent SKUs, prices, dates, dimensions, or policy terms that aren't in the sources.\n"
         " - No markdown headings. No bulleted lists unless the customer explicitly asked for a list.\n"
         " - Plain prose only — write the way a helpful human store assistant would.\n\n"
         f"Customer question: {req.query.strip()}\n\n"
@@ -420,6 +422,22 @@ def _format_product_source(s: dict, title: str) -> str:
     if categories:
         parts.append(f"Categories: {categories}")
 
+    brand = s.get("brand")
+    if brand:
+        parts.append(f"Brand: {brand}")
+
+    # Attributes block — the LLM needs these to answer "what's the weight",
+    # "what's it made of", "who makes it", and any custom-attribute question
+    # the merchant exposed (battery life, dimensions, screen size etc.). The
+    # values are stored as flat top-level keys on the payload (color="Red",
+    # weight="1.5", etc.) by format_product. We iterate everything that
+    # ISN'T a known structural field, isn't a filter-flag boolean, and is a
+    # short scalar — that gives us the attribute set without a hard-coded
+    # whitelist that would miss merchant-defined attributes.
+    attribute_lines = _extract_attribute_lines(s)
+    if attribute_lines:
+        parts.append("Attributes:\n" + "\n".join(attribute_lines))
+
     # The critical bit: variant attributes + children so the LLM can
     # answer "what sizes does this come in".
     variant_attrs = s.get("variant_attributes") or {}
@@ -452,9 +470,54 @@ def _format_product_source(s: dict, title: str) -> str:
 
     desc = (s.get("description") or s.get("short_description") or s.get("summary") or "")
     if desc:
-        parts.append(f"Description: {str(desc)[:600]}")
+        parts.append(f"Description: {str(desc)[:1500]}")
 
     return "\n".join(parts)
+
+
+# Structural fields on a product source — they're surfaced explicitly above,
+# so we skip them when listing free-form attributes. Anything NOT in this set
+# and not prefixed `attr_` / `cat_` is treated as a merchant attribute the
+# LLM should see.
+_KNOWN_PRODUCT_FIELDS = frozenset({
+    "sku", "name", "title", "summary", "description", "short_description",
+    "permalink", "image_url", "price", "currency", "currency_symbol",
+    "regular_price", "sale_price", "on_sale", "average_rating",
+    "categories", "category_paths", "category_ids", "tags",
+    "stock_status", "type_id", "is_configurable", "has_variants",
+    "variant_attributes", "children", "child_skus",
+    "content_type", "entity_id", "client_id", "store_code", "embedded_text",
+    "score", "product_id", "page_id", "post_id", "value", "label", "key",
+    "identifier", "status", "meta_description", "updated_at",
+    "brand", "gender",   # already surfaced explicitly
+})
+
+
+def _extract_attribute_lines(s: dict) -> list[str]:
+    """Pull merchant attributes (weight, material, custom fields) out of the
+    payload and render them as a bulleted list. Skips structural fields,
+    filter booleans, and anything that isn't a short scalar so we don't dump
+    JSON blobs or 2000-char descriptions into the prompt twice."""
+    lines: list[str] = []
+    for key, value in s.items():
+        if key in _KNOWN_PRODUCT_FIELDS:
+            continue
+        if key.startswith("attr_") or key.startswith("cat_"):
+            continue
+        if value in (None, "", [], {}):
+            continue
+        # Only short scalars — long text is the description path.
+        if isinstance(value, (int, float)):
+            text = str(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text or len(text) > 200:
+                continue
+        else:
+            continue
+        label = key.replace("_", " ").strip().title()
+        lines.append(f"  - {label}: {text}")
+    return lines
 
 
 def _extract_text(content: Any) -> str:
