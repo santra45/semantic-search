@@ -35,14 +35,24 @@ except Exception:  # pragma: no cover
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _NEWLINES_RE = re.compile(r"\n{3,}")
+# Magento template directives — `{{block class="..."}}`, `{{widget type="..."}}`,
+# `{{config path="..."}}`, etc. The Magento providers now render these
+# server-side via FilterProvider before the content is shipped, but we keep
+# this stripper as a safety net for two cases:
+#   1. Older deployments still running the unpatched provider.
+#   2. Directives that fail to render (deleted block class, missing template)
+#      and fall through to the raw text.
+# Either way, raw `{{...}}` syntax should never reach the embedder.
+_MAGENTO_DIRECTIVE_RE = re.compile(r"\{\{[^}]*\}\}", re.DOTALL)
 
 
 def _final_clean(text: str) -> str:
-    """Guarantee no HTML tags or raw entities survive."""
+    """Guarantee no HTML tags, raw entities, or Magento directives survive."""
     if not text:
         return ""
     text = html_mod.unescape(text)
     text = _TAG_RE.sub(" ", text)
+    text = _MAGENTO_DIRECTIVE_RE.sub(" ", text)
     text = _WHITESPACE_RE.sub(" ", text)
     text = _NEWLINES_RE.sub("\n\n", text)
     return text.strip()
@@ -56,6 +66,13 @@ def html_to_structured_text(html: str) -> str:
     """Preserve semantic structure (paragraphs, bullets, table rows) when stripping HTML."""
     if not html:
         return ""
+
+    # Strip Magento directive syntax BEFORE parsing as HTML — BS4 treats
+    # `{{...}}` as plain text and would let it leak through to the embedder.
+    # This complements the Magento-side FilterProvider rendering: we render
+    # what we can server-side, then drop any literal directive that survived.
+    html = _MAGENTO_DIRECTIVE_RE.sub(" ", html)
+
     if not _HAS_BS4:
         return _strip_html_simple(html)
 
