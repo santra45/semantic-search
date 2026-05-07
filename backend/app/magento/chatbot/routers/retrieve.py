@@ -387,10 +387,11 @@ def retrieve_answer(
 def _format_source_for_prompt(s: dict) -> str:
     """Flatten one source into the text block the RAG summarizer sees.
 
-    For products we surface the variant breakdown, price, stock, and parent
-    SKU — otherwise the summarizer only sees a name and will say things like
-    'the sources don't list the available sizes' even though the data was
-    right there in the payload.
+    Per-content-type formatting because different shapes need different
+    framing for the LLM:
+      - product    → sku, variants, price, stock, attributes, description.
+      - cms_page / cms_block → URL, heading, meta description, content body.
+      - everything else → generic title + body fallback.
     """
     ct = (s.get("content_type") or "").lower()
     title = s.get("title") or s.get("name") or s.get("identifier") or s.get("sku") or ""
@@ -398,8 +399,46 @@ def _format_source_for_prompt(s: dict) -> str:
     if ct == "product" or s.get("sku") or s.get("type_id"):
         return _format_product_source(s, title)
 
+    if ct in ("cms_page", "cms_block"):
+        return _format_cms_source(s, ct, title)
+
     body = (s.get("summary") or s.get("content") or s.get("description") or "")[:800]
     return f"[{ct or 'source'}] {title}\n{body}"
+
+
+def _format_cms_source(s: dict, ct: str, title: str) -> str:
+    """Lay out a CMS page / block with all its useful framing context.
+
+    The LLM benefits from seeing the page's display heading and URL — both
+    let it write a more specific answer ("see our **Return Policy** page
+    for full details"). meta_description is added explicitly so it doesn't
+    get truncated when the body is long. Body cap raised from 800 → 1500
+    so multi-section policy pages are visible in full.
+    """
+    parts: list[str] = [f"[{ct}] {title}"]
+
+    heading = (s.get("content_heading") or "").strip()
+    if heading and heading.lower() != str(title).lower():
+        parts.append(f"Heading: {heading}")
+
+    permalink = (s.get("permalink") or "").strip()
+    if permalink:
+        parts.append(f"URL: {permalink}")
+
+    meta_desc = (s.get("meta_description") or "").strip()
+    if meta_desc:
+        parts.append(f"Summary: {meta_desc}")
+
+    keywords = (s.get("meta_keywords") or "").strip()
+    if keywords:
+        parts.append(f"Keywords: {keywords}")
+
+    body = s.get("content") or s.get("summary") or ""
+    if body:
+        parts.append("")
+        parts.append(str(body)[:1500])
+
+    return "\n".join(parts)
 
 
 def _format_product_source(s: dict, title: str) -> str:

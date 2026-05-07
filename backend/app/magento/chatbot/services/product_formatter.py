@@ -556,26 +556,69 @@ def format_product(
 # ── CMS page / block / widget / store config ─────────────────────────────────
 
 def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    title = str(page.get("title") or page.get("name") or "").strip()
-    identifier = str(page.get("identifier") or "").strip()
-    content = html_to_structured_text(page.get("content") or "")
-    meta_description = str(page.get("meta_description") or "").strip()
+    """Build (embedding_text, qdrant_payload) for one CMS page.
 
-    parts = [f"CMS Page: {title}"] if title else []
+    The embedding text now includes every retrieval-relevant field the
+    Magento provider ships — URL key, content heading, SEO title, SEO
+    description, keywords, then content. This matters because:
+
+      - meta_keywords is where merchants put synonyms ("returns, refunds,
+        exchanges, money back") that customers actually use in queries but
+        rarely appear in the page body verbatim.
+      - meta_description is curated 1-2 sentence prose, perfect for both
+        embedding signal and as a card snippet.
+      - content_heading is the on-page display heading, often more
+        descriptive than the URL-friendly title.
+
+    Length budget — embedding sees up to ~3000 chars of body content (was
+    1500), payload keeps the full 4000. That gives long policy pages enough
+    room to be indexed in full while keeping the embedding focused on the
+    front of the document where the answer usually lives.
+    """
+    title            = str(page.get("title") or page.get("name") or "").strip()
+    identifier       = str(page.get("identifier") or "").strip()
+    content_heading  = str(page.get("content_heading") or "").strip()
+    meta_title       = str(page.get("meta_title") or "").strip()
+    meta_description = str(page.get("meta_description") or "").strip()
+    meta_keywords    = str(page.get("meta_keywords") or "").strip()
+    content          = html_to_structured_text(page.get("content") or "")
+
+    # Snippet that ends up on the customer-facing card. The Magento provider
+    # already computes this with the same priority (meta_description first,
+    # then content[:300]) but we recompute defensively in case the provider
+    # didn't run the new logic — old payloads still in flight during a
+    # rolling deploy will fall through correctly.
+    summary = str(page.get("summary") or "").strip()
+    if not summary:
+        summary = meta_description or content[:300]
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"CMS Page: {title}")
+    if content_heading and content_heading.lower() != title.lower():
+        parts.append(f"Heading: {content_heading}")
+    if meta_title and meta_title.lower() not in {title.lower(), content_heading.lower()}:
+        parts.append(f"SEO Title: {meta_title}")
     if identifier:
         parts.append(f"URL Key: {identifier}")
     if meta_description:
-        parts.append(f"Summary: {meta_description}")
+        parts.append(f"Description: {meta_description}")
+    if meta_keywords:
+        parts.append(f"Keywords: {meta_keywords}")
     if content:
-        parts.append(f"Content: {content[:1500]}")
+        parts.append(f"Content: {content[:3000]}")
 
     payload = {
-        "title": title,
-        "identifier": identifier,
-        "content": content[:2000],
+        "title":            title,
+        "content_heading":  content_heading,
+        "meta_title":       meta_title,
         "meta_description": meta_description,
-        "permalink": page.get("permalink") or "",
-        "status": page.get("status") or "active",
+        "meta_keywords":    meta_keywords,
+        "identifier":       identifier,
+        "content":          content[:4000],
+        "summary":          summary[:600],
+        "permalink":        str(page.get("permalink") or ""),
+        "status":           str(page.get("status") or "active"),
     }
     return _final_clean("\n".join(parts)), payload
 
