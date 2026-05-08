@@ -27,6 +27,7 @@ KNOWN_CONTENT_TYPES = [
     "policy",
     "faq",
     "store_config",
+    "promotion",
     "page",
     "post",
 ]

@@ -45,7 +45,7 @@ from backend.app.magento.chatbot.services.product_formatter import format_item
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-SUPPORTED_TYPES = {"product", "cms_page", "cms_block", "widget", "store_config"}
+SUPPORTED_TYPES = {"product", "cms_page", "cms_block", "widget", "store_config", "promotion"}
 
 # Window for the "did we just embed this exact payload?" guard. Long enough
 # to absorb any near-simultaneous fires from multiple Magento modules sharing

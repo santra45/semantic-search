@@ -11,10 +11,12 @@ touch any identifiers beyond client_id (already anonymous).
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
@@ -386,6 +388,145 @@ def retrieve_answer(
             "model":    model_name,
         },
     }
+
+
+@router.post("/magento/chatbot/retrieve/answer/stream")
+def retrieve_answer_stream(
+    req: AnswerRequest,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    db: Session = Depends(get_db),
+):
+    """Streaming variant of /retrieve/answer.
+
+    Returns NDJSON (newline-delimited JSON), one event per line:
+        {"event": "token", "text": "..."}    — incremental chunk
+        {"event": "done",  "answer": "...", "usage": {...}}    — terminal
+
+    NDJSON over chunked transfer encoding rather than SSE because:
+      - PHP can read it as plain chunks via cURL WRITEFUNCTION (the Magento
+        proxy in Controller/Ajax/Stream.php) without needing an SSE parser.
+      - Frontend can use fetch + ReadableStream.getReader without
+        EventSource — fetch is what we already use for everything else.
+      - Restart-friendly: each line is a complete JSON object so a partial
+        chunk just means "wait for more bytes".
+
+    Behaviour parity with /retrieve/answer: same auth, same prompt, same
+    cost computation, same TokenUsageTracker write at the end. The only
+    difference is the response shape.
+    """
+    license_data = authorize_request(
+        request=request, db=db,
+        authorization=authorization, x_api_key=x_api_key,
+        request_license=req.license_key,
+    )
+
+    if not req.query.strip() or not req.sources:
+        raise HTTPException(status_code=400, detail="query and sources are required")
+
+    api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
+
+    from backend.app.magento.chatbot.agents.llm_factory import build_llm
+
+    llm = build_llm(
+        provider=req.llm_provider,
+        model=req.llm_model,
+        api_key=api_key,
+        temperature=0.2,
+    )
+
+    sources_blob = "\n\n".join(
+        _format_source_for_prompt(s) for s in req.sources[:6]
+    )
+
+    # Same prompt as the one-shot endpoint — keeps answer style consistent
+    # whether the merchant has streaming on or off.
+    prompt = (
+        "You are a concise store assistant. Answer the customer's question using ONLY the sources below.\n\n"
+        "Rules:\n"
+        " - If the sources don't contain the answer, say honestly in one sentence that you don't have that "
+        "specific information and suggest the customer check the product page or contact support. Do not guess "
+        "or invent details.\n"
+        " - Keep the answer to 1-2 short sentences. For \"tell me about\" requests, you may use 2-3 sentences.\n"
+        " - Put any concrete number, measurement, timeframe, or money value in **bold** (e.g. **30 days**, "
+        "**$50**, **1.5 kg**).\n"
+        " - Never invent SKUs, prices, dates, dimensions, or policy terms that aren't in the sources.\n"
+        " - No markdown headings. No bulleted lists unless the customer explicitly asked for a list.\n"
+        " - Plain prose only — write the way a helpful human store assistant would.\n\n"
+        f"Customer question: {req.query.strip()}\n\n"
+        f"Sources:\n{sources_blob}"
+    )
+
+    from langchain_core.messages import HumanMessage
+
+    provider_name = (req.llm_provider or "google").lower()
+    model_name    = req.llm_model or "gemini-2.0-flash-lite"
+
+    def event_stream():
+        # Accumulate as we go so we can compute total cost + write the
+        # tracker row once at the end. The langchain stream() yields
+        # AIMessageChunk objects; the FINAL chunk usually carries
+        # usage_metadata, but we max-merge across chunks to be safe.
+        full_answer: list[str] = []
+        in_tokens  = 0
+        out_tokens = 0
+        try:
+            for chunk in llm.stream([HumanMessage(content=prompt)]):
+                token_text = _extract_text(getattr(chunk, "content", "")) or ""
+                if token_text:
+                    full_answer.append(token_text)
+                    yield json.dumps({"event": "token", "text": token_text}) + "\n"
+                meta = getattr(chunk, "usage_metadata", None) or {}
+                if meta:
+                    in_tokens  = max(in_tokens,  int(meta.get("input_tokens",  0) or 0))
+                    out_tokens = max(out_tokens, int(meta.get("output_tokens", 0) or 0))
+        except Exception as exc:
+            logger.warning("retrieve/answer/stream LLM stream failed: %s", exc)
+            yield json.dumps({"event": "error", "message": "LLM unavailable"}) + "\n"
+            return
+
+        answer_text = "".join(full_answer).strip()
+
+        # Cost calculation — split into input/output components so the
+        # tracker row matches what /retrieve/answer writes (same fix from
+        # the cost-tracking bug we patched a few turns ago).
+        from backend.app.services.llm_rerank_service import MODEL_PRICING
+        pricing = MODEL_PRICING.get(model_name, {})
+        input_cost  = in_tokens  * pricing.get("input",  0.0)
+        output_cost = out_tokens * pricing.get("output", 0.0)
+        cost = input_cost + output_cost
+
+        try:
+            TokenUsageTracker(db).create_usage_record(
+                client_id=license_data["client_id"],
+                query_type="chat_answer",
+                llm_provider=provider_name,
+                llm_model=model_name,
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+                input_cost=float(input_cost),
+                output_cost=float(output_cost),
+                request_text_length=len(prompt),
+                response_text_length=len(answer_text),
+            )
+        except Exception:
+            pass
+
+        yield json.dumps({
+            "event":  "done",
+            "answer": answer_text,
+            "usage": {
+                "input":    in_tokens,
+                "output":   out_tokens,
+                "cost":     float(cost),
+                "provider": provider_name,
+                "model":    model_name,
+            },
+        }) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

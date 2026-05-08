@@ -694,6 +694,65 @@ def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     return _final_clean("\n".join(parts)), payload
 
 
+def format_promotion(promo: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Build (embedding_text, payload) for one active promotion / coupon rule.
+
+    The Magento provider already does most of the prose construction (title +
+    discount phrase + free shipping + description + coupon + validity, in
+    that order, joined into `content`). Here we just normalise the payload
+    and build a slightly more retrieval-friendly embedding text that
+    repeats key signal tokens — "promotion", "discount", "coupon",
+    "promo code" — so customer queries using any of those phrasings hit
+    the right point even when the rule's name doesn't include them.
+    """
+    title         = str(promo.get("name") or promo.get("title") or "Promotion").strip()
+    description   = str(promo.get("description") or "").strip()
+    discount_text = str(promo.get("discount_text") or "").strip()
+    coupon_code   = str(promo.get("coupon_code") or "").strip()
+    free_shipping = bool(promo.get("free_shipping", False))
+    from_date     = str(promo.get("from_date") or "").strip()
+    to_date       = str(promo.get("to_date") or "").strip()
+    body          = str(promo.get("content") or "").strip()
+
+    # Embedding text — lead with retrieval-boosting category words so a
+    # customer asking "any active discounts" / "promo codes" / "current
+    # deals" matches even rules whose name is a marketing slogan rather
+    # than a product-shape word.
+    parts = [
+        f"Promotion: {title}",
+        "Active discount, deal, sale, offer, special, coupon code.",
+    ]
+    if discount_text:
+        parts.append(f"Discount: {discount_text}")
+    if free_shipping:
+        parts.append("Free shipping included.")
+    if description:
+        parts.append(f"Description: {description}")
+    if coupon_code:
+        parts.append(f"Coupon code: {coupon_code}")
+    if from_date or to_date:
+        when = []
+        if from_date: when.append(f"from {from_date}")
+        if to_date:   when.append(f"until {to_date}")
+        parts.append("Valid " + " ".join(when))
+
+    payload = {
+        "title":         title,
+        "name":          title,
+        "description":   description,
+        "discount_text": discount_text,
+        "coupon_code":   coupon_code,
+        "free_shipping": free_shipping,
+        "from_date":     from_date,
+        "to_date":       to_date,
+        "content":       body or " ".join(parts),
+        "summary":       (title + (" — " + discount_text if discount_text else ""))[:300],
+        "permalink":     str(promo.get("permalink") or ""),
+        "status":        str(promo.get("status") or "active"),
+    }
+    return _final_clean("\n".join(parts)), payload
+
+
 def format_widget(widget: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     title = str(widget.get("title") or widget.get("instance_type") or "").strip()
     instance_type = str(widget.get("instance_type") or widget.get("type") or "").strip()
@@ -763,6 +822,8 @@ def format_item(
         return format_widget(item)
     if content_type == "store_config":
         return format_store_config(item)
+    if content_type == "promotion":
+        return format_promotion(item)
     title = str(item.get("title") or item.get("name") or item.get("identifier") or "")
     content = html_to_structured_text(item.get("content") or item.get("description") or "")
     return (
