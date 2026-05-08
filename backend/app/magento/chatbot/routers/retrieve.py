@@ -340,12 +340,17 @@ def retrieve_answer(
         # Cost is computed from the model pricing table — matches what the
         # /classify endpoint returns so the Magento per-message billing row
         # can sum cost across both call types without per-shape branches.
+        # Split into input_cost / output_cost so the token_usage_tracking
+        # row populates both component columns (the tracker computes
+        # total_cost = input_cost + output_cost internally). The previous
+        # version computed `cost` as a single value and never passed it to
+        # the tracker — every chat_answer row ended up with zeroed cost
+        # columns despite token counts being correct.
         from backend.app.services.llm_rerank_service import MODEL_PRICING
         pricing = MODEL_PRICING.get(model_name, {})
-        cost = (
-            input_tokens  * pricing.get("input",  0.0)
-            + output_tokens * pricing.get("output", 0.0)
-        )
+        input_cost  = input_tokens  * pricing.get("input",  0.0)
+        output_cost = output_tokens * pricing.get("output", 0.0)
+        cost = input_cost + output_cost
 
         _log_ctx.record(
             response_text=answer_text,
@@ -362,6 +367,8 @@ def retrieve_answer(
             llm_model=req.llm_model or "gemini-2.0-flash-lite",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            input_cost=float(input_cost),
+            output_cost=float(output_cost),
             request_text_length=len(prompt),
             response_text_length=len(answer_text),
         )
