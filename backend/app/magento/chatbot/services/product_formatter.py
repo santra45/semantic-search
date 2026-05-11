@@ -777,24 +777,72 @@ def format_widget(widget: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 
 
 def format_store_config(info: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    """For store metadata: hours, address, contact info, shipping policies, etc."""
-    key = str(info.get("key") or info.get("identifier") or "").strip()
+    """Build (embedding_text, payload) for a store_config composite snippet.
+
+    Adapted to the composite-snippet rewrite on the Magento side. Each row
+    now arrives as a rich blob with semantic anchors + factual data baked
+    into `content`, rather than a single bare label/value pair. The key
+    things the formatter does:
+
+      - Drops the old "Key: store_phone" line that used to sit between
+        label and value. The snake_case identifier was admin metadata —
+        zero retrieval value, just diluted the embedding.
+      - Uses `content` as the primary body (composite anchors + facts).
+        Falls back to `value` for legacy per-field rows from older syncs
+        so this formatter stays compatible with un-migrated points until
+        a re-sync.
+      - Surfaces both `value` and `content` in the payload — _format_hit
+        and frontend cards each have their own preference. Storing both
+        is cheap and avoids per-consumer translation.
+
+    Length budget: composite content can be 1-3KB after anchors + facts.
+    Caps mirror cms_block — generous enough for any single composite
+    without bloating the embedding window.
+    """
+    key   = str(info.get("key") or info.get("identifier") or "").strip()
     label = str(info.get("label") or info.get("title") or key).strip()
-    value = info.get("value") or info.get("content") or ""
-    if isinstance(value, (dict, list)):
-        value = html_mod.unescape(str(value))
-    value = html_to_structured_text(str(value))
 
-    parts = [f"Store Info: {label}"]
-    if key:
-        parts.append(f"Key: {key}")
-    if value:
-        parts.append(f"Value: {value[:1200]}")
+    # Content is the new composite body (anchors + facts). Value is the
+    # legacy short-form field — for new rows it carries the facts only
+    # (for chat-card display); for legacy per-field rows from old syncs
+    # it carries the bare value.
+    raw_content = info.get("content") or info.get("value") or ""
+    raw_value   = info.get("value")   or info.get("content") or ""
+    if isinstance(raw_content, (dict, list)):
+        raw_content = html_mod.unescape(str(raw_content))
+    if isinstance(raw_value, (dict, list)):
+        raw_value = html_mod.unescape(str(raw_value))
 
+    content = html_to_structured_text(str(raw_content))
+    value   = html_to_structured_text(str(raw_value))
+
+    # Embedding text — label as a one-line header, then the composite body.
+    # Composite bodies already lead with semantic anchors so retrieval
+    # catches the variety of customer phrasings; we don't add more here.
+    parts: list[str] = []
+    if label:
+        parts.append(label + ".")
+    if content:
+        parts.append(content[:3000])
+
+    # Summary is the short form the chat card shows. It comes from the
+    # Magento composite (first 300 chars of facts only — without the
+    # semantic anchors). Falls back to the value field for legacy per-row
+    # syncs that don't carry summary.
+    raw_summary = str(info.get("summary") or value or "")
+    summary = html_to_structured_text(raw_summary)[:300]
+
+    # Payload key order matters for _format_hit's snippet fallback chain
+    # (summary → excerpt → content → description → value → short_description).
+    # We want chat cards to show the short fact-only summary, NOT the full
+    # composite body with semantic anchors at the front. Setting summary
+    # explicitly here puts the right thing first in the chain.
     payload = {
-        "key": key,
-        "label": label,
-        "value": value[:1500],
+        "key":     key,
+        "label":   label,
+        "summary": summary,
+        "value":   value[:600],     # short form for card body fallback
+        "content": content[:4000],  # full composite body for the LLM
     }
     return _final_clean("\n".join(parts)), payload
 
