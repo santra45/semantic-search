@@ -108,6 +108,10 @@ class SyncBatchRequest(BaseModel):
 class SyncDeleteItem(BaseModel):
     entity_id: str
     content_type: str
+    # Optional: when present the per-store variant is targeted; when
+    # absent the legacy single-store point is targeted (back-compat with
+    # old callers that don't know about per-store sync yet).
+    store_code: Optional[str] = None
 
 
 class SyncDeleteRequest(BaseModel):
@@ -186,7 +190,14 @@ def sync_batch(
                 category_vocab_sink=category_vocab_sink if item.content_type == "product" else None,
             )
             payload["embedded_text"] = text_for_embed
-            payload["store_code"] = item.store_code or req.store_code
+
+            # store_code stamped onto payload + passed to upsert. When the
+            # Magento side runs per-store sync each batch carries the
+            # specific store_code; we use it both as the payload tag (so
+            # retrieve can filter) AND as part of the point id (so two
+            # store-views of the same entity don't overwrite each other).
+            store_code = item.store_code or req.store_code
+            payload["store_code"] = store_code
 
             vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
 
@@ -197,6 +208,7 @@ def sync_batch(
                 entity_id=item.entity_id,
                 vector=vector,
                 payload=payload,
+                store_code=store_code,
             )
             success_ids.append(item.entity_id)
             success_by_type[item.content_type] += 1
@@ -262,6 +274,7 @@ def sync_delete(
                 domain=license_data["domain"],
                 content_type=item.content_type,
                 entity_id=item.entity_id,
+                store_code=item.store_code,
             )
             deleted += 1
         except Exception:

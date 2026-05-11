@@ -62,6 +62,12 @@ class ProductRetrieveRequest(BaseModel):
     # tenant's billing config and will lose cost tracking).
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    # Customer's current store view. When set, retrieval is scoped to
+    # points tagged with this store_code (set by the Magento side at
+    # sync time from store->getCode()). Absent / empty means "no store
+    # filter" — used by legacy single-store deployments that pre-date
+    # per-store sync.
+    store_code: Optional[str] = None
 
     @field_validator("attribute_filters", mode="before")
     @classmethod
@@ -117,6 +123,8 @@ class ContentRetrieveRequest(BaseModel):
     query: str
     content_types: list[str] = Field(default_factory=lambda: ["cms_page", "cms_block"])
     limit: int = 5
+    # See ProductRetrieveRequest.store_code — same semantics.
+    store_code: Optional[str] = None
 
     @field_validator("content_types", mode="before")
     @classmethod
@@ -169,7 +177,7 @@ def retrieve_products(
 
     # ── Direct SKU lookup path (no embedding, no LLM) ────────────────────────
     if req.skus:
-        hits = _lookup_by_skus(client_id, domain, req.skus)
+        hits = _lookup_by_skus(client_id, domain, req.skus, store_code=req.store_code)
         return {
             "results": hits,
             "count": len(hits),
@@ -195,6 +203,7 @@ def retrieve_products(
         max_price=req.max_price,
         only_in_stock=req.only_in_stock,
         content_types=req.content_types or ["product"],
+        store_code=req.store_code,
     )
 
     # Attribute + category filtering — these are stored as payload booleans,
@@ -261,6 +270,7 @@ def retrieve_content(
         query_vector=query_vector,
         limit=req.limit,
         content_types=req.content_types or ["cms_page", "cms_block"],
+        store_code=req.store_code,
     )
     return {"results": hits, "count": len(hits)}
 
@@ -744,9 +754,21 @@ def _slug(value: str) -> str:
     return s.strip("_")
 
 
-def _lookup_by_skus(client_id: str, domain: str, skus: list[str]) -> list[dict]:
-    """Direct SKU lookup via Qdrant scroll with filter — no embedding required."""
-    from qdrant_client.models import FieldCondition, Filter, MatchAny
+def _lookup_by_skus(
+    client_id: str,
+    domain: str,
+    skus: list[str],
+    store_code: Optional[str] = None,
+) -> list[dict]:
+    """Direct SKU lookup via Qdrant scroll with filter — no embedding required.
+
+    When `store_code` is provided we also filter on it so multi-store
+    deployments return the customer's store-view variant of each SKU.
+    Without it (legacy single-store) we get whichever variant happens to
+    score first, which for single-store collections is fine (only one
+    variant exists anyway).
+    """
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
     collection = get_collection_name(client_id, domain)
     try:
@@ -754,9 +776,13 @@ def _lookup_by_skus(client_id: str, domain: str, skus: list[str]) -> list[dict]:
         if collection not in existing:
             return []
 
+        must = [FieldCondition(key="sku", match=MatchAny(any=skus))]
+        if store_code:
+            must.append(FieldCondition(key="store_code", match=MatchValue(value=store_code)))
+
         points, _ = qdrant.scroll(
             collection_name=collection,
-            scroll_filter=Filter(must=[FieldCondition(key="sku", match=MatchAny(any=skus))]),
+            scroll_filter=Filter(must=must),
             limit=max(10, len(skus) * 2),
             with_payload=True,
             with_vectors=False,
