@@ -206,8 +206,13 @@ def build_product_text(p: dict) -> str:
     if short:
         parts.append(f"Summary: {short}")
 
-    # ── 6. Full description — capped at 600 chars ─────────────────────────
-    desc = strip_html(p.get("description", "")).strip()[:600]
+    # ── 6. Full description — capped at 1500 chars ────────────────────────
+    # Was 600 — too short for catalogues that put warranty terms,
+    # dimensions, or care instructions in the body of the description.
+    # Embedding-window-wise 1500 still leaves headroom for the remaining
+    # fields below; 1500 matches the RAG payload cap downstream, so we
+    # don't lose any text that would otherwise reach the LLM.
+    desc = strip_html(p.get("description", "")).strip()[:1500]
     if desc:
         parts.append(f"Description: {desc}")
 

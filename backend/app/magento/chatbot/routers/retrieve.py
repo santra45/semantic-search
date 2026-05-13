@@ -68,6 +68,40 @@ class ProductRetrieveRequest(BaseModel):
     # filter" — used by legacy single-store deployments that pre-date
     # per-store sync.
     store_code: Optional[str] = None
+    # Sort intent extracted by the PHP classifier from phrases like
+    # "cheapest", "most expensive", "lowest priced". The Qdrant search
+    # itself returns by semantic similarity (vector cosine); we fetch a
+    # larger relevance-ordered pool, then apply this sort in Python over
+    # the on-topic candidates, then slice back to `limit`. So semantic
+    # relevance still gates which products appear, but the order honours
+    # the customer's stated preference.
+    #
+    # sort_by   — currently "price" only. Future-proofed for "name",
+    #             "rating", "newest" etc. Unknown values fall back to
+    #             vector relevance (no resort) instead of erroring.
+    # sort_order — "asc" | "desc". Defaults to "asc" when sort_by is set
+    #              and order is omitted.
+    sort_by: Optional[str] = None
+    sort_order: Optional[str] = None
+
+    @field_validator("sort_by", mode="before")
+    @classmethod
+    def _coerce_sort_by(cls, value):
+        if value in (None, "", [], {}):
+            return None
+        v = str(value).strip().lower()
+        # Whitelist known sort keys; silently drop unknowns rather than
+        # 422-ing so a forward-incompatible classifier output never
+        # breaks the retrieval call.
+        return v if v in {"price", "name", "rating", "newest"} else None
+
+    @field_validator("sort_order", mode="before")
+    @classmethod
+    def _coerce_sort_order(cls, value):
+        if value in (None, "", [], {}):
+            return None
+        v = str(value).strip().lower()
+        return v if v in {"asc", "desc"} else None
 
     @field_validator("attribute_filters", mode="before")
     @classmethod
@@ -145,6 +179,51 @@ class AnswerRequest(BaseModel):
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     llm_api_key_encrypted: Optional[str] = None
+    # Optional store contact details forwarded by the Magento agents
+    # (PolicyAgent / StoreInfoAgent / GenericChatAgent). When set, the
+    # prompt instructs the LLM to surface phone/email in any refusal so
+    # the customer always has a path forward. Pulled live from Magento's
+    # general/store_information/* config — universal across clients.
+    #
+    # Shape: {"phone": "+44 ...", "email": "support@..."}
+    contact: dict[str, str] = Field(default_factory=dict)
+    # Optional last-few-turns of conversation history for multi-turn
+    # follow-up queries ("what's the price of next-day delivery" after a
+    # product question about delivery options). Each item:
+    #   {"role": "user"|"assistant", "content": "..."}
+    # Capped at 6 turns by the prompt builder — older context is ignored.
+    conversation_history: list[dict[str, str]] = Field(default_factory=list)
+
+    @field_validator("contact", mode="before")
+    @classmethod
+    def _coerce_contact(cls, value):
+        if value in (None, "", [], {}):
+            return {}
+        if isinstance(value, dict):
+            out: dict[str, str] = {}
+            for key in ("phone", "email"):
+                v = value.get(key)
+                if v is not None and str(v).strip() != "":
+                    out[key] = str(v).strip()
+            return out
+        return {}
+
+    @field_validator("conversation_history", mode="before")
+    @classmethod
+    def _coerce_history(cls, value):
+        if value in (None, "", [], {}):
+            return []
+        if not isinstance(value, list):
+            return []
+        out: list[dict[str, str]] = []
+        for entry in value:
+            if not isinstance(entry, dict):
+                continue
+            role = str(entry.get("role") or "").strip().lower()
+            content = str(entry.get("content") or "").strip()
+            if role in ("user", "assistant") and content != "":
+                out.append({"role": role, "content": content})
+        return out[-6:]
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -191,8 +270,15 @@ def retrieve_products(
     embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
     query_vector = embed_query(req.query.strip(), embedding_api_key, client_id)
 
-    # Fetch over-broad so the post-filter has room to narrow down.
-    raw_limit = max(req.limit, req.limit * 3 if req.attribute_filters or req.category_id else req.limit)
+    # Fetch over-broad so the post-filter has room to narrow down. When a
+    # sort intent is present we widen even further — we want enough
+    # on-topic candidates that the price-sorted slice doesn't just show
+    # the same N closest-by-vector items. Universal: every catalog with
+    # > limit relevant items benefits from the wider pool.
+    fan_out = 3 if (req.attribute_filters or req.category_id) else 1
+    if req.sort_by:
+        fan_out = max(fan_out, 5)
+    raw_limit = max(req.limit, req.limit * fan_out)
 
     hits = qdrant_search_products(
         client_id=client_id,
@@ -217,6 +303,16 @@ def retrieve_products(
     if req.category_id:
         key = f"cat_{req.category_id}"
         hits = [h for h in hits if h.get(key) is True]
+
+    # ── Apply customer-requested sort on the on-topic candidate pool ─────
+    # Runs AFTER attribute/category narrowing so the sort operates on
+    # items that already match what the customer asked for. Vector
+    # relevance gated which products made it this far; the sort decides
+    # the final ordering. Stable sort preserves relevance order within
+    # equal sort keys, so a tie on price (rare in practice) keeps the
+    # most-relevant item on top.
+    if req.sort_by:
+        hits = _apply_sort(hits, req.sort_by, req.sort_order or "asc")
 
     hits = hits[: req.limit]
 
@@ -306,24 +402,11 @@ def retrieve_answer(
         temperature=0.2,
     )
 
-    sources_blob = "\n\n".join(
-        _format_source_for_prompt(s) for s in req.sources[:6]
-    )
-
-    prompt = (
-        "You are a concise store assistant. Answer the customer's question using ONLY the sources below.\n\n"
-        "Rules:\n"
-        " - If the sources don't contain the answer, say honestly in one sentence that you don't have that "
-        "specific information and suggest the customer check the product page or contact support. Do not guess "
-        "or invent details.\n"
-        " - Keep the answer to 1-2 short sentences. For \"tell me about\" requests, you may use 2-3 sentences.\n"
-        " - Put any concrete number, measurement, timeframe, or money value in **bold** (e.g. **30 days**, "
-        "**$50**, **1.5 kg**).\n"
-        " - Never invent SKUs, prices, dates, dimensions, or policy terms that aren't in the sources.\n"
-        " - No markdown headings. No bulleted lists unless the customer explicitly asked for a list.\n"
-        " - Plain prose only — write the way a helpful human store assistant would.\n\n"
-        f"Customer question: {req.query.strip()}\n\n"
-        f"Sources:\n{sources_blob}"
+    prompt = _build_answer_prompt(
+        query=req.query.strip(),
+        sources=req.sources,
+        contact=req.contact,
+        conversation_history=req.conversation_history,
     )
 
     from langchain_core.messages import HumanMessage
@@ -447,26 +530,13 @@ def retrieve_answer_stream(
         temperature=0.2,
     )
 
-    sources_blob = "\n\n".join(
-        _format_source_for_prompt(s) for s in req.sources[:6]
-    )
-
     # Same prompt as the one-shot endpoint — keeps answer style consistent
     # whether the merchant has streaming on or off.
-    prompt = (
-        "You are a concise store assistant. Answer the customer's question using ONLY the sources below.\n\n"
-        "Rules:\n"
-        " - If the sources don't contain the answer, say honestly in one sentence that you don't have that "
-        "specific information and suggest the customer check the product page or contact support. Do not guess "
-        "or invent details.\n"
-        " - Keep the answer to 1-2 short sentences. For \"tell me about\" requests, you may use 2-3 sentences.\n"
-        " - Put any concrete number, measurement, timeframe, or money value in **bold** (e.g. **30 days**, "
-        "**$50**, **1.5 kg**).\n"
-        " - Never invent SKUs, prices, dates, dimensions, or policy terms that aren't in the sources.\n"
-        " - No markdown headings. No bulleted lists unless the customer explicitly asked for a list.\n"
-        " - Plain prose only — write the way a helpful human store assistant would.\n\n"
-        f"Customer question: {req.query.strip()}\n\n"
-        f"Sources:\n{sources_blob}"
+    prompt = _build_answer_prompt(
+        query=req.query.strip(),
+        sources=req.sources,
+        contact=req.contact,
+        conversation_history=req.conversation_history,
     )
 
     from langchain_core.messages import HumanMessage
@@ -542,6 +612,99 @@ def retrieve_answer_stream(
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
+def _build_answer_prompt(
+    query: str,
+    sources: list[dict],
+    contact: Optional[dict] = None,
+    conversation_history: Optional[list[dict]] = None,
+) -> str:
+    """Single source of truth for the /retrieve/answer prompt — shared
+    between the one-shot and streaming endpoints so style and rules stay
+    in sync.
+
+    Extras vs. the original inline prompt:
+      - **Direction-of-flow rule**. The damage / return scenarios are
+        the dangerous-confidence failure mode: a customer says "my item
+        arrived damaged" and the only evidence covers "if you return a
+        damaged item, no refund". The LLM mashes them together and
+        sounds confident while saying the opposite of the right thing.
+        This rule tells it not to.
+      - **Conversation context**. Last 4-6 turns of the chat are
+        prepended so follow-ups ("what's the next-day delivery cost?"
+        after a question about delivery options) can resolve "what" to
+        the right subject.
+      - **Contact details on refusal**. When phone/email are forwarded
+        from Magento's store_information config, the LLM is asked to
+        include them in any "I don't have that" sentence — so the
+        customer always has a path forward even on a refusal.
+      - **Comparative requests**. A short note acknowledges the
+        comparative framing used by GenericChatAgent so the LLM doesn't
+        retreat to a one-sided answer when one operand has more sources.
+    """
+    sources_blob = "\n\n".join(
+        _format_source_for_prompt(s) for s in (sources or [])[:6]
+    )
+
+    contact_line = ""
+    if contact:
+        bits = []
+        if contact.get("phone"):
+            bits.append(f"**{contact['phone']}**")
+        if contact.get("email"):
+            bits.append(f"**{contact['email']}**")
+        if bits:
+            contact_line = (
+                "\n - When you have to say 'I don't have that information' or 'check the product page', "
+                "follow it in the SAME sentence with the store's contact details so the customer has a "
+                f"way forward: reach our team at {' or '.join(bits)}."
+            )
+
+    history_block = ""
+    if conversation_history:
+        history_lines = []
+        for turn in conversation_history[-6:]:
+            role = (turn.get("role") or "").strip().lower()
+            text = (turn.get("content") or "").strip()
+            if not text or role not in ("user", "assistant"):
+                continue
+            history_lines.append(
+                f"{'CUSTOMER' if role == 'user' else 'ASSISTANT'}: {text}"
+            )
+        if history_lines:
+            history_block = (
+                "\n\nConversation so far (most recent last) — use to resolve "
+                "pronouns and follow-ups, but don't quote it verbatim:\n"
+                + "\n".join(history_lines)
+            )
+
+    return (
+        "You are a concise store assistant. Answer the customer's question using ONLY the sources below.\n\n"
+        "Rules:\n"
+        " - If the sources don't contain the answer, say honestly in one sentence that you don't have that "
+        "specific information and suggest the customer check the product page or contact support. Do not guess "
+        "or invent details.\n"
+        " - Keep the answer to 1-2 short sentences. For \"tell me about\" requests, you may use 2-3 sentences.\n"
+        " - Put any concrete number, measurement, timeframe, or money value in **bold** (e.g. **30 days**, "
+        "**$50**, **1.5 kg**).\n"
+        " - Never invent SKUs, prices, dates, dimensions, or policy terms that aren't in the sources.\n"
+        " - No markdown headings. No bulleted lists unless the customer explicitly asked for a list.\n"
+        " - Plain prose only — write the way a helpful human store assistant would.\n"
+        " - **Direction of flow matters.** If the customer describes RECEIVING a damaged, broken, or "
+        "defective product, and the evidence only covers RETURNING such items (e.g. 'damaged-on-return' "
+        "or 'sender's responsibility'), do NOT apply that evidence to the customer's situation. Say plainly "
+        "that the policy in evidence is for customer-initiated returns, and that received-damaged claims "
+        "need to be raised with support — they're a separate process.\n"
+        " - **Comparative questions** (\"difference between X and Y\", \"X vs Y\"): contrast both sides "
+        "using only what the sources say about each. If the evidence covers only one side, name what "
+        "you do know and acknowledge the gap on the other."
+        + contact_line
+        + "\n\n"
+        f"Customer question: {query}"
+        + history_block
+        + f"\n\nSources:\n{sources_blob}"
+    )
+
+
 def _format_source_for_prompt(s: dict) -> str:
     """Flatten one source into the text block the RAG summarizer sees.
 
@@ -550,18 +713,24 @@ def _format_source_for_prompt(s: dict) -> str:
       - product    → sku, variants, price, stock, attributes, description.
       - cms_page / cms_block → URL, heading, meta description, content body.
       - everything else → generic title + body fallback.
+
+    When the source carries a `comparison_side` tag (set by
+    GenericChatAgent's comparative branch), the side is prepended so the
+    LLM can cleanly attribute facts to the right operand.
     """
     ct = (s.get("content_type") or "").lower()
     title = s.get("title") or s.get("name") or s.get("identifier") or s.get("sku") or ""
+    side = (s.get("comparison_side") or "").strip()
+    side_prefix = f"[COMPARE-SIDE: {side}] " if side else ""
 
     if ct == "product" or s.get("sku") or s.get("type_id"):
-        return _format_product_source(s, title)
+        return side_prefix + _format_product_source(s, title)
 
     if ct in ("cms_page", "cms_block"):
-        return _format_cms_source(s, ct, title)
+        return side_prefix + _format_cms_source(s, ct, title)
 
     body = (s.get("summary") or s.get("content") or s.get("description") or "")[:800]
-    return f"[{ct or 'source'}] {title}\n{body}"
+    return f"{side_prefix}[{ct or 'source'}] {title}\n{body}"
 
 
 def _format_cms_source(s: dict, ct: str, title: str) -> str:
@@ -752,6 +921,62 @@ def _slug(value: str) -> str:
     s = _re.sub(r"[^a-z0-9]+", "_", s)
     s = _re.sub(r"_+", "_", s)
     return s.strip("_")
+
+
+def _apply_sort(hits: list[dict], sort_by: str, sort_order: str) -> list[dict]:
+    """Apply a customer-requested sort to the (already-filtered) candidate
+    pool. Handles missing / non-numeric payload fields gracefully — items
+    with no sortable value drop to the end so they don't compete with
+    properly-priced items for the top slots.
+
+    sort_by   — "price" | "name" | "rating" | "newest". Anything else
+                falls through (returns hits unchanged) rather than
+                erroring, so a forward-compatible classifier output
+                doesn't break retrieval if it sends a sort the backend
+                hasn't learned yet.
+    sort_order — "asc" | "desc". Defaults to ascending for unknown values.
+    """
+    reverse = sort_order == "desc"
+
+    if sort_by == "price":
+        def key(h: dict) -> tuple[int, float]:
+            raw = h.get("price")
+            try:
+                v = float(raw)
+                if v <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                # No usable price → push to the back (group=1) regardless
+                # of asc/desc so the top of the list always shows items
+                # with real prices.
+                return (1, 0.0)
+            return (0, v)
+        return sorted(hits, key=key, reverse=reverse)
+
+    if sort_by == "name":
+        def key_name(h: dict) -> tuple[int, str]:
+            name = str(h.get("name") or h.get("title") or "").strip().lower()
+            return (0 if name else 1, name)
+        return sorted(hits, key=key_name, reverse=reverse)
+
+    if sort_by == "rating":
+        def key_rating(h: dict) -> tuple[int, float]:
+            try:
+                v = float(h.get("average_rating") or 0)
+            except (TypeError, ValueError):
+                v = 0.0
+            return (0 if v > 0 else 1, v)
+        return sorted(hits, key=key_rating, reverse=reverse)
+
+    if sort_by == "newest":
+        def key_newest(h: dict) -> tuple[int, str]:
+            ts = str(h.get("updated_at") or h.get("created_at") or "").strip()
+            return (0 if ts else 1, ts)
+        # "newest" naturally implies descending date order — flip when
+        # asc is explicitly requested.
+        return sorted(hits, key=key_newest, reverse=not (sort_order == "asc"))
+
+    return hits
 
 
 def _lookup_by_skus(
