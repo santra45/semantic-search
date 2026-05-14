@@ -13,36 +13,36 @@ psycopg[binary,pool]>=3.2.0,<4.0.0
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
-cryptography>=41.0.0
-crypto
-pycrypto
-pycryptodome          # removed: crypto (abandoned), pycrypto (CVEs + conflicts)
+cryptography==48.0.0
+crypto==1.4.1
+pycrypto==2.6.1
+pycryptodome==3.23.0
 
 # Vector Database & Search
 qdrant-client==1.17.0
 
 # AI / Embeddings
-google-genai
-openai
-anthropic
+google-genai==1.4.0
+openai==1.109.1
+anthropic==0.101.0
 tiktoken
 
 # LangChain / LangGraph multi-agent
 langchain==0.3.7
-langchain-core==0.3.23        # bumped: langchain-anthropic 0.3.0 needs >=0.3.23
+langchain-core==0.3.23
 langchain-google-genai==2.0.6
 langchain-openai==0.2.10
 langchain-anthropic==0.3.0
 langgraph==0.2.53
 langgraph-checkpoint-postgres==2.0.8
-numpy>=1.26.4                 # loosened: avoid conflicts with AI package updates
+numpy>=1.26.4
 beautifulsoup4==4.12.3
 
 # Server-side export (chat history PDF)
 weasyprint==62.3
 
 # Data Validation
-pydantic[email]>=2.7.4        # fixed pin + merged pydantic[email] from bottom
+pydantic[email]>=2.7.4
 
 # Caching
 redis==5.0.1
