@@ -127,8 +127,17 @@ def sync_batch(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
     x_magento_creds: Optional[str] = Header(None, alias="X-Magento-Admin-Creds-Encrypted"),
+    # When the Magento side sets this header (truthy value), skip the
+    # Redis dedup guard. Full-sync batches are authoritative — if we get
+    # the same product twice in a sync run, we WANT it embedded twice
+    # (the second one wins and reflects the latest state), not "counted
+    # as success but silently skipped". The dedup safety-net is only
+    # useful for the realtime observer path where multiple Magento
+    # modules might fire on the same product save in quick succession.
+    x_full_sync: Optional[str] = Header(None, alias="X-Full-Sync"),
     db: Session = Depends(get_db),
 ):
+    bypass_dedup = (x_full_sync or "").strip().lower() in ("1", "true", "yes")
     license_data = authorize_request(
         request=request, db=db,
         authorization=authorization, x_api_key=x_api_key,
@@ -174,13 +183,25 @@ def sync_batch(
         # same product save under the same license. The PHP-side ownership
         # helper covers the normal case; this catches the race window during
         # deploys and any future custom integrations posting the same item.
-        fingerprint = _payload_fingerprint(item.payload)
-        if not _claim_sync_slot(
-            license_data["client_id"], item.content_type, item.entity_id, fingerprint
-        ):
-            success_ids.append(item.entity_id)
-            success_by_type[item.content_type] += 1
-            continue
+        #
+        # Bypassed entirely during full sync (X-Full-Sync header set) —
+        # full-sync batches are authoritative and a duplicate should be
+        # re-embedded with the latest state, not counted-as-success-and-
+        # skipped. The dedup-as-success behaviour was the source of the
+        # demo-day "Magento says 852 processed but Qdrant has 285" mystery.
+        if not bypass_dedup:
+            fingerprint = _payload_fingerprint(item.payload)
+            if not _claim_sync_slot(
+                license_data["client_id"], item.content_type, item.entity_id, fingerprint
+            ):
+                logger.info(
+                    "sync_batch dedup-skipped %s/%s (fingerprint %s) — "
+                    "duplicate post within %ds. Set X-Full-Sync: 1 to bypass.",
+                    item.content_type, item.entity_id, fingerprint, _DEDUP_TTL_SECONDS,
+                )
+                success_ids.append(item.entity_id)
+                success_by_type[item.content_type] += 1
+                continue
 
         try:
             text_for_embed, payload = format_item(
