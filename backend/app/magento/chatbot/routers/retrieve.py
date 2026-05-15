@@ -739,26 +739,25 @@ def _build_answer_prompt(
 
     # Default "answer" purpose + "comparison" (same prompt, comparison
     # gets an extra hint via `instruction`).
-    contact_line = ""
-    if contact:
-        bits = []
-        if contact.get("phone"):
-            bits.append(f"**{contact['phone']}**")
-        if contact.get("email"):
-            bits.append(f"**{contact['email']}**")
-        if bits:
-            contact_line = (
-                "\n - When you have to say 'I don't have that information' or 'check the product page', "
-                "follow it in the SAME sentence with the store's contact details so the customer has a "
-                f"way forward: reach our team at {' or '.join(bits)}."
-            )
-
+    #
+    # NOTE: there used to be a `contact_line` directive here that asked
+    # the LLM to mention phone/email inline whenever it refused. That
+    # was the right idea at the time but it conflicts with the chip
+    # rendering UX — the frontend now shows clickable tel:/mailto:
+    # chips below every chatbot reply, so the LLM dumping the same
+    # numbers into its text body produced an ugly "duplicate contact"
+    # experience AND triggered refusals in cases where the evidence
+    # actually contained the answer (the LLM saw the "include contact"
+    # instruction and concluded it should refuse to use it). We rely on
+    # the chip channel for contact handoff; the LLM should produce
+    # clean answers using only the source content.
     return (
         "You are a concise store assistant. Answer the customer's question using ONLY the sources below.\n\n"
         "Rules:\n"
-        " - If the sources don't contain the answer, say honestly in one sentence that you don't have that "
-        "specific information and suggest the customer check the product page or contact support. Do not guess "
-        "or invent details.\n"
+        " - If the sources don't contain the answer, say honestly in one sentence that you don't have "
+        "that specific information. Do NOT include phone numbers or email addresses in your reply — the "
+        "interface renders contact options as separate clickable chips below your message; mentioning "
+        "them inline duplicates that and makes the reply feel cluttered.\n"
         " - Keep the answer to 1-2 short sentences. For \"tell me about\" requests, you may use 2-3 sentences.\n"
         " - Put any concrete number, measurement, timeframe, or money value in **bold** (e.g. **30 days**, "
         "**$50**, **1.5 kg**).\n"
@@ -769,11 +768,15 @@ def _build_answer_prompt(
         "defective product, and the evidence only covers RETURNING such items (e.g. 'damaged-on-return' "
         "or 'sender's responsibility'), do NOT apply that evidence to the customer's situation. Say plainly "
         "that the policy in evidence is for customer-initiated returns, and that received-damaged claims "
-        "need to be raised with support — they're a separate process.\n"
+        "need to be raised with the support team separately.\n"
         " - **Comparative questions** (\"difference between X and Y\", \"X vs Y\"): contrast both sides "
         "using only what the sources say about each. If the evidence covers only one side, name what "
-        "you do know and acknowledge the gap on the other."
-        + contact_line
+        "you do know and acknowledge the gap on the other.\n"
+        " - **When the question is about store info** (address, hours, phone, email, payment options, "
+        "shipping methods, etc.) and a `[store_config: ...]` source is present, USE the facts in that "
+        "source verbatim. The composite contains the literal values from the store's admin config — they "
+        "are authoritative. Do not say you don't have the information when a store_config source is "
+        "provided that contains the answer."
         + instruction_block
         + "\n\n"
         f"Customer question: {query}"
@@ -787,16 +790,21 @@ def _format_source_for_prompt(s: dict) -> str:
 
     Per-content-type formatting because different shapes need different
     framing for the LLM:
-      - product    → sku, variants, price, stock, attributes, description.
+      - product             → sku, variants, price, stock, attributes, description.
       - cms_page / cms_block → URL, heading, meta description, content body.
-      - everything else → generic title + body fallback.
+      - store_config         → the full composite body (contact_info, shipping_options,
+                               payment_options, store_identity, tax_info, store_rules,
+                               locale_info, social_links). Address/phone/hours live
+                               in `contact_info`; truncating these at 800 chars meant
+                               the LLM saw the anchors but not the actual facts.
+      - everything else      → generic title + body fallback.
 
     When the source carries a `comparison_side` tag (set by
     GenericChatAgent's comparative branch), the side is prepended so the
     LLM can cleanly attribute facts to the right operand.
     """
     ct = (s.get("content_type") or "").lower()
-    title = s.get("title") or s.get("name") or s.get("identifier") or s.get("sku") or ""
+    title = s.get("title") or s.get("name") or s.get("identifier") or s.get("sku") or s.get("label") or ""
     side = (s.get("comparison_side") or "").strip()
     side_prefix = f"[COMPARE-SIDE: {side}] " if side else ""
 
@@ -806,8 +814,60 @@ def _format_source_for_prompt(s: dict) -> str:
     if ct in ("cms_page", "cms_block"):
         return side_prefix + _format_cms_source(s, ct, title)
 
+    if ct == "store_config":
+        return side_prefix + _format_store_config_source(s, title)
+
     body = (s.get("summary") or s.get("content") or s.get("description") or "")[:800]
     return f"{side_prefix}[{ct or 'source'}] {title}\n{body}"
+
+
+def _format_store_config_source(s: dict, title: str) -> str:
+    """Lay out a store_config composite for the LLM.
+
+    StoreConfigContentProvider on the Magento side packs each composite
+    (contact_info, shipping_options, payment_options, store_identity,
+    tax_info, store_rules, locale_info, social_links) into a single
+    payload with:
+
+      - `label`   — human title (e.g. "Store contact information")
+      - `content` — anchors + facts ("Phone number: ...; Email: ...;
+                    Mailing address: street, city, postcode, country;
+                    Business hours: ...")
+      - `value`   — facts only, no anchors
+      - `summary` — first 300 chars of facts, used for card snippets
+
+    Previously the generic fallback read `summary` first and capped at
+    800 chars — so the LLM saw 300 chars of facts and lost half the
+    composite. That's why "what's the store address" got refused even
+    when the address WAS indexed: the address was past the 300-char cap.
+
+    Now we explicitly read `value` (facts only) preferring it over
+    `content` (which leads with anchor text the LLM doesn't need to
+    see), cap at 6000 chars (composites rarely exceed 2000), and tag
+    the source with its composite key so the LLM knows which kind of
+    info it's looking at.
+    """
+    key = str(s.get("key") or s.get("entity_id") or "").strip() or "store_config"
+
+    # `value` is "facts only" (no anchor preamble). Prefer it because
+    # the anchors are retrieval-only signal — at answer time they just
+    # take up token budget. Fall back to `content` (which contains
+    # anchors + facts) when `value` is empty (old payloads from before
+    # the composite split).
+    body = (
+        s.get("value")
+        or s.get("content")
+        or s.get("summary")
+        or ""
+    )
+    body = str(body).strip()[:6000]
+
+    label = title or s.get("label") or key.replace("_", " ").title()
+
+    parts = [f"[store_config: {key}] {label}"]
+    if body:
+        parts.append(body)
+    return "\n".join(parts)
 
 
 def _format_cms_source(s: dict, ct: str, title: str) -> str:
