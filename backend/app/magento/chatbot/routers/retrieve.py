@@ -870,7 +870,7 @@ def _format_store_config_source(s: dict, title: str) -> str:
         or s.get("summary")
         or ""
     )
-    body = str(body).strip()[:6000]
+    body = str(body)
 
     label = title or s.get("label") or key.replace("_", " ").title()
 
@@ -918,7 +918,7 @@ def _format_cms_source(s: dict, ct: str, title: str) -> str:
     body = s.get("content") or s.get("summary") or ""
     if body:
         parts.append("")
-        parts.append(str(body)[:15000])
+        parts.append(str(body))
 
     return "\n".join(parts)
 

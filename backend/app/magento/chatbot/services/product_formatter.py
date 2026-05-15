@@ -651,7 +651,7 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         parts.append(f"Indexing hints: {anchors}")
 
     if content:
-        parts.append(f"Content: {content[:6000]}")
+        parts.append(f"Content: {content}")
 
     payload = {
         "title":            title,
@@ -664,7 +664,7 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         # time. Bigger than the embedding cap on purpose: the embedding
         # only needs enough to hit a similarity match, the LLM needs enough
         # to actually answer detail questions about later parts of the page.
-        "content":          content[:15000],
+        "content":          content,
         "summary":          summary[:600],
         "permalink":        str(page.get("permalink") or ""),
         "status":           str(page.get("status") or "active"),
@@ -840,12 +840,12 @@ def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         parts.append(f"Indexing hints: {anchors}")
 
     if content:
-        parts.append(f"Content: {content[:3000]}")
+        parts.append(f"Content: {content}")
 
     payload = {
         "title": title,
         "identifier": identifier,
-        "content": content[:8000],
+        "content": content,
         "summary": content[:300],
         "status": block.get("status") or "active",
     }
@@ -981,7 +981,7 @@ def format_store_config(info: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     if label:
         parts.append(label + ".")
     if content:
-        parts.append(content[:3000])
+        parts.append(content)
 
     # Summary is the short form the chat card shows. It comes from the
     # Magento composite (first 300 chars of facts only — without the
@@ -999,8 +999,8 @@ def format_store_config(info: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         "key":     key,
         "label":   label,
         "summary": summary,
-        "value":   value[:600],     # short form for card body fallback
-        "content": content[:4000],  # full composite body for the LLM
+        "value":   value,     # short form for card body fallback
+        "content": content,  # full composite body for the LLM
     }
     return _final_clean("\n".join(parts)), payload
 
