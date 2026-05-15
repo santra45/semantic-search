@@ -639,6 +639,17 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         parts.append(f"Description: {meta_description}")
     if meta_keywords:
         parts.append(f"Keywords: {meta_keywords}")
+
+    # Same factual-anchor detection as cms_block — merchants sometimes
+    # put the store address or contact info on a page like `about-us`
+    # or `home` rather than a footer block, and pages with cryptic
+    # identifiers (`pp` for privacy policy, `info_main` for a catch-all
+    # info page) need the same help being retrievable for queries
+    # about the facts they happen to contain.
+    anchors = _detect_factual_anchors(content)
+    if anchors:
+        parts.append(f"Indexing hints: {anchors}")
+
     if content:
         parts.append(f"Content: {content[:6000]}")
 
@@ -661,6 +672,137 @@ def format_cms_page(page: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     return _final_clean("\n".join(parts)), payload
 
 
+# ─── Factual-content anchor detection ──────────────────────────────────────
+#
+# Merchants don't always file information where it "belongs". The store's
+# address often lives inside a footer CMS block named `sirena_footer` or
+# `footer_v2`, not the Magento general/store_information/* fields. The
+# return policy lives mixed into a page called `info_main` rather than a
+# dedicated `return-policy` page. Vector search can't find these for
+# queries like "what's the store address" because the block's title and
+# identifier carry zero address-related signal — only the body bytes do,
+# and they have to fight for attention against blocks with better names.
+#
+# These helpers scan the cleaned content for factual patterns (address-
+# shaped sequences, phone numbers, emails, hours-of-operation phrases,
+# policy keywords, payment-method mentions, VAT/tax identifiers). When
+# they fire, the formatter prepends explicit "this block contains X"
+# anchor sentences to the EMBEDDING text. The block becomes retrievable
+# for the natural-language queries customers actually use, regardless of
+# the merchant's identifier-naming hygiene. The PAYLOAD body is
+# untouched — the LLM still sees only the merchant's real content.
+#
+# Patterns kept deliberately broad (UK + US + generic numeric formats)
+# so the same code works across the geographies a Magento install can
+# serve. False positives are cheap (extra anchor text doesn't break
+# anything); false negatives are the failure mode we're fighting.
+
+_RE_UK_POSTCODE = re.compile(r"\b[A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2}\b")
+_RE_US_ZIP     = re.compile(r"\b\d{5}(?:-\d{4})?\b")
+_RE_GENERIC_POSTAL = re.compile(r"\b\d{4,6}\b")
+_RE_ADDRESS_WORDS = re.compile(
+    r"\b(?:unit|suite|floor|street|st\.?|avenue|ave\.?|road|rd\.?|lane|ln\.?|"
+    r"way|drive|dr\.?|plaza|park|estate|industrial|business)\b",
+    re.IGNORECASE,
+)
+_RE_PHONE = re.compile(
+    r"(?:\+\d{1,3}[\s\-\.]?)?(?:\(?\d{2,5}\)?[\s\-\.]?){2,4}\d{2,5}"
+)
+_RE_EMAIL = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", re.IGNORECASE)
+_RE_HOURS = re.compile(
+    r"\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\s*(?:[\-–to]+|–)\s*"
+    r"(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b"
+    r"|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*(?:[\-–to]+|until)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
+    re.IGNORECASE,
+)
+_RE_POLICY_KEYWORDS = re.compile(
+    r"\b(?:returns?|refunds?|warranty|guarantee|exchange|cancellation|"
+    r"delivery|shipping|dispatch|track(?:ing)?|policy|policies)\b",
+    re.IGNORECASE,
+)
+_RE_PAYMENT_KEYWORDS = re.compile(
+    r"\b(?:visa|mastercard|paypal|stripe|klarna|clearpay|afterpay|amex|"
+    r"american\s+express|maestro|discover|apple\s+pay|google\s+pay|"
+    r"bank\s+transfer|cash\s+on\s+delivery|cod\b)\b",
+    re.IGNORECASE,
+)
+_RE_TAX_KEYWORDS = re.compile(
+    r"\b(?:vat\b|gst\b|sales\s+tax|company\s+reg(?:istration)?(?:\s+(?:number|no))?"
+    r"|reg\.?\s*no\.?)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_factual_anchors(content: str) -> str:
+    """Scan messy CMS content for factual patterns and emit anchor
+    sentences that semantically describe what the block contains.
+
+    The anchors are prepended to the embedding text (not the payload), so
+    they help vector search find this block for queries about those facts
+    without changing what the LLM ultimately reads in its prompt.
+
+    Returns a single string (sentences space-joined) ready to drop into
+    the formatter's `parts` list. Empty when nothing factual is detected
+    — most decorative banners and CTA blocks fall through unchanged.
+    """
+    if not content:
+        return ""
+
+    anchors: list[str] = []
+
+    # Address: requires BOTH a postal-code-shaped sequence AND an
+    # address-word ("Unit", "Street", "Avenue", etc.). Either alone has
+    # too many false positives (a random 4-digit number; the word
+    # "street" mentioned in marketing copy). The combination is a strong
+    # signal.
+    has_postcode = (
+        _RE_UK_POSTCODE.search(content) is not None
+        or _RE_US_ZIP.search(content) is not None
+    )
+    if has_postcode and _RE_ADDRESS_WORDS.search(content):
+        anchors.append(
+            "This block contains the store's physical and mailing address. "
+            "Where the store is located. Postal address. Office address."
+        )
+
+    if _RE_PHONE.search(content):
+        anchors.append(
+            "This block contains a phone number. "
+            "Customer service phone. Contact phone number. Tel."
+        )
+
+    if _RE_EMAIL.search(content):
+        anchors.append(
+            "This block contains an email address. "
+            "Contact email. Customer support email. Get in touch."
+        )
+
+    if _RE_HOURS.search(content):
+        anchors.append(
+            "This block contains opening or business hours. "
+            "When the store is open. Trading hours."
+        )
+
+    if _RE_POLICY_KEYWORDS.search(content):
+        anchors.append(
+            "This block references store policies — "
+            "returns, refunds, warranty, shipping, delivery, cancellation."
+        )
+
+    if _RE_PAYMENT_KEYWORDS.search(content):
+        anchors.append(
+            "This block mentions accepted payment methods — "
+            "credit / debit cards, PayPal, bank transfer, cash on delivery."
+        )
+
+    if _RE_TAX_KEYWORDS.search(content):
+        anchors.append(
+            "This block contains VAT / tax / company registration details."
+        )
+
+    return " ".join(anchors)
+
+
 def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """Build (embedding_text, payload) for one CMS block.
 
@@ -673,6 +815,13 @@ def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
       - Payload content capped at 8000 chars — the LLM gets the full block
         text even for unusually long blocks (FAQ blocks, multi-paragraph
         legal disclaimers).
+
+    Factual anchors (see _detect_factual_anchors above) are prepended to
+    the embedding text when address / phone / email / hours / policy /
+    payment / tax patterns are detected in the body. This is what makes
+    a footer block named `sirena_footer` retrievable for "what's the
+    store address" queries even when the merchant's content hygiene is
+    nonexistent.
     """
     title = str(block.get("title") or block.get("name") or "").strip()
     identifier = str(block.get("identifier") or "").strip()
@@ -681,6 +830,15 @@ def format_cms_block(block: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     parts = [f"CMS Block: {title}"] if title else []
     if identifier:
         parts.append(f"Identifier: {identifier}")
+
+    # Factual-content anchors first, BEFORE the raw content — they're
+    # short and high-signal, so leading with them gives the embedding
+    # the right semantic centre of mass when the rest of the body is
+    # marketing copy or HTML cruft.
+    anchors = _detect_factual_anchors(content)
+    if anchors:
+        parts.append(f"Indexing hints: {anchors}")
+
     if content:
         parts.append(f"Content: {content[:3000]}")
 
