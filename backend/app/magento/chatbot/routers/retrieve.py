@@ -194,6 +194,36 @@ class AnswerRequest(BaseModel):
     # Capped at 6 turns by the prompt builder — older context is ignored.
     conversation_history: list[dict[str, str]] = Field(default_factory=list)
 
+    # Purpose switches the prompt template:
+    #
+    #   "answer"   (default) — strict grounded Q&A. Refuses when evidence
+    #                          doesn't support a claim. Used by PolicyAgent,
+    #                          StoreInfoAgent, GenericChatAgent for policy /
+    #                          info questions where confident-but-wrong
+    #                          answers are the failure mode to avoid.
+    #
+    #   "preamble"           — confirmation framing. Used by
+    #                          ProductSearchAgent's NL answer-line. Vector
+    #                          search has ALREADY filtered to relevant
+    #                          products; the LLM's job is to acknowledge
+    #                          the customer's request in one sentence
+    #                          using their phrasing, NOT to second-guess
+    #                          whether the evidence supports the claim.
+    #                          Skipping the strict refusal rule is the
+    #                          whole point.
+    #
+    #   "comparison"         — comparative framing. Used by GenericChatAgent's
+    #                          "X vs Y" branch. Asks the LLM to contrast
+    #                          both sides using product evidence per
+    #                          operand.
+    purpose: Optional[str] = "answer"
+    # Free-form extra instruction the caller wants surfaced in the
+    # prompt. ProductSearchAgent uses this to pass framing hints
+    # ("results are sorted cheapest first", "the customer described
+    # their situation as advisory"). Distinct from `query` so the LLM
+    # doesn't confuse the instruction with the customer's question.
+    instruction: Optional[str] = None
+
     @field_validator("contact", mode="before")
     @classmethod
     def _coerce_contact(cls, value):
@@ -407,6 +437,8 @@ def retrieve_answer(
         sources=req.sources,
         contact=req.contact,
         conversation_history=req.conversation_history,
+        purpose=req.purpose or "answer",
+        instruction=req.instruction,
     )
 
     from langchain_core.messages import HumanMessage
@@ -537,6 +569,8 @@ def retrieve_answer_stream(
         sources=req.sources,
         contact=req.contact,
         conversation_history=req.conversation_history,
+        purpose=req.purpose or "answer",
+        instruction=req.instruction,
     )
 
     from langchain_core.messages import HumanMessage
@@ -617,47 +651,41 @@ def _build_answer_prompt(
     sources: list[dict],
     contact: Optional[dict] = None,
     conversation_history: Optional[list[dict]] = None,
+    purpose: str = "answer",
+    instruction: Optional[str] = None,
 ) -> str:
     """Single source of truth for the /retrieve/answer prompt — shared
     between the one-shot and streaming endpoints so style and rules stay
     in sync.
 
-    Extras vs. the original inline prompt:
-      - **Direction-of-flow rule**. The damage / return scenarios are
-        the dangerous-confidence failure mode: a customer says "my item
-        arrived damaged" and the only evidence covers "if you return a
-        damaged item, no refund". The LLM mashes them together and
-        sounds confident while saying the opposite of the right thing.
-        This rule tells it not to.
-      - **Conversation context**. Last 4-6 turns of the chat are
-        prepended so follow-ups ("what's the next-day delivery cost?"
-        after a question about delivery options) can resolve "what" to
-        the right subject.
-      - **Contact details on refusal**. When phone/email are forwarded
-        from Magento's store_information config, the LLM is asked to
-        include them in any "I don't have that" sentence — so the
-        customer always has a path forward even on a refusal.
-      - **Comparative requests**. A short note acknowledges the
-        comparative framing used by GenericChatAgent so the LLM doesn't
-        retreat to a one-sided answer when one operand has more sources.
+    Three modes, switched by `purpose`:
+
+      "answer" (default) — strict grounded Q&A. Refuses when the
+        evidence doesn't support a claim. Right behaviour for policy /
+        info questions where confident-but-wrong is the failure mode.
+
+      "preamble" — confirmation framing for ProductSearchAgent's
+        natural-language answer line. Vector search has ALREADY filtered
+        to relevant products; the prompt's job is to acknowledge the
+        customer's request in one sentence, NOT to second-guess whether
+        the evidence supports the claim. The strict refusal rule is
+        DROPPED entirely — if the LLM hesitates here, it produces "I
+        don't have specific information about indoor water features"
+        while looking at four indoor water features, which is exactly
+        the failure the senior reported.
+
+      "comparison" — used by GenericChatAgent's comparative branch.
+        Contrasts both sides explicitly.
+
+    Across all modes:
+      - **Conversation context** (last 6 turns) for pronoun resolution.
+      - **Contact details on refusal** in "answer" mode only — preamble
+        doesn't refuse.
+      - **Direction-of-flow rule** for damage scenarios.
     """
     sources_blob = "\n\n".join(
         _format_source_for_prompt(s) for s in (sources or [])[:6]
     )
-
-    contact_line = ""
-    if contact:
-        bits = []
-        if contact.get("phone"):
-            bits.append(f"**{contact['phone']}**")
-        if contact.get("email"):
-            bits.append(f"**{contact['email']}**")
-        if bits:
-            contact_line = (
-                "\n - When you have to say 'I don't have that information' or 'check the product page', "
-                "follow it in the SAME sentence with the store's contact details so the customer has a "
-                f"way forward: reach our team at {' or '.join(bits)}."
-            )
 
     history_block = ""
     if conversation_history:
@@ -675,6 +703,54 @@ def _build_answer_prompt(
                 "\n\nConversation so far (most recent last) — use to resolve "
                 "pronouns and follow-ups, but don't quote it verbatim:\n"
                 + "\n".join(history_lines)
+            )
+
+    instruction_block = ""
+    if instruction:
+        instruction_block = f"\n\nAdditional framing instruction: {instruction.strip()}"
+
+    if purpose == "preamble":
+        # CONFIRMATION mode — used by ProductSearchAgent's NL answer-line.
+        # Drops the strict refusal rule. The product cards render below
+        # the message regardless, so the prompt's job is ONE sentence.
+        return (
+            "You are writing the lead-in sentence for a product search result. "
+            "Vector search has ALREADY confirmed these products match the customer's request — "
+            "your job is to acknowledge that match in natural language, NOT to second-guess "
+            "whether the evidence supports it.\n\n"
+            "Rules:\n"
+            " - Reply with ONE short sentence. Two at most.\n"
+            " - Use the customer's own phrasing where it fits (e.g. if they asked about "
+            "\"indoor water features\", use \"indoor water features\" in your reply — not "
+            "an internal attribute name).\n"
+            " - For yes/no questions, start with \"Yes\" or \"Yes — \".\n"
+            " - For \"which X would you suggest\" / \"recommend\" / \"help me choose\" "
+            "questions, frame as advice: \"For a small garden, here are some compact "
+            "options to consider:\", \"These would suit a beginner:\".\n"
+            " - Do NOT list product names or SKUs. Cards render below this sentence.\n"
+            " - Do NOT refuse or claim insufficient information. The match is real.\n"
+            " - Do NOT use markdown headings or bullets — plain prose only.\n"
+            + instruction_block
+            + "\n\n"
+            f"Customer question: {query}"
+            + history_block
+            + f"\n\nMatched products (for context — DO NOT list these by name):\n{sources_blob}"
+        )
+
+    # Default "answer" purpose + "comparison" (same prompt, comparison
+    # gets an extra hint via `instruction`).
+    contact_line = ""
+    if contact:
+        bits = []
+        if contact.get("phone"):
+            bits.append(f"**{contact['phone']}**")
+        if contact.get("email"):
+            bits.append(f"**{contact['email']}**")
+        if bits:
+            contact_line = (
+                "\n - When you have to say 'I don't have that information' or 'check the product page', "
+                "follow it in the SAME sentence with the store's contact details so the customer has a "
+                f"way forward: reach our team at {' or '.join(bits)}."
             )
 
     return (
@@ -698,6 +774,7 @@ def _build_answer_prompt(
         "using only what the sources say about each. If the evidence covers only one side, name what "
         "you do know and acknowledge the gap on the other."
         + contact_line
+        + instruction_block
         + "\n\n"
         f"Customer question: {query}"
         + history_block
@@ -741,11 +818,14 @@ def _format_cms_source(s: dict, ct: str, title: str) -> str:
     for full details"). meta_description is added explicitly so it doesn't
     get truncated when the body is long.
 
-    Body cap is 4000 chars per source. With up to 6 sources passed to the
-    summariser, the prompt body block can grow to ~24000 chars — roughly
-    6000 tokens, comfortable inside any modern LLM's context window. If
-    you find the LLM losing the early sources to "lost in the middle",
-    drop this back to 2500-3000.
+    Body cap: 15000 chars per source. CMS policy pages routinely run
+    several thousand words (return policy, warranty terms, FAQ pages);
+    the old 4000-char cap chopped them mid-sentence and the LLM could
+    only see the start. With Gemini's 1M-token context window plus
+    typical 6 sources × ~3700 tokens per source = ~22000 tokens, this
+    fits comfortably while letting full policy content reach the model.
+    If you find the LLM losing the early sources to "lost in the
+    middle", drop this back to 8000-10000.
     """
     parts: list[str] = [f"[{ct}] {title}"]
 
@@ -768,7 +848,7 @@ def _format_cms_source(s: dict, ct: str, title: str) -> str:
     body = s.get("content") or s.get("summary") or ""
     if body:
         parts.append("")
-        parts.append(str(body)[:4000])
+        parts.append(str(body)[:15000])
 
     return "\n".join(parts)
 
