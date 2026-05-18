@@ -28,9 +28,11 @@ from backend.app.services.database import get_db
 from backend.app.services.embedder import embed_document
 from backend.app.services.license_service import increment_ingest_count
 from backend.app.services.qdrant_service import (
+    CHUNKABLE_CONTENT_TYPES,
     delete_content_item,
     get_client_content_counts,
     get_client_product_count,
+    upsert_chunked_content_item,
     upsert_content_item,
 )
 
@@ -40,7 +42,20 @@ from backend.app.magento.chatbot.routers.common import (
     maybe_persist_magento_creds,
 )
 from backend.app.magento.chatbot.services import vocab_service
-from backend.app.magento.chatbot.services.product_formatter import format_item
+from backend.app.magento.chatbot.services.product_formatter import (
+    format_cms_block_chunkable,
+    format_cms_page_chunkable,
+    format_item,
+)
+from backend.app.magento.chatbot.services.text_chunker import chunk_text
+
+# How big each chunk's *body* gets, and how much context is carried across
+# adjacent chunk boundaries. 500 chars (~80-100 words) lets a single chunk
+# semantically centre on one paragraph or short section. 200-char overlap
+# preserves cross-paragraph context for queries that straddle a section
+# break.
+_CHUNK_TARGET_SIZE = 500
+_CHUNK_OVERLAP     = 200
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -117,6 +132,69 @@ class SyncDeleteItem(BaseModel):
 class SyncDeleteRequest(BaseModel):
     license_key: Optional[str] = None
     items: list[SyncDeleteItem] = Field(default_factory=list)
+
+
+def _process_chunkable_item(
+    item: "SyncItem",
+    store_code: str,
+    embedding_api_key: Optional[str],
+    license_data: dict[str, Any],
+) -> int:
+    """Embed + upsert one CMS-style item as N chunks.
+
+    Returns the number of chunks written. Raises on embedding failure
+    (caught by the outer loop's per-item try/except so one bad page
+    doesn't tank the whole batch).
+
+    The chunkable formatter splits the item into (header, body, base_payload):
+      - header  — title + metadata + factual anchors, repeated on every
+                  chunk's embedding so the vector stays grounded in the
+                  parent page.
+      - body    — the raw content, what gets sliced into chunks.
+      - base_payload — per-page metadata (title, identifier, permalink, …)
+                       copied onto every chunk's payload.
+
+    Each chunk's `content` in payload is just THAT chunk's body — when
+    retrieval matches chunk 3 of a long policy, the LLM sees that
+    paragraph specifically, not the whole page. The page-level title /
+    permalink / summary still ride along on every chunk so the chat card
+    UI and citation strip can identify the parent page.
+    """
+    if item.content_type == "cms_page":
+        header, body, base_payload = format_cms_page_chunkable(item.payload)
+    elif item.content_type == "cms_block":
+        header, body, base_payload = format_cms_block_chunkable(item.payload)
+    else:
+        # Defensive: outer loop should only route chunkable types here.
+        raise ValueError(f"non-chunkable content_type routed to chunked path: {item.content_type}")
+
+    base_payload["store_code"] = store_code
+
+    body_chunks = chunk_text(body, target_size=_CHUNK_TARGET_SIZE, overlap=_CHUNK_OVERLAP)
+
+    chunk_records: list[dict[str, Any]] = []
+    for idx, chunk_body in enumerate(body_chunks):
+        # Embed text = header + chunk body. Header repetition is the
+        # whole point of the chunked formatter — keeps every chunk's
+        # vector grounded in the page's title + meta + anchors.
+        embed_text = f"{header}\nContent: {chunk_body}" if header else chunk_body
+        vector = embed_document(embed_text, embedding_api_key, license_data["client_id"])
+        chunk_records.append({
+            "vector":        vector,
+            "content":       chunk_body,
+            "chunk_index":   idx,
+            "embedded_text": embed_text,
+        })
+
+    return upsert_chunked_content_item(
+        client_id=license_data["client_id"],
+        domain=license_data["domain"],
+        content_type=item.content_type,
+        entity_id=item.entity_id,
+        store_code=store_code,
+        chunks=chunk_records,
+        base_payload=base_payload,
+    )
 
 
 @router.post("/magento/chatbot/agent/sync/batch")
@@ -204,33 +282,50 @@ def sync_batch(
                 continue
 
         try:
-            text_for_embed, payload = format_item(
-                item.content_type,
-                item.payload,
-                attribute_vocab_sink=attribute_vocab_sink if item.content_type == "product" else None,
-                category_vocab_sink=category_vocab_sink if item.content_type == "product" else None,
-            )
-            payload["embedded_text"] = text_for_embed
-
             # store_code stamped onto payload + passed to upsert. When the
             # Magento side runs per-store sync each batch carries the
             # specific store_code; we use it both as the payload tag (so
             # retrieve can filter) AND as part of the point id (so two
             # store-views of the same entity don't overwrite each other).
             store_code = item.store_code or req.store_code
-            payload["store_code"] = store_code
 
-            vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
+            if item.content_type in CHUNKABLE_CONTENT_TYPES:
+                # Chunked path — N points per item. Each chunk's embedding
+                # gets the header prepended so it stays grounded in the
+                # parent page's title/identifier/anchors. upsert_chunked_
+                # content_item filter-deletes first so old chunks (or
+                # legacy single points pre-chunking) can't leave orphans.
+                _process_chunkable_item(
+                    item, store_code, embedding_api_key, license_data,
+                )
+            else:
+                # Single-point path — unchanged from pre-chunking behaviour
+                # so products / store_config / promotion / widget keep
+                # their existing deterministic UUIDs and need no resync.
+                text_for_embed, payload = format_item(
+                    item.content_type,
+                    item.payload,
+                    attribute_vocab_sink=attribute_vocab_sink if item.content_type == "product" else None,
+                    category_vocab_sink=category_vocab_sink if item.content_type == "product" else None,
+                )
+                payload["embedded_text"] = text_for_embed
+                payload["store_code"]    = store_code
 
-            upsert_content_item(
-                client_id=license_data["client_id"],
-                domain=license_data["domain"],
-                content_type=item.content_type,
-                entity_id=item.entity_id,
-                vector=vector,
-                payload=payload,
-                store_code=store_code,
-            )
+                vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
+
+                upsert_content_item(
+                    client_id=license_data["client_id"],
+                    domain=license_data["domain"],
+                    content_type=item.content_type,
+                    entity_id=item.entity_id,
+                    vector=vector,
+                    payload=payload,
+                    store_code=store_code,
+                )
+            # Item-level success — N chunks count as one item processed so
+            # the Magento progress bar (items shipped vs items acked)
+            # stays sane. Per-point counts would over-report by 5-10x for
+            # chunked content.
             success_ids.append(item.entity_id)
             success_by_type[item.content_type] += 1
         except Exception:

@@ -1005,6 +1005,118 @@ def format_store_config(info: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     return _final_clean("\n".join(parts)), payload
 
 
+# ── Chunkable variants (CMS pages + blocks) ─────────────────────────────────
+#
+# The chunked path splits *body* across N Qdrant points while repeating
+# *header* (title, identifier, SEO metadata, factual anchors) on each chunk's
+# embedding. That keeps every chunk's vector grounded in the page it came
+# from — without the header repeat, a paragraph 3000 chars into a "Returns
+# Policy" page would embed as just its own words, with nothing tying it back
+# to the policy concept for retrieval purposes.
+#
+# Returns: (header_text, body_text, base_payload). The sync router:
+#   1. chunks body_text into N chunks
+#   2. for each chunk i, embeds (header_text + "\nContent: " + chunk_i)
+#   3. upserts N points sharing base_payload but with per-chunk:
+#        - point id    = uuid5("{client}-{type}-{entity}-{store}-chunk-{i}")
+#        - content     = the chunk body (not the full page)
+#        - chunk_index = i
+#        - total_chunks = N
+#        - parent_entity_id = entity_id
+#
+# Length budgets here are *body* budgets — the header is short (~200-400
+# chars) and adds little to each chunk. Bumping body chunk size much past
+# 500 chars defeats the chunking goal (the first sentence of a long chunk
+# dominates the embedding again).
+
+def format_cms_page_chunkable(page: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    """Chunkable variant of format_cms_page. See module-level note above."""
+    title            = str(page.get("title") or page.get("name") or "").strip()
+    identifier       = str(page.get("identifier") or "").strip()
+    content_heading  = str(page.get("content_heading") or "").strip()
+    meta_title       = str(page.get("meta_title") or "").strip()
+    meta_description = str(page.get("meta_description") or "").strip()
+    meta_keywords    = str(page.get("meta_keywords") or "").strip()
+    content          = html_to_structured_text(page.get("content") or "")
+
+    summary = str(page.get("summary") or "").strip()
+    if not summary:
+        summary = meta_description or content[:300]
+
+    # Header — repeated verbatim on every chunk's embedding. Keep it tight
+    # (no full content here); the goal is to identify which page each chunk
+    # belongs to, not duplicate the body.
+    header_parts: list[str] = []
+    if title:
+        header_parts.append(f"CMS Page: {title}")
+    if content_heading and content_heading.lower() != title.lower():
+        header_parts.append(f"Heading: {content_heading}")
+    if meta_title and meta_title.lower() not in {title.lower(), content_heading.lower()}:
+        header_parts.append(f"SEO Title: {meta_title}")
+    if identifier:
+        header_parts.append(f"URL Key: {identifier}")
+    if meta_description:
+        header_parts.append(f"Description: {meta_description}")
+    if meta_keywords:
+        header_parts.append(f"Keywords: {meta_keywords}")
+    # Factual anchors run on the FULL body once (anchors fire on content
+    # signals — postcode, phone, hours — that may live anywhere in the
+    # page). Attach to the header so every chunk benefits, not just the
+    # chunk that happens to contain the anchored text.
+    anchors = _detect_factual_anchors(content)
+    if anchors:
+        header_parts.append(f"Indexing hints: {anchors}")
+
+    header_text = _final_clean("\n".join(header_parts))
+
+    # base_payload is the per-page metadata copied onto every chunk. The
+    # sync router overlays chunk-specific fields (content, chunk_index,
+    # total_chunks, parent_entity_id, summary).
+    base_payload = {
+        "title":            title,
+        "content_heading":  content_heading,
+        "meta_title":       meta_title,
+        "meta_description": meta_description,
+        "meta_keywords":    meta_keywords,
+        "identifier":       identifier,
+        # Note: `content` is intentionally OMITTED from base_payload —
+        # the sync router sets it per chunk to the chunk body. Letting
+        # the full page content leak through would defeat the
+        # "matched paragraph" semantic the chunking promises.
+        "summary":          summary[:600],
+        "permalink":        str(page.get("permalink") or ""),
+        "status":           str(page.get("status") or "active"),
+    }
+    return header_text, content, base_payload
+
+
+def format_cms_block_chunkable(block: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    """Chunkable variant of format_cms_block. See module-level note above."""
+    title      = str(block.get("title") or block.get("name") or "").strip()
+    identifier = str(block.get("identifier") or "").strip()
+    content    = html_to_structured_text(block.get("content") or "")
+
+    header_parts: list[str] = []
+    if title:
+        header_parts.append(f"CMS Block: {title}")
+    if identifier:
+        header_parts.append(f"Identifier: {identifier}")
+    anchors = _detect_factual_anchors(content)
+    if anchors:
+        header_parts.append(f"Indexing hints: {anchors}")
+
+    header_text = _final_clean("\n".join(header_parts))
+
+    base_payload = {
+        "title":      title,
+        "identifier": identifier,
+        # `content` deliberately omitted — set per chunk by the sync router.
+        "summary":    content[:300],
+        "status":     block.get("status") or "active",
+    }
+    return header_text, content, base_payload
+
+
 # ── Dispatcher ───────────────────────────────────────────────────────────────
 
 def format_item(

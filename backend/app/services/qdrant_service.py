@@ -7,8 +7,11 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    FilterSelector,
+    IsEmptyCondition,
     MatchAny,
     MatchValue,
+    PayloadField,
     PointStruct,
     Range,
     VectorParams,
@@ -31,6 +34,17 @@ KNOWN_CONTENT_TYPES = [
     "page",
     "post",
 ]
+
+# Content types whose body is split into multiple points instead of one.
+# When a chunked type is upserted we delete-by-filter on the parent
+# (content_type + entity_id + store_code) before inserting the new chunks,
+# which atomically:
+#   * removes any legacy single-point version (pre-chunking) for this entity
+#   * removes any old chunks left over when chunk count shrinks (5 chunks → 3)
+#
+# Adding a new chunkable type later: just add it here AND make sure
+# product_formatter has a matching format_<type>_chunkable function.
+CHUNKABLE_CONTENT_TYPES = {"cms_page", "cms_block"}
 
 
 def get_collection_name(client_id: str, domain: str) -> str:
@@ -94,6 +108,58 @@ def build_point_id(
             source = f"{client_id}-{content_type}-{entity_id}"
 
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, source))
+
+
+def build_chunk_point_id(
+    client_id: str,
+    content_type: str,
+    entity_id: str,
+    store_code: Optional[str],
+    chunk_index: int,
+) -> str:
+    """Deterministic Qdrant point id for one chunk of a chunkable entity.
+
+    Shape: `{client}-{type}-{entity}-{store}-chunk-{N}`. Different from
+    build_point_id() — the chunked id always carries store_code (defaults
+    to "default") and the chunk suffix, so two chunks of the same page
+    never collide and chunk N of page X resolves to a stable UUID across
+    re-syncs (in-place upsert, no orphan).
+
+    Why a separate function: keeping build_point_id() unchanged means the
+    legacy non-chunked path (products, store_config, etc.) keeps the
+    exact same UUIDs it had before this feature shipped, so no existing
+    client needs to re-sync those types.
+    """
+    sc = store_code or "default"
+    source = f"{client_id}-{content_type}-{entity_id}-{sc}-chunk-{int(chunk_index)}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, source))
+
+
+def _build_entity_filter(
+    client_id: str,
+    content_type: str,
+    entity_id: str,
+    store_code: Optional[str],
+) -> Filter:
+    """Filter matching every point belonging to one entity in one store.
+
+    Used for bulk-delete-by-entity (chunked upsert cleanup, chunked
+    delete). Matches BOTH legacy single-point variants AND new chunks
+    because both write the same payload fields (client_id, content_type,
+    entity_id, store_code).
+
+    Including client_id on the filter is defence-in-depth — every
+    collection is already per-tenant, but explicit beats implicit when
+    the cost is one extra condition.
+    """
+    must = [
+        FieldCondition(key="client_id",    match=MatchValue(value=str(client_id))),
+        FieldCondition(key="content_type", match=MatchValue(value=str(content_type))),
+        FieldCondition(key="entity_id",    match=MatchValue(value=str(entity_id))),
+    ]
+    if store_code:
+        must.append(FieldCondition(key="store_code", match=MatchValue(value=str(store_code))))
+    return Filter(must=must)
 
 
 def _type_specific_id_key(content_type: str) -> str:
@@ -222,7 +288,28 @@ def search_content(
     only_in_stock: bool = False,
     content_types: Optional[list[str]] = None,
     store_code: Optional[str] = None,
+    dedupe_by_parent: bool = True,
+    max_per_parent: int = 2,
 ) -> list[dict[str, Any]]:
+    """Vector search over the per-tenant collection.
+
+    Dedup-by-parent semantics:
+
+      When `dedupe_by_parent` is on (default), we fetch up to 3x `limit`
+      raw candidates and keep at most `max_per_parent` hits per
+      (content_type, parent_entity_id, store_code). This prevents one
+      verbose chunked page from monopolising the top-K — a 20-paragraph
+      Return Policy chunked into 20 points would otherwise return 20
+      copies of itself when the query matches the page strongly.
+
+      For non-chunked content (products, store_config) the dedup key is
+      always unique per point (no two products share the same entity_id
+      with the same store_code), so the dedup pass is a no-op.
+
+      `max_per_parent=2` allows compound questions to surface two
+      relevant paragraphs of the same page (e.g. "returns AND warranty"
+      both matching the policy page).
+    """
     collection_name = ensure_collection_exists(client_id, domain)
     query_filter = _build_content_filter(
         content_types=content_types,
@@ -232,15 +319,50 @@ def search_content(
         store_code=store_code,
     )
 
+    # Over-fetch when dedup is on so the post-filter pass has enough
+    # candidates to fill `limit` even when several top hits collapse
+    # into the same parent.
+    fetch_limit = min(limit * 3, 50) if dedupe_by_parent else limit
+
     result = qdrant.query_points(
         collection_name=collection_name,
         query=query_vector,
         query_filter=query_filter,
-        limit=limit,
+        limit=fetch_limit,
         with_payload=True,
     )
 
-    return [_format_hit(hit) for hit in result.points]
+    hits = [_format_hit(hit) for hit in result.points]
+    if not dedupe_by_parent:
+        return hits[:limit]
+    return _dedupe_by_parent(hits, limit, max_per_parent=max_per_parent)
+
+
+def _dedupe_by_parent(hits: list[dict[str, Any]], limit: int, max_per_parent: int = 2) -> list[dict[str, Any]]:
+    """Keep up to *max_per_parent* hits per (content_type, parent, store).
+
+    Iterates hits in score order (qdrant returns highest first), keeps the
+    first N hits per parent group, stops when *limit* total survivors are
+    collected. Stable: input order is preserved among kept hits.
+    """
+    if limit <= 0:
+        return []
+    counts: dict[tuple[str, str, str], int] = {}
+    out: list[dict[str, Any]] = []
+    for hit in hits:
+        parent = hit.get("parent_entity_id") or hit.get("entity_id") or ""
+        key = (
+            str(hit.get("content_type") or ""),
+            str(parent),
+            str(hit.get("store_code") or ""),
+        )
+        if counts.get(key, 0) >= max_per_parent:
+            continue
+        out.append(hit)
+        counts[key] = counts.get(key, 0) + 1
+        if len(out) >= limit:
+            break
+    return out
 
 
 def search_products(
@@ -306,6 +428,125 @@ def upsert_content_item(
     )
 
 
+def upsert_chunked_content_item(
+    client_id: str,
+    domain: str,
+    content_type: str,
+    entity_id: str,
+    store_code: Optional[str],
+    chunks: list[dict[str, Any]],
+    base_payload: dict[str, Any],
+) -> int:
+    """Replace every existing point for this entity with the given chunks.
+
+    Atomicity model (delete-first):
+
+      1. Filter-delete by (client_id, content_type, entity_id, store_code).
+         This wipes any legacy single-point variant AND any prior chunks
+         from an earlier sync — including the case where the chunk count
+         shrunk (5 chunks → 3), which a naive upsert-with-deterministic-ids
+         would leave with two orphans.
+
+      2. Upsert the N new chunks with deterministic ids
+         (build_chunk_point_id). Subsequent re-syncs of the same content
+         hit the same uuid5s, so concurrent reads see exactly one version
+         of each chunk index.
+
+      There is a brief window between (1) and (2) where the entity has no
+      points indexed. We chose this over "upsert-then-clean-orphans"
+      because the alternative would produce DUPLICATE retrieval hits
+      during the window (worse than briefly missing the entity).
+
+    Each chunk dict must carry {vector: list[float], content: str,
+    chunk_index: int}. base_payload supplies the shared per-entity fields
+    (title, identifier, permalink, summary, …). Returns the number of
+    points upserted.
+    """
+    if not chunks:
+        # Defensive: chunker always returns >= 1 chunk, but if a caller
+        # somehow passes an empty list we still want to clear any stale
+        # points rather than leave them.
+        delete_content_items_by_entity(client_id, domain, content_type, entity_id, store_code)
+        return 0
+
+    collection_name = ensure_collection_exists(client_id, domain)
+    total_chunks = len(chunks)
+    type_key = _type_specific_id_key(content_type)
+
+    # Step 1 — bulk-delete every point currently associated with this entity.
+    # Bypasses build_point_id entirely (filter on payload fields, not point
+    # ids), so it catches legacy single-point variants whose id used a
+    # different naming scheme.
+    qdrant.delete(
+        collection_name=collection_name,
+        points_selector=FilterSelector(
+            filter=_build_entity_filter(client_id, content_type, entity_id, store_code)
+        ),
+    )
+
+    # Step 2 — build + upsert the N new chunk points.
+    points: list[PointStruct] = []
+    for chunk in chunks:
+        idx = int(chunk["chunk_index"])
+        chunk_payload = {
+            **base_payload,
+            "client_id":        client_id,
+            "content_type":     content_type,
+            "entity_id":        str(entity_id),
+            type_key:           str(entity_id),
+            "parent_entity_id": str(entity_id),
+            "chunk_index":      idx,
+            "total_chunks":     total_chunks,
+            # Per-chunk fields. Content is the chunk body only — see the
+            # chunkable formatter for why we don't carry the full page
+            # text on every chunk.
+            "content":          str(chunk.get("content") or ""),
+            "embedded_text":    str(chunk.get("embedded_text") or ""),
+        }
+        if store_code and "store_code" not in chunk_payload:
+            chunk_payload["store_code"] = store_code
+
+        points.append(
+            PointStruct(
+                id=build_chunk_point_id(client_id, content_type, entity_id, store_code, idx),
+                vector=chunk["vector"],
+                payload=chunk_payload,
+            )
+        )
+
+    qdrant.upsert(collection_name=collection_name, points=points)
+    return len(points)
+
+
+def delete_content_items_by_entity(
+    client_id: str,
+    domain: str,
+    content_type: str,
+    entity_id: str,
+    store_code: Optional[str] = None,
+) -> None:
+    """Filter-based bulk delete — wipes every point for (entity, store).
+
+    Used by:
+      * upsert_chunked_content_item — clear before re-insert
+      * delete_content_item — when content_type is chunkable
+      * the /sync/delete handler — when content_type is chunkable
+
+    Idempotent: if no matching points exist (entity already gone) the
+    delete is a no-op. Filter-based so legacy single-point variants
+    AND new chunks are both removed in one call.
+    """
+    if not _collection_exists(client_id, domain):
+        return
+    collection_name = get_collection_name(client_id, domain)
+    qdrant.delete(
+        collection_name=collection_name,
+        points_selector=FilterSelector(
+            filter=_build_entity_filter(client_id, content_type, entity_id, store_code)
+        ),
+    )
+
+
 def upsert_product(client_id: str, domain: str, product_id: str, vector: list[float], payload: dict[str, Any]) -> None:
     upsert_content_item(client_id, domain, "product", product_id, vector, payload)
 
@@ -333,7 +574,15 @@ def delete_content_item(
 
     For sites running multi-store sync the delete observer should pass
     store_code explicitly (else the wrong-store-view variant survives).
+
+    Chunkable types route through delete_content_items_by_entity instead
+    so every chunk of the entity is removed in one filter-based call.
+    Falling back to a by-id delete would only wipe one chunk's UUID and
+    leave the other N-1 stranded.
     """
+    if content_type in CHUNKABLE_CONTENT_TYPES:
+        delete_content_items_by_entity(client_id, domain, content_type, entity_id, store_code)
+        return
     collection_name = ensure_collection_exists(client_id, domain)
     point_id = build_point_id(client_id, content_type, entity_id, store_code)
     qdrant.delete(collection_name=collection_name, points_selector=[point_id])
@@ -352,13 +601,50 @@ def delete_post(client_id: str, domain: str, post_id: str) -> None:
 
 
 def count_content_type(client_id: str, domain: str, content_type: str) -> int:
+    """Count how many *logical entities* of *content_type* are indexed.
+
+    For non-chunkable types (product, store_config, promotion, widget) this
+    is just a raw point count — one point per entity.
+
+    For chunkable types (cms_page, cms_block) one logical entity expands to
+    N Qdrant points after the chunking refactor. The admin KPI strip needs
+    to show entity-count ("50 pages indexed"), not point-count ("250 chunks"),
+    so we restrict the filter to:
+
+        chunk_index = 0   ← the first chunk of every new chunked entity
+      OR chunk_index missing  ← legacy single-point entities synced before
+                                 the chunking deploy
+
+    Both conditions are needed during the rollout window: stores that
+    haven't run a full re-sync since the chunking deploy still have the
+    legacy points without a `chunk_index` field. Counting them too keeps
+    the KPI honest for mixed-state collections.
+    """
     if not _collection_exists(client_id, domain):
         return 0
 
     collection_name = get_collection_name(client_id, domain)
+
+    if content_type in CHUNKABLE_CONTENT_TYPES:
+        count_filter = Filter(
+            must=[
+                FieldCondition(key="content_type", match=MatchValue(value=content_type)),
+            ],
+            # Qdrant semantics: `must AND (any of should)`. So this resolves
+            # to: content_type matches AND (chunk_index == 0 OR chunk_index
+            # is empty/missing). IsEmptyCondition matches null, missing
+            # field, and empty array — exactly the legacy-point shape.
+            should=[
+                FieldCondition(key="chunk_index", match=MatchValue(value=0)),
+                IsEmptyCondition(is_empty=PayloadField(key="chunk_index")),
+            ],
+        )
+    else:
+        count_filter = _build_content_filter(content_types=[content_type])
+
     result = qdrant.count(
         collection_name=collection_name,
-        count_filter=_build_content_filter(content_types=[content_type]),
+        count_filter=count_filter,
         exact=True,
     )
     return int(result.count or 0)
