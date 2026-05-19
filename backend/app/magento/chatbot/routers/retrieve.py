@@ -62,6 +62,12 @@ class ProductRetrieveRequest(BaseModel):
     # tenant's billing config and will lose cost tracking).
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    # Phase 2.2 — admin-toggled hybrid search. When True the handler
+    # generates a BM25 sparse vector alongside the dense query vector
+    # and asks Qdrant to fuse the two via RRF. When False the existing
+    # dense-only path runs unchanged. Magento threads this through from
+    # the `aichatbot/llm/hybrid_search_enabled` config flag.
+    hybrid: bool = False
     # Customer's current store view. When set, retrieval is scoped to
     # points tagged with this store_code (set by the Magento side at
     # sync time from store->getCode()). Absent / empty means "no store
@@ -159,6 +165,11 @@ class ContentRetrieveRequest(BaseModel):
     limit: int = 5
     # See ProductRetrieveRequest.store_code — same semantics.
     store_code: Optional[str] = None
+    # Phase 2.2 — same admin toggle as products. Particularly valuable
+    # for CMS / store-config queries where customers often use exact
+    # keywords ("warranty", "tax registration") that semantic search
+    # ranks below near-synonyms.
+    hybrid: bool = False
 
     @field_validator("content_types", mode="before")
     @classmethod
@@ -300,6 +311,18 @@ def retrieve_products(
     embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
     query_vector = embed_query(req.query.strip(), embedding_api_key, client_id)
 
+    # Phase 2.2 — when the admin has hybrid on, also generate a BM25
+    # sparse query vector. Soft-fail on import / inference errors so a
+    # malformed model cache or missing fastembed install degrades to
+    # dense-only instead of 500ing the request.
+    sparse_query_vector = None
+    if req.hybrid:
+        try:
+            from backend.app.services.sparse_embedder import embed_sparse_query
+            sparse_query_vector = embed_sparse_query(req.query.strip())
+        except Exception as exc:
+            logger.warning("retrieve/products hybrid sparse-embed failed: %s — dense-only", exc)
+
     # Fetch over-broad so the post-filter has room to narrow down. When a
     # sort intent is present we widen even further — we want enough
     # on-topic candidates that the price-sorted slice doesn't just show
@@ -320,6 +343,8 @@ def retrieve_products(
         only_in_stock=req.only_in_stock,
         content_types=req.content_types or ["product"],
         store_code=req.store_code,
+        hybrid=req.hybrid,
+        sparse_query_vector=sparse_query_vector,
     )
 
     # Attribute + category filtering — these are stored as payload booleans,
@@ -390,6 +415,17 @@ def retrieve_content(
     embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
     query_vector = embed_query(req.query.strip(), embedding_api_key, license_data["client_id"])
 
+    # Phase 2.2 — sparse query vector for hybrid mode. Same soft-fail
+    # pattern as retrieve_products so a CMS query never gets bricked by
+    # a BM25 cold-start glitch.
+    sparse_query_vector = None
+    if req.hybrid:
+        try:
+            from backend.app.services.sparse_embedder import embed_sparse_query
+            sparse_query_vector = embed_sparse_query(req.query.strip())
+        except Exception as exc:
+            logger.warning("retrieve/content hybrid sparse-embed failed: %s — dense-only", exc)
+
     hits = qdrant_search_content(
         client_id=license_data["client_id"],
         domain=license_data["domain"],
@@ -397,6 +433,8 @@ def retrieve_content(
         limit=req.limit,
         content_types=req.content_types or ["cms_page", "cms_block"],
         store_code=req.store_code,
+        hybrid=req.hybrid,
+        sparse_query_vector=sparse_query_vector,
     )
     return {"results": hits, "count": len(hits)}
 

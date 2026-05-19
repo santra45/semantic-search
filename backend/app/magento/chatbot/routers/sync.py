@@ -35,6 +35,12 @@ from backend.app.services.qdrant_service import (
     upsert_chunked_content_item,
     upsert_content_item,
 )
+# Phase 2.2 — BM25 sparse vectors written alongside the existing dense
+# Gemini vectors so hybrid search has something to fuse with on the read
+# side. Generation is ~5 ms CPU per text, no per-call $ cost. Imported
+# at module level (and not inside the loop) so the BM25 model loads
+# exactly once on first sync rather than once per item.
+from backend.app.services.sparse_embedder import embed_sparse_document
 
 from backend.app.magento.chatbot.routers.common import (
     authorize_request,
@@ -179,8 +185,23 @@ def _process_chunkable_item(
         # vector grounded in the page's title + meta + anchors.
         embed_text = f"{header}\nContent: {chunk_body}" if header else chunk_body
         vector = embed_document(embed_text, embedding_api_key, license_data["client_id"])
+        # Phase 2.2 — sparse BM25 vector generated from the SAME embed
+        # text the dense vector saw. Fast (~5 ms CPU) and free; cached
+        # nothing because each chunk is unique. Failure is non-fatal —
+        # if BM25 generation crashes we log and continue with dense-
+        # only for this chunk (point still reachable, just no BM25
+        # contribution at search time).
+        try:
+            sparse_vector = embed_sparse_document(embed_text)
+        except Exception as exc:
+            logger.warning(
+                "sparse embed failed for chunk %s/%s idx=%d: %s — proceeding dense-only",
+                item.content_type, item.entity_id, idx, exc,
+            )
+            sparse_vector = None
         chunk_records.append({
             "vector":        vector,
+            "sparse_vector": sparse_vector,
             "content":       chunk_body,
             "chunk_index":   idx,
             "embedded_text": embed_text,
@@ -302,6 +323,11 @@ def sync_batch(
                 # Single-point path — unchanged from pre-chunking behaviour
                 # so products / store_config / promotion / widget keep
                 # their existing deterministic UUIDs and need no resync.
+                #
+                # Phase 2.2: also generate a sparse BM25 vector from the
+                # same embed text so hybrid search has signal on these
+                # types too. fastembed BM25 is ~5 ms CPU; soft-fails to
+                # None on error and the point upserts dense-only.
                 text_for_embed, payload = format_item(
                     item.content_type,
                     item.payload,
@@ -312,6 +338,14 @@ def sync_batch(
                 payload["store_code"]    = store_code
 
                 vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
+                try:
+                    sparse_vector = embed_sparse_document(text_for_embed)
+                except Exception as exc:
+                    logger.warning(
+                        "sparse embed failed for %s/%s: %s — proceeding dense-only",
+                        item.content_type, item.entity_id, exc,
+                    )
+                    sparse_vector = None
 
                 upsert_content_item(
                     client_id=license_data["client_id"],
@@ -321,6 +355,7 @@ def sync_batch(
                     vector=vector,
                     payload=payload,
                     store_code=store_code,
+                    sparse_vector=sparse_vector,
                 )
             # Item-level success — N chunks count as one item processed so
             # the Magento progress bar (items shipped vs items acked)

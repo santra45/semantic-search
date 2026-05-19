@@ -9,40 +9,44 @@ python-multipart==0.0.6
 # Database & ORM
 sqlalchemy==2.0.23
 pymysql==1.1.0
-psycopg[binary,pool]>=3.2.0,<4.0.0
+psycopg[binary,pool]==3.1.18
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
-cryptography==48.0.0
-crypto==1.4.1
-pycrypto==2.6.1
-pycryptodome==3.23.0
+cryptography>=41.0.0
+crypto
+pycrypto
+pycryptodome
 
 # Vector Database & Search
 qdrant-client==1.17.0
+# Sparse-vector (BM25) generation for hybrid search (Phase 2.2).
+# fastembed bundles a small ONNX BM25 model — ~30MB on first import,
+# CPU-only, no GPU needed. Used by app/services/sparse_embedder.py.
+fastembed>=0.3,<0.4
 
 # AI / Embeddings
-google-genai==1.4.0
-openai==1.109.1
-anthropic==0.101.0
+google-genai
+openai
+anthropic
 tiktoken
 
 # LangChain / LangGraph multi-agent
 langchain==0.3.7
-langchain-core==0.3.23
+langchain-core==0.3.21
 langchain-google-genai==2.0.6
 langchain-openai==0.2.10
 langchain-anthropic==0.3.0
 langgraph==0.2.53
 langgraph-checkpoint-postgres==2.0.8
-numpy>=1.26.4
+numpy==1.26.4
 beautifulsoup4==4.12.3
 
 # Server-side export (chat history PDF)
 weasyprint==62.3
 
 # Data Validation
-pydantic[email]>=2.7.4
+pydantic==2.5.0
 
 # Caching
 redis==5.0.1
@@ -54,8 +58,9 @@ aiohttp==3.9.1
 # Environment Management
 python-dotenv==1.0.0
 
-# Development & Testing
+# Development & Testing (optional but useful)
 pytest==7.4.3
 pytest-asyncio==0.21.1
 black==23.11.0
 flake8==6.1.0
+pydantic[email]
