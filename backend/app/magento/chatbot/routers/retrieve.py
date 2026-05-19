@@ -68,6 +68,20 @@ class ProductRetrieveRequest(BaseModel):
     # dense-only path runs unchanged. Magento threads this through from
     # the `aichatbot/llm/hybrid_search_enabled` config flag.
     hybrid: bool = False
+    # Phase 2.3 — admin-toggled MMR (Maximal Marginal Relevance) over
+    # the post-retrieval candidate pool, BEFORE the LLM reranker (2.1).
+    # Prevents N near-duplicate results (same product in 6 colour
+    # variants, or 5 chunks of the same long policy) from dominating
+    # the top-K and starving the reranker of variety. Disabled by
+    # default and skipped automatically when sort_by is set (customer
+    # explicitly wants a specific order — don't second-guess them).
+    mmr: bool = False
+    # MMR lambda — relevance/diversity tradeoff. 1.0 = pure relevance
+    # (equivalent to MMR off), 0.0 = pure diversity. 0.5 (default) is
+    # balanced. Admin can tune via `aichatbot/llm/mmr_lambda`. Values
+    # outside [0,1] are clamped server-side rather than 422'd, so a
+    # config typo never breaks a customer query.
+    mmr_lambda: float = 0.5
     # Customer's current store view. When set, retrieval is scoped to
     # points tagged with this store_code (set by the Magento side at
     # sync time from store->getCode()). Absent / empty means "no store
@@ -100,6 +114,21 @@ class ProductRetrieveRequest(BaseModel):
         # 422-ing so a forward-incompatible classifier output never
         # breaks the retrieval call.
         return v if v in {"price", "name", "rating", "newest"} else None
+
+    @field_validator("mmr_lambda", mode="before")
+    @classmethod
+    def _coerce_mmr_lambda(cls, value):
+        # Clamp into [0, 1]. Bad values (non-numeric, out of range)
+        # collapse to the default 0.5 instead of 422-ing — same posture
+        # as sort_by above. A merchant's typo in admin config field
+        # should never DOS the chatbot.
+        if value in (None, "", [], {}):
+            return 0.5
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+        return max(0.0, min(1.0, v))
 
     @field_validator("sort_order", mode="before")
     @classmethod
@@ -170,6 +199,23 @@ class ContentRetrieveRequest(BaseModel):
     # keywords ("warranty", "tax registration") that semantic search
     # ranks below near-synonyms.
     hybrid: bool = False
+    # Phase 2.3 — same MMR knobs as ProductRetrieveRequest. Especially
+    # useful for CMS content where chunking (1.3) can put 2-3 paragraphs
+    # of the same long page in the top-K; MMR pushes a chunk from a
+    # different page up to break the near-duplicate streak.
+    mmr: bool = False
+    mmr_lambda: float = 0.5
+
+    @field_validator("mmr_lambda", mode="before")
+    @classmethod
+    def _coerce_mmr_lambda(cls, value):
+        if value in (None, "", [], {}):
+            return 0.5
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+        return max(0.0, min(1.0, v))
 
     @field_validator("content_types", mode="before")
     @classmethod
@@ -328,8 +374,16 @@ def retrieve_products(
     # on-topic candidates that the price-sorted slice doesn't just show
     # the same N closest-by-vector items. Universal: every catalog with
     # > limit relevant items benefits from the wider pool.
+    #
+    # Phase 2.3: MMR also benefits from oversampling — diversity is
+    # meaningless if there are only `limit` candidates to choose from.
+    # Bump fan_out to ≥5 when MMR is on (and not pre-empted by sort_by;
+    # MMR is skipped in that branch — see the apply step below).
     fan_out = 3 if (req.attribute_filters or req.category_id) else 1
     if req.sort_by:
+        fan_out = max(fan_out, 5)
+    mmr_active = req.mmr and not req.sort_by
+    if mmr_active:
         fan_out = max(fan_out, 5)
     raw_limit = max(req.limit, req.limit * fan_out)
 
@@ -345,6 +399,9 @@ def retrieve_products(
         store_code=req.store_code,
         hybrid=req.hybrid,
         sparse_query_vector=sparse_query_vector,
+        # Only ask qdrant to return vectors when MMR will actually use
+        # them — saves wire bytes on every dense-only-without-MMR call.
+        with_vectors=mmr_active,
     )
 
     # Attribute + category filtering — these are stored as payload booleans,
@@ -369,9 +426,35 @@ def retrieve_products(
     if req.sort_by:
         hits = _apply_sort(hits, req.sort_by, req.sort_order or "asc")
 
-    hits = hits[: req.limit]
-
+    # ── Phase 2.3: MMR diversification BEFORE the LLM reranker ──────────
+    # Skipped when sort_by is set (the customer asked for a specific
+    # ordering — don't second-guess them) and when there's not enough
+    # candidate headroom for MMR to do anything meaningful (≤ limit
+    # items in the pool; MMR can't diversify what's already the full
+    # result set).
     mode = "semantic"
+    if mmr_active and len(hits) > req.limit:
+        from backend.app.services.mmr import apply_mmr, strip_vector
+        try:
+            hits = apply_mmr(
+                query_vector=query_vector,
+                candidates=hits,
+                lambda_val=req.mmr_lambda,
+                k=req.limit,
+            )
+            mode = "semantic+mmr"
+        except Exception as exc:
+            # MMR failures fall back to vector-similarity order. Never
+            # let a numpy hiccup deprive the customer of results.
+            logger.warning("retrieve/products MMR failed: %s — falling back to vector order", exc)
+            hits = hits[: req.limit]
+        finally:
+            # Always strip — successful MMR or fall-back, the dense
+            # vectors don't belong on the wire to Magento.
+            strip_vector(hits)
+    else:
+        hits = hits[: req.limit]
+
     if req.rerank and hits:
         try:
             hits = _llm_rerank(
@@ -383,7 +466,7 @@ def retrieve_products(
                 llm_model=req.llm_model,
                 db=db,
             )
-            mode = "semantic+rerank"
+            mode = mode + "+rerank" if mode != "semantic" else "semantic+rerank"
         except Exception as exc:
             logger.warning("retrieve/products rerank failed: %s", exc)
 
@@ -426,16 +509,54 @@ def retrieve_content(
         except Exception as exc:
             logger.warning("retrieve/content hybrid sparse-embed failed: %s — dense-only", exc)
 
+    # Phase 2.3 — MMR over-sampling. CMS retrieval doesn't have the
+    # fan_out logic the products handler uses, so we apply the
+    # equivalent inline: when MMR will run, oversample 5× so it has a
+    # real pool to diversify across. Otherwise stick with req.limit.
+    if req.mmr:
+        fetch_limit = max(req.limit * 5, 30)
+    else:
+        fetch_limit = req.limit
+
     hits = qdrant_search_content(
         client_id=license_data["client_id"],
         domain=license_data["domain"],
         query_vector=query_vector,
-        limit=req.limit,
+        limit=fetch_limit,
         content_types=req.content_types or ["cms_page", "cms_block"],
         store_code=req.store_code,
         hybrid=req.hybrid,
         sparse_query_vector=sparse_query_vector,
+        with_vectors=req.mmr,
     )
+
+    # Apply MMR (when on) then strip the internal `_dense_vector` field
+    # whether MMR ran or not — search_content stamped it on every hit
+    # if with_vectors was True, and Magento agents don't need 3072-dim
+    # arrays riding through the JSON response.
+    if req.mmr and len(hits) > req.limit:
+        from backend.app.services.mmr import apply_mmr, strip_vector
+        try:
+            hits = apply_mmr(
+                query_vector=query_vector,
+                candidates=hits,
+                lambda_val=req.mmr_lambda,
+                k=req.limit,
+            )
+        except Exception as exc:
+            logger.warning("retrieve/content MMR failed: %s — falling back to vector order", exc)
+            hits = hits[: req.limit]
+        finally:
+            strip_vector(hits)
+    elif req.mmr:
+        # Pool ≤ limit — nothing for MMR to do, but still need to drop
+        # the vectors we asked qdrant for.
+        from backend.app.services.mmr import strip_vector
+        hits = hits[: req.limit]
+        strip_vector(hits)
+    else:
+        hits = hits[: req.limit]
+
     return {"results": hits, "count": len(hits)}
 
 

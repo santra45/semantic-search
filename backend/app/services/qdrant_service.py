@@ -306,6 +306,26 @@ def _format_hit(hit: Any) -> dict[str, Any]:
     if entity_id_key not in result and result["entity_id"]:
         result[entity_id_key] = result["entity_id"]
 
+    # Phase 2.3 — when the caller asked qdrant for vectors (search_content's
+    # `with_vectors=True` path, used by MMR), pluck the dense slot onto the
+    # hit under a private `_dense_vector` key. The MMR helper consumes it;
+    # retrieve.py strips it before responding to Magento so the wire
+    # payload doesn't carry 3072-dim floats for no consumer.
+    vec = getattr(hit, "vector", None)
+    if vec is not None:
+        dense = None
+        if isinstance(vec, dict):
+            # Named-vector collection (post-2.2). DENSE_VECTOR_NAME is the
+            # slot MMR cares about — sparse cosine has different metric
+            # behaviour and isn't the right input for MMR's similarity.
+            dense = vec.get(DENSE_VECTOR_NAME)
+        elif isinstance(vec, list):
+            # Legacy unnamed-vector collection (pre-2.2). Single list IS
+            # the dense vector.
+            dense = vec
+        if dense:
+            result["_dense_vector"] = list(dense)
+
     return result
 
 
@@ -342,6 +362,7 @@ def search_content(
     max_per_parent: int = 2,
     hybrid: bool = False,
     sparse_query_vector: Optional[SparseVector] = None,
+    with_vectors: bool = False,
 ) -> list[dict[str, Any]]:
     """Vector search over the per-tenant collection.
 
@@ -392,6 +413,14 @@ def search_content(
     # into the same parent.
     fetch_limit = min(limit * 3, 50) if dedupe_by_parent else limit
 
+    # Phase 2.3 — when MMR is going to run downstream the caller asks
+    # for vectors back on each hit. We only need the DENSE slot (sparse
+    # cosine doesn't behave like dense cosine for MMR's similarity term).
+    # Specifying a list of names is the qdrant-client knob that fetches
+    # only those vectors — cheaper than `with_vectors=True` which would
+    # also drag back the sparse_bm25 indices/values.
+    vectors_arg: Any = [DENSE_VECTOR_NAME] if with_vectors else False
+
     if hybrid and sparse_query_vector is not None:
         # Hybrid path — Qdrant fuses the two prefetch result sets via
         # Reciprocal Rank Fusion. Each prefetch carries the SAME filter
@@ -417,6 +446,7 @@ def search_content(
             query=FusionQuery(fusion=Fusion.RRF),
             limit=fetch_limit,
             with_payload=True,
+            with_vectors=vectors_arg,
         )
     else:
         if hybrid and sparse_query_vector is None:
@@ -435,6 +465,7 @@ def search_content(
             query_filter=query_filter,
             limit=fetch_limit,
             with_payload=True,
+            with_vectors=vectors_arg,
         )
 
     hits = [_format_hit(hit) for hit in result.points]
@@ -482,10 +513,14 @@ def search_products(
     store_code: Optional[str] = None,
     hybrid: bool = False,
     sparse_query_vector: Optional[SparseVector] = None,
+    with_vectors: bool = False,
 ) -> list[dict[str, Any]]:
     # Phase 2.2: hybrid + sparse args passed through to search_content
     # so the products endpoint participates in BM25 + dense fusion when
     # the admin toggle is on.
+    # Phase 2.3: with_vectors plumbs the dense-vector return through so
+    # the retrieve handler can run MMR diversification on the candidate
+    # pool before the LLM reranker sees it.
     return search_content(
         client_id=client_id,
         domain=domain,
@@ -498,6 +533,7 @@ def search_products(
         store_code=store_code,
         hybrid=hybrid,
         sparse_query_vector=sparse_query_vector,
+        with_vectors=with_vectors,
     )
 
 
