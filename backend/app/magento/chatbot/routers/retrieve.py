@@ -1179,10 +1179,25 @@ def _llm_rerank(
     llm_model: Optional[str] = None,
     db: Session,
 ) -> list[dict]:
-    """Delegate to the existing llm_rerank_service already used by the /magento/search endpoint."""
+    """Delegate to the existing llm_rerank_service already used by the /magento/search endpoint.
+
+    Phase 2.1a (LLM Reranker Tuning) — wrapper-level latency telemetry.
+    The inner service times the LLM call itself; we add a wrapper-level
+    timer here so we can tell the two apart:
+
+      * `inner ms`  — pure LLM round-trip (logged by llm_rerank_service)
+      * `wrapper ms` — LLM + payload reshaping + (future) cache lookups
+                       + provider client init overhead
+
+    When we later add the LRU cache in 2.1d, cache hits will show as
+    near-zero wrapper-ms with no corresponding inner-ms entry — that's
+    how we'll measure cache hit rate without a separate counter.
+    """
+    import time
     from backend.app.services.llm_rerank_service import llm_rerank_products
 
-    return llm_rerank_products(
+    t0 = time.perf_counter()
+    result = llm_rerank_products(
         query,
         hits,
         len(hits),
@@ -1191,3 +1206,15 @@ def _llm_rerank(
         llm_api_key=llm_api_key,
         client_id=license_data["client_id"],
     ) or hits
+    wrapper_ms = int((time.perf_counter() - t0) * 1000)
+
+    logger.info(
+        "[rerank] client=%s provider=%s model=%s candidates=%d returned=%d wrapper_ms=%d",
+        license_data.get("client_id", "?"),
+        llm_provider or "gemini",
+        llm_model or "(default)",
+        len(hits),
+        len(result),
+        wrapper_ms,
+    )
+    return result

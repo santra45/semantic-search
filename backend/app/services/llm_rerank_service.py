@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import httpx
 import tiktoken
 from typing import List, Dict, Optional
@@ -326,10 +327,15 @@ def llm_rerank_content(
     Example: ["123", "page_456", "post_789"] or []
     """
 
-    try:
-        response_text = ""
-        response = None
+    # Telemetry — wall-clock from "about to call the LLM" to "got a response
+    # back". Logged via `duration_ms` on the llm_interaction record so the
+    # ops team can answer "is rerank our P95 culprit?" without speculation.
+    # Phase 2.1a (LLM Reranker Tuning).
+    rerank_t0 = time.perf_counter()
+    response_text = ""
+    response = None
 
+    try:
         # ---------------------------
         # GEMINI
         # ---------------------------
@@ -376,6 +382,12 @@ def llm_rerank_content(
         else:
             return content[:limit]
 
+        # Stop the clock as soon as the LLM call returns — anything below
+        # this point (token accounting, JSON parsing, payload reshaping) is
+        # our overhead, not the LLM's, and we'd rather not blame the LLM
+        # for slow Python.
+        duration_ms = int((time.perf_counter() - rerank_t0) * 1000)
+
         # ---------------------------
         # TOKEN USAGE & COST
         # ---------------------------
@@ -384,6 +396,7 @@ def llm_rerank_content(
 
         logger.info(f"🔢 Token Usage: {usage}")
         logger.info(f"💰 Estimated Cost: ${round(cost, 8)}")
+        logger.info(f"⏱  Rerank LLM latency: {duration_ms} ms ({provider} / {model})")
 
         log_llm_interaction(
             provider=provider,
@@ -395,7 +408,15 @@ def llm_rerank_content(
             output_tokens=usage["output"],
             cost=cost,
             client_id=client_id,
-            extra={"items": len(content_summaries)},
+            duration_ms=duration_ms,
+            # Extra metadata makes the log entry self-describing — when
+            # grepping logs/llm.log for slow rerank calls we can see how
+            # many candidates were ranked without re-reading the prompt.
+            extra={
+                "items":      len(content_summaries),
+                "candidates": len(content),
+                "limit":      limit,
+            },
         )
 
         # Track token usage
@@ -435,7 +456,10 @@ def llm_rerank_content(
         return []
 
     except Exception as e:
-        logger.error(f"❌ Error during LLM reranking: {str(e)}", exc_info=True)
+        # Time even on failure — slow failures (timeouts especially) are
+        # the most useful latency data we can collect.
+        duration_ms = int((time.perf_counter() - rerank_t0) * 1000)
+        logger.error(f"❌ Error during LLM reranking after {duration_ms} ms: {str(e)}", exc_info=True)
         try:
             log_llm_interaction(
                 provider=provider,
@@ -443,7 +467,9 @@ def llm_rerank_content(
                 purpose="product_rerank",
                 prompt=prompt,
                 client_id=client_id,
+                duration_ms=duration_ms,
                 error=str(e),
+                extra={"candidates": len(content), "limit": limit},
             )
         except Exception:
             pass
