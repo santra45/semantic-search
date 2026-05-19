@@ -29,6 +29,12 @@ QUERY_TYPES = {
     # when the heuristic layer falls below confidence threshold and we
     # need a single small structured-JSON call to pick the right agent.
     'chat_intent': 'chat_intent',
+    # Tool-calling intent router — Phase 3.1. Single LLM call where every
+    # agent is registered as a tool; LLM picks the appropriate tool +
+    # extracts args. Separate query type from `chat_intent` so admin
+    # dashboard can A/B costs between the legacy classifier and the new
+    # tool-call router during the shadow / live rollout window.
+    'chat_tool_call': 'chat_tool_call',
 }
 
 class TokenUsageTracker:

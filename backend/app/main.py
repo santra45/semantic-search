@@ -21,6 +21,7 @@ from backend.app.magento.chatbot.routers import (
     sync as magento_chatbot_sync,
     usage as magento_chatbot_usage,
     classify as magento_chatbot_classify,
+    agent as magento_chatbot_agent,
 )
 
 app = FastAPI(
@@ -57,6 +58,9 @@ app.include_router(magento_chatbot_retrieve.router, prefix="/api")
 app.include_router(magento_chatbot_sync.router, prefix="/api")
 app.include_router(magento_chatbot_usage.router, prefix="/api")
 app.include_router(magento_chatbot_classify.router, prefix="/api")
+# Phase 3.1 — tool-calling intent router. Sits alongside /classify;
+# Magento side picks which to call based on aichatbot/llm/tool_calling_mode.
+app.include_router(magento_chatbot_agent.router, prefix="/api")
 
 @app.get("/")
 def root():
