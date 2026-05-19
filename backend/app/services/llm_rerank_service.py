@@ -1,9 +1,12 @@
 import json
 import logging
+import threading
 import time
+from collections import OrderedDict
+from typing import Any, List, Dict, Optional, Tuple
+
 import httpx
 import tiktoken
-from typing import List, Dict, Optional
 
 from google import genai
 from openai import OpenAI
@@ -223,6 +226,127 @@ def estimate_cost(model: str, usage: Dict) -> float:
 
 
 # ---------------------------
+# In-process LRU+TTL cache for rerank results  (Phase 2.1d)
+# ---------------------------
+#
+# Repeat queries inside a short window — the same shopper hitting "return
+# policy" twice in 30s, or two parallel page-loads of an FAQ widget —
+# would otherwise re-pay the LLM cost. A 60s TTL collapses those into
+# one LLM call.
+#
+# Scope:
+#   * Module-local. Lives inside a single uvicorn worker; multiple workers
+#     = multiple cache instances (acceptable — SMB query volumes make
+#     cross-worker dedup not worth the Redis round-trip).
+#   * Tenant-isolated: client_id is part of every key, so one tenant can
+#     never see another tenant's reranked list.
+#   * Failure-aware: only SUCCESSFUL reranks are cached. If the LLM call
+#     fails the fallback (unranked top-N) is returned but NOT cached, so
+#     the next request gets a real retry.
+#
+# Eviction: LRU at `maxsize` entries, TTL at `ttl_seconds`. Lazy expiry
+# on get; bulk eviction on set when over capacity.
+#
+# Concurrency: a single threading.Lock guards both OrderedDict mutations
+# and TTL checks. Uvicorn's default async worker still runs request
+# handlers in a thread pool for sync endpoints (which retrieve/products
+# is), so the lock is necessary.
+
+class _RerankCache:
+    """Tiny thread-safe LRU+TTL cache. ~30 lines vs adding cachetools."""
+
+    __slots__ = ("_maxsize", "_ttl", "_data", "_lock", "_hits", "_misses")
+
+    def __init__(self, maxsize: int = 1000, ttl_seconds: int = 60):
+        self._maxsize = int(maxsize)
+        self._ttl = float(ttl_seconds)
+        # OrderedDict gives us O(1) move_to_end for LRU semantics.
+        # Value: (expires_at, payload_list).
+        self._data: "OrderedDict[Tuple, Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+        self._lock = threading.Lock()
+        # Stats counters kept for occasional log dumps — cheap to maintain.
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, key: Tuple) -> Optional[List[Dict[str, Any]]]:
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                self._misses += 1
+                return None
+            expires_at, value = entry
+            if time.time() >= expires_at:
+                # Lazy expiry — entry is past TTL, treat as miss + evict.
+                del self._data[key]
+                self._misses += 1
+                return None
+            # Move to end so LRU eviction targets genuinely cold entries.
+            self._data.move_to_end(key)
+            self._hits += 1
+            return value
+
+    def set(self, key: Tuple, value: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self._data[key] = (time.time() + self._ttl, value)
+            self._data.move_to_end(key)
+            while len(self._data) > self._maxsize:
+                # popitem(last=False) drops the oldest — true LRU order
+                # because every get() promotes its hit to the end.
+                self._data.popitem(last=False)
+
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "size":   len(self._data),
+                "hits":   self._hits,
+                "misses": self._misses,
+            }
+
+
+# Singleton — sized for SMB tenant patterns (a chatbot session generates
+# ~5-20 reranked queries; 1000 entries holds ~50-200 active sessions
+# simultaneously, well above realistic concurrency for the target tier).
+_RERANK_CACHE = _RerankCache(maxsize=1000, ttl_seconds=60)
+
+
+def _item_identity(item: Dict[str, Any]) -> str:
+    """Stable per-item identifier used in the rerank cache key.
+
+    Mirrors the type-specific id resolution the rerank prompt itself
+    uses (product_id / page_id / post_id / entity_id) so the cache key
+    reflects exactly which candidates would have been embedded in the
+    prompt — different candidate sets correctly miss the cache.
+    """
+    ct = item.get("content_type") or ("product" if item.get("sku") else "")
+    eid = (
+        item.get("product_id")
+        or item.get("page_id")
+        or item.get("post_id")
+        or item.get("entity_id")
+        or item.get("id")
+        or ""
+    )
+    return f"{ct}:{eid}"
+
+
+def _rerank_cache_key(client_id: str, query: str, content: List[Dict[str, Any]]) -> Tuple:
+    """Compose the cache key.
+
+    Normalisation:
+      * client_id forced to str (defensive — never let a non-string slip in)
+      * query trimmed, lower-cased, whitespace collapsed so casing/spacing
+        variation doesn't multiply entries
+      * candidate ids taken IN ORDER for the first 25 items, matching the
+        `content[:25]` cap inside the rerank prompt. Same first-25 in
+        same order → same key. Different items (or different ordering
+        from Qdrant) → cache miss → fresh rerank.
+    """
+    norm_q = " ".join((query or "").lower().split())
+    ids = tuple(_item_identity(item) for item in content[:25])
+    return (str(client_id), norm_q, ids)
+
+
+# ---------------------------
 # Main Function
 # ---------------------------
 def llm_rerank_content(
@@ -254,6 +378,30 @@ def llm_rerank_content(
     if not api_key:
         logger.warning("⚠️ No API key provided. Returning top results without reranking.")
         return content[:limit]
+
+    # ── Cache lookup (Phase 2.1d) ────────────────────────────────────────
+    # Sits between the cheap-guards and the LLM call. Skipping the cache
+    # for empty content / missing API key is intentional — those paths
+    # don't represent a real "rerank result" we'd want to memoise.
+    #
+    # Skipping when query is whitespace too: nothing useful to cache and
+    # the LLM would fail validation downstream.
+    cache_key = _rerank_cache_key(client_id, query, content) if (query or "").strip() else None
+    if cache_key is not None:
+        cached = _RERANK_CACHE.get(cache_key)
+        if cached is not None:
+            # Hit — re-slice to the caller's `limit` (the cached value
+            # was stored at whatever limit the FIRST caller requested,
+            # which may differ from this caller).
+            logger.info(
+                "[rerank-cache] hit  client=%s candidates=%d returned=%d",
+                client_id, len(content), min(len(cached), limit),
+            )
+            return cached[:limit]
+        logger.info(
+            "[rerank-cache] miss client=%s candidates=%d",
+            client_id, len(content),
+        )
 
     content_summaries = []
     content_map = {}
@@ -450,6 +598,16 @@ def llm_rerank_content(
                     relevant_content.append(content_map[item_id_str])
 
             if relevant_content:
+                # Cache the FULL reranked list (not the limit-sliced one)
+                # so a later caller asking for a larger limit on the same
+                # (client, query, candidates) tuple still benefits from
+                # the LLM work we just paid for.
+                #
+                # Only successful, non-empty reranks are cached. Empty
+                # results stay uncached on purpose — gives transient LLM
+                # parse failures a free retry path on the next call.
+                if cache_key is not None:
+                    _RERANK_CACHE.set(cache_key, relevant_content)
                 return relevant_content[:limit]
 
         logger.warning("⚠️ No relevant content found after reranking.")
