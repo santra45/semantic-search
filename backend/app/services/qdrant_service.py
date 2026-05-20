@@ -363,6 +363,7 @@ def search_content(
     hybrid: bool = False,
     sparse_query_vector: Optional[SparseVector] = None,
     with_vectors: bool = False,
+    query_vectors: Optional[list[list[float]]] = None,
 ) -> list[dict[str, Any]]:
     """Vector search over the per-tenant collection.
 
@@ -421,28 +422,70 @@ def search_content(
     # also drag back the sparse_bm25 indices/values.
     vectors_arg: Any = [DENSE_VECTOR_NAME] if with_vectors else False
 
-    if hybrid and sparse_query_vector is not None:
-        # Hybrid path — Qdrant fuses the two prefetch result sets via
-        # Reciprocal Rank Fusion. Each prefetch carries the SAME filter
-        # so content_type / store_code / price / stock all narrow both
-        # sides identically before fusion. Per-side limit matches the
-        # post-dedup fetch budget so RRF has plenty of headroom.
-        result = qdrant.query_points(
-            collection_name=collection_name,
-            prefetch=[
+    # Phase 3.3 — `query_vectors` (plural) carries 2-3 decomposed
+    # sub-query embeddings when the caller has run query decomposition.
+    # When present, each vector becomes its own dense Prefetch; Qdrant
+    # fuses the per-sub-query candidate sets via RRF (same fusion
+    # primitive 2.2 introduced for hybrid). Normalise empty / single-
+    # element lists back to the single-vector path so callers can pass
+    # the list unconditionally without branching.
+    _vectors = list(query_vectors) if query_vectors else []
+    if len(_vectors) <= 1:
+        _vectors = []  # collapse to single-vector path below
+
+    # Build the prefetch list once. Three cases:
+    #   * multi-vector decomposition (with or without hybrid sparse)
+    #   * single-vector hybrid (1 dense + 1 sparse)
+    #   * single-vector dense (no prefetch — direct `query=`)
+    prefetch: list[Prefetch] = []
+    if _vectors:
+        for v in _vectors:
+            prefetch.append(
                 Prefetch(
-                    query=query_vector,
+                    query=v,
                     using=DENSE_VECTOR_NAME,
                     filter=query_filter,
                     limit=fetch_limit,
-                ),
+                )
+            )
+        if hybrid and sparse_query_vector is not None:
+            # Decomposition + hybrid: N dense prefetches + 1 sparse
+            # prefetch all feed the same RRF fusion. Qdrant handles
+            # arbitrary prefetch counts.
+            prefetch.append(
                 Prefetch(
                     query=sparse_query_vector,
                     using=SPARSE_VECTOR_NAME,
                     filter=query_filter,
                     limit=fetch_limit,
-                ),
-            ],
+                )
+            )
+    elif hybrid and sparse_query_vector is not None:
+        # Hybrid-only path — Qdrant fuses the two prefetch result sets
+        # via Reciprocal Rank Fusion. Each prefetch carries the SAME
+        # filter so content_type / store_code / price / stock all
+        # narrow both sides identically before fusion. Per-side limit
+        # matches the post-dedup fetch budget so RRF has plenty of
+        # headroom.
+        prefetch = [
+            Prefetch(
+                query=query_vector,
+                using=DENSE_VECTOR_NAME,
+                filter=query_filter,
+                limit=fetch_limit,
+            ),
+            Prefetch(
+                query=sparse_query_vector,
+                using=SPARSE_VECTOR_NAME,
+                filter=query_filter,
+                limit=fetch_limit,
+            ),
+        ]
+
+    if prefetch:
+        result = qdrant.query_points(
+            collection_name=collection_name,
+            prefetch=prefetch,
             query=FusionQuery(fusion=Fusion.RRF),
             limit=fetch_limit,
             with_payload=True,
@@ -514,6 +557,7 @@ def search_products(
     hybrid: bool = False,
     sparse_query_vector: Optional[SparseVector] = None,
     with_vectors: bool = False,
+    query_vectors: Optional[list[list[float]]] = None,
 ) -> list[dict[str, Any]]:
     # Phase 2.2: hybrid + sparse args passed through to search_content
     # so the products endpoint participates in BM25 + dense fusion when
@@ -521,6 +565,9 @@ def search_products(
     # Phase 2.3: with_vectors plumbs the dense-vector return through so
     # the retrieve handler can run MMR diversification on the candidate
     # pool before the LLM reranker sees it.
+    # Phase 3.3: query_vectors carries N decomposed sub-query embeddings
+    # for RRF fusion across sub-queries (in addition to the hybrid
+    # sparse fusion when both are on).
     return search_content(
         client_id=client_id,
         domain=domain,
@@ -534,6 +581,7 @@ def search_products(
         hybrid=hybrid,
         sparse_query_vector=sparse_query_vector,
         with_vectors=with_vectors,
+        query_vectors=query_vectors,
     )
 
 

@@ -82,6 +82,13 @@ class ProductRetrieveRequest(BaseModel):
     # outside [0,1] are clamped server-side rather than 422'd, so a
     # config typo never breaks a customer query.
     mmr_lambda: float = 0.5
+    # Phase 3.3 — admin-toggled query decomposition. When True the
+    # handler runs the query through query_decomposer.maybe_decompose
+    # before embedding; if it returns 2-3 sub-queries each is embedded
+    # and the resulting candidate sets are fused server-side by Qdrant
+    # via RRF. Gated by an internal heuristic too — simple short
+    # queries skip the LLM call regardless of this flag.
+    query_decomposition: bool = False
     # Customer's current store view. When set, retrieval is scoped to
     # points tagged with this store_code (set by the Magento side at
     # sync time from store->getCode()). Absent / empty means "no store
@@ -205,6 +212,12 @@ class ContentRetrieveRequest(BaseModel):
     # different page up to break the near-duplicate streak.
     mmr: bool = False
     mmr_lambda: float = 0.5
+    # Phase 3.3 — same admin toggle as ProductRetrieveRequest. Useful
+    # for CMS / policy queries that compound multiple concepts ("shipping
+    # cost to canada with express delivery", "returns policy for
+    # international orders") — the dense single-vector path tends to
+    # match the dominant concept and miss the others.
+    query_decomposition: bool = False
 
     @field_validator("mmr_lambda", mode="before")
     @classmethod
@@ -365,12 +378,48 @@ def retrieve_products(
         raise HTTPException(status_code=400, detail="query or skus is required")
 
     embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
-    query_vector = embed_query(req.query.strip(), embedding_api_key, client_id)
+
+    # Phase 3.3 — query decomposition. Runs BEFORE embedding so each
+    # sub-query gets its own dense vector + its own RRF prefetch slot.
+    # The decomposer's heuristic gate skips simple queries even when
+    # the admin toggle is on, so the LLM cost is only paid for
+    # genuinely compositional questions. Soft-fall to [original_query]
+    # on any error — same posture as hybrid / mmr graceful degradation.
+    sub_queries: list[str] = [req.query.strip()]
+    if req.query_decomposition:
+        try:
+            from backend.app.services.query_decomposer import maybe_decompose
+            sub_queries = maybe_decompose(
+                req.query.strip(),
+                llm_provider=req.llm_provider,
+                llm_model=req.llm_model,
+                api_key=embedding_api_key,
+                client_id=client_id,
+            )
+        except Exception as exc:
+            logger.warning("retrieve/products decomposition failed: %s — single-vector path", exc)
+            sub_queries = [req.query.strip()]
+    decomposed = len(sub_queries) > 1
+
+    # Embed each sub-query. Single-query case is exactly one embed call
+    # — same cost as pre-3.3. Multi-sub-query case pays N embed calls
+    # (~$0.0001 each for Gemini, sub-millisecond latency each).
+    query_vector = embed_query(sub_queries[0], embedding_api_key, client_id)
+    query_vectors: Optional[list[list[float]]] = None
+    if decomposed:
+        query_vectors = [query_vector]
+        for sq in sub_queries[1:]:
+            query_vectors.append(embed_query(sq, embedding_api_key, client_id))
 
     # Phase 2.2 — when the admin has hybrid on, also generate a BM25
     # sparse query vector. Soft-fail on import / inference errors so a
     # malformed model cache or missing fastembed install degrades to
     # dense-only instead of 500ing the request.
+    #
+    # Sparse vector is built from the ORIGINAL combined query even when
+    # decomposition splits the dense side — BM25 keyword signal is more
+    # useful when grounded in what the customer actually typed than in
+    # per-concept fragments that lose cross-concept term co-occurrence.
     sparse_query_vector = None
     if req.hybrid:
         try:
@@ -412,6 +461,10 @@ def retrieve_products(
         # Only ask qdrant to return vectors when MMR will actually use
         # them — saves wire bytes on every dense-only-without-MMR call.
         with_vectors=mmr_active,
+        # Phase 3.3 — non-None only when decomposition produced 2+
+        # sub-queries. qdrant_service collapses 1-element lists back
+        # to the single-vector path internally.
+        query_vectors=query_vectors,
     )
 
     # Attribute + category filtering — these are stored as payload booleans,
@@ -442,7 +495,13 @@ def retrieve_products(
     # candidate headroom for MMR to do anything meaningful (≤ limit
     # items in the pool; MMR can't diversify what's already the full
     # result set).
-    mode = "semantic"
+    # Phase 3.3 — mode string surfaces "+decomp" when decomposition
+    # actually produced multiple sub-queries (not just when the toggle
+    # is on — the heuristic gate may have skipped the LLM call). Lets
+    # ops grep response.mode in api.log to count decomposed turns
+    # without parsing structured fields.
+    base_mode = "semantic+decomp" if decomposed else "semantic"
+    mode = base_mode
     if mmr_active and len(hits) > req.limit:
         from backend.app.services.mmr import apply_mmr, strip_vector
         try:
@@ -452,7 +511,7 @@ def retrieve_products(
                 lambda_val=req.mmr_lambda,
                 k=req.limit,
             )
-            mode = "semantic+mmr"
+            mode = base_mode + "+mmr"
         except Exception as exc:
             # MMR failures fall back to vector-similarity order. Never
             # let a numpy hiccup deprive the customer of results.
@@ -476,7 +535,11 @@ def retrieve_products(
                 llm_model=req.llm_model,
                 db=db,
             )
-            mode = mode + "+rerank" if mode != "semantic" else "semantic+rerank"
+            # Always append — mode is built from earlier stages
+            # (semantic, +decomp, +mmr) and "+rerank" is the terminal
+            # suffix. The old "mode != 'semantic'" guard pre-dated
+            # the +decomp prefix and now misclassifies.
+            mode = mode + "+rerank"
         except Exception as exc:
             logger.warning("retrieve/products rerank failed: %s", exc)
 
@@ -506,11 +569,45 @@ def retrieve_content(
         raise HTTPException(status_code=400, detail="query is required")
 
     embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
-    query_vector = embed_query(req.query.strip(), embedding_api_key, license_data["client_id"])
+
+    # Phase 3.3 — query decomposition for CMS / policy queries. Same
+    # heuristic gate as retrieve_products; especially useful for
+    # compound policy questions ("shipping cost to canada with express",
+    # "returns policy for international orders") that mix multiple
+    # semantic concepts.
+    sub_queries: list[str] = [req.query.strip()]
+    if req.query_decomposition:
+        try:
+            from backend.app.services.query_decomposer import maybe_decompose
+            # ContentRetrieveRequest deliberately doesn't carry
+            # llm_provider/llm_model — the decomposer falls back to
+            # the backend default (gemini-2.5-flash via env GEMINI_API_KEY)
+            # if these are None. Threading them would require extending
+            # the schema + ApiClient for a marginal benefit.
+            sub_queries = maybe_decompose(
+                req.query.strip(),
+                llm_provider=None,
+                llm_model=None,
+                api_key=embedding_api_key,
+                client_id=license_data["client_id"],
+            )
+        except Exception as exc:
+            logger.warning("retrieve/content decomposition failed: %s — single-vector path", exc)
+            sub_queries = [req.query.strip()]
+    decomposed = len(sub_queries) > 1
+
+    query_vector = embed_query(sub_queries[0], embedding_api_key, license_data["client_id"])
+    query_vectors: Optional[list[list[float]]] = None
+    if decomposed:
+        query_vectors = [query_vector]
+        for sq in sub_queries[1:]:
+            query_vectors.append(embed_query(sq, embedding_api_key, license_data["client_id"]))
 
     # Phase 2.2 — sparse query vector for hybrid mode. Same soft-fail
     # pattern as retrieve_products so a CMS query never gets bricked by
-    # a BM25 cold-start glitch.
+    # a BM25 cold-start glitch. Built from the ORIGINAL combined query
+    # even when decomposition is active (see retrieve_products for the
+    # cross-concept BM25 rationale).
     sparse_query_vector = None
     if req.hybrid:
         try:
@@ -538,6 +635,7 @@ def retrieve_content(
         hybrid=req.hybrid,
         sparse_query_vector=sparse_query_vector,
         with_vectors=req.mmr,
+        query_vectors=query_vectors,
     )
 
     # Apply MMR (when on) then strip the internal `_dense_vector` field

@@ -35,6 +35,12 @@ QUERY_TYPES = {
     # dashboard can A/B costs between the legacy classifier and the new
     # tool-call router during the shadow / live rollout window.
     'chat_tool_call': 'chat_tool_call',
+    # Query decomposer — Phase 3.3. Small JSON-mode call that splits a
+    # compositional customer query into 1-3 semantic sub-queries which
+    # the retrieval pipeline then embeds + fuses via Qdrant RRF.
+    # Separate query type so admin dashboard can see decomposer cost
+    # broken out from classifier and answer-generation buckets.
+    'chat_query_decompose': 'chat_query_decompose',
 }
 
 class TokenUsageTracker:
