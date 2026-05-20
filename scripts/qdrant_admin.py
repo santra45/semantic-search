@@ -43,11 +43,22 @@ Environment
 Filters
 -------
 The most useful filters are exposed as flags on most commands:
-    --type        product | cms_page | cms_block | widget | store_config | (any other)
+    --type        product | category | cms_page | cms_block | widget |
+                  store_config | promotion | (any other)
     --entity-id   the id Magento sent (string match against payload.entity_id)
     --store-code  scope to one store view
 
 Larger ad-hoc filters: use `export` to dump JSON, then grep / jq it.
+
+Chunked content
+---------------
+`cms_page`, `cms_block`, and `category` are split into N Qdrant points
+per source item (~500-char chunks with ~200-char overlap). `stats` shows
+this divergence in two columns — ENTITIES (parent items, matches admin
+dashboard) and POINTS (raw Qdrant rows). For these types `show` /
+`get` / `search` / `delete` / `export` operate on raw POINTS, not
+entities — that's usually what you want when debugging or removing data
+(deleting by content_type wipes every chunk of every page in one go).
 """
 
 from __future__ import annotations
@@ -60,7 +71,13 @@ from typing import Any, Optional
 
 try:
     from qdrant_client import QdrantClient
-    from qdrant_client.models import Filter, FieldCondition, MatchValue
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        IsEmptyCondition,
+        MatchValue,
+        PayloadField,
+    )
 except ImportError:
     sys.stderr.write(
         "ERROR: qdrant-client not installed.\n"
@@ -193,41 +210,126 @@ def cmd_info(args, client: QdrantClient) -> None:
 
 
 # Common content types we recognise — used to drive the `stats` table.
-_KNOWN_TYPES = ("product", "cms_page", "cms_block", "widget", "store_config",
-                "policy", "faq", "review", "page", "post")
+# Keep in step with backend KNOWN_CONTENT_TYPES (app/services/qdrant_service.py).
+_KNOWN_TYPES = ("product", "category", "cms_page", "cms_block", "widget",
+                "store_config", "promotion", "policy", "faq", "review",
+                "page", "post")
+
+# Content types that get chunked at sync time (see backend
+# CHUNKABLE_CONTENT_TYPES). For these the raw Qdrant point count
+# inflates by chunk fan-out — a 50-page CMS catalog with ~5 chunks
+# per page shows up as 250 points. `cmd_stats` queries an additional
+# "entity count" with a chunk_index=0-OR-missing filter so the table
+# can show both numbers (entities = what the merchant indexed, points
+# = what's stored in Qdrant). Keep in step with the same set in the
+# backend.
+_CHUNKABLE_TYPES = frozenset({"cms_page", "cms_block", "category"})
+
+
+def build_entity_filter(content_type: str) -> Filter:
+    """Filter that counts ONE row per logical entity even for chunked types.
+
+    Matches points where chunk_index=0 OR the field is missing. For
+    chunked content (cms_page / cms_block / category post-Phase 1.3 +
+    category) only the first chunk has chunk_index=0; for legacy
+    pre-chunking points the field is absent entirely. Either way the
+    parent entity is represented once.
+
+    For non-chunkable types this filter is equivalent to a plain
+    content_type filter because no point in those types carries
+    chunk_index at all, so the IsEmpty branch always matches.
+
+    Mirror of backend qdrant_service.count_content_type's filter — keep
+    in sync if the chunkable-detection logic ever changes there.
+    """
+    return Filter(
+        must=[
+            FieldCondition(key="content_type", match=MatchValue(value=content_type)),
+        ],
+        should=[
+            FieldCondition(key="chunk_index", match=MatchValue(value=0)),
+            IsEmptyCondition(is_empty=PayloadField(key="chunk_index")),
+        ],
+    )
 
 
 def cmd_stats(args, client: QdrantClient) -> None:
+    """Two-column count: ENTITIES (logical items the merchant indexed) +
+    POINTS (raw Qdrant points; chunked types fan out N points per entity).
+
+    Both columns are useful in different contexts:
+      * ENTITIES is what the admin dashboard shows and what the merchant
+        thinks of as "indexed content" — 50 CMS pages, 30 categories.
+      * POINTS is the actual Qdrant storage shape — 250 chunks for those
+        50 pages. Useful when debugging "why is my collection so big" or
+        verifying chunking is actually fanning out.
+    """
     try:
-        total = client.count(collection_name=args.collection, exact=True).count
+        total_points = client.count(collection_name=args.collection, exact=True).count
     except Exception as e:
         print(f"ERROR: {e}")
         sys.exit(1)
 
-    rows = []
-    accounted = 0
+    # Per-type counts. For chunkable types we query twice (entities + points);
+    # for non-chunkable types entities == points so we just copy.
+    rows: list[tuple[str, int, int]] = []  # (type, entities, points)
+    accounted_points = 0
+    total_entities = 0
     for t in _KNOWN_TYPES:
         try:
-            n = client.count(
+            n_points = client.count(
                 collection_name=args.collection,
                 count_filter=build_filter(content_type=t),
                 exact=True,
             ).count
         except Exception:
-            n = 0
-        if n:
-            rows.append((t, n))
-            accounted += n
-    rows.sort(key=lambda r: -r[1])
+            n_points = 0
+        if not n_points:
+            continue
 
-    print(f"{'CONTENT TYPE':<20}  POINTS")
-    print("-" * 30)
-    for t, n in rows:
-        print(f"{t:<20}  {n}")
-    if total != accounted:
-        print(f"{'(other)':<20}  {total - accounted}")
-    print("-" * 30)
-    print(f"{'TOTAL':<20}  {total}")
+        if t in _CHUNKABLE_TYPES:
+            try:
+                n_entities = client.count(
+                    collection_name=args.collection,
+                    count_filter=build_entity_filter(t),
+                    exact=True,
+                ).count
+            except Exception:
+                # If the entity-count query fails for any reason, fall
+                # back to the point count rather than 0 — we'd rather
+                # over-report than show a confusing zero alongside a
+                # non-zero points column.
+                n_entities = n_points
+        else:
+            n_entities = n_points
+
+        rows.append((t, n_entities, n_points))
+        total_entities += n_entities
+        accounted_points += n_points
+
+    # Sort by raw points desc — biggest contributors to collection size first.
+    rows.sort(key=lambda r: -r[2])
+
+    print(f"{'CONTENT TYPE':<20}  {'ENTITIES':>10}  {'POINTS':>10}")
+    print("-" * 46)
+    for t, e, p in rows:
+        # Asterisk marks chunked types so the merchant can immediately see
+        # which rows explain any entities-vs-points divergence below.
+        marker = " *" if t in _CHUNKABLE_TYPES else "  "
+        print(f"{t + marker:<20}  {e:>10,}  {p:>10,}")
+    if total_points != accounted_points:
+        other = total_points - accounted_points
+        print(f"{'(other)':<20}  {'?':>10}  {other:>10,}")
+    print("-" * 46)
+    print(f"{'TOTAL':<20}  {total_entities:>10,}  {total_points:>10,}")
+    if total_entities != total_points:
+        # Footnote only when there's actually a divergence, to avoid
+        # cluttering output on collections that hold no chunked content.
+        print()
+        print("  * chunked content type — entities = parent items "
+              "(cms_page / cms_block / category),")
+        print("    points = chunks stored in Qdrant. See "
+              "CHUNKABLE_CONTENT_TYPES in qdrant_service.py.")
 
 
 def cmd_show(args, client: QdrantClient) -> None:
@@ -468,8 +570,8 @@ def cmd_export(args, client: QdrantClient) -> None:
 def _common_filter_args(p: argparse.ArgumentParser) -> None:
     """Add the standard --type / --entity-id / --store-code triple."""
     p.add_argument("--type",
-                   help="Content type filter, e.g. product, cms_page, cms_block, "
-                        "widget, store_config")
+                   help="Content type filter, e.g. product, category, cms_page, "
+                        "cms_block, widget, store_config, promotion")
     p.add_argument("--entity-id",
                    help="Filter to a specific Magento entity_id")
     p.add_argument("--store-code",
