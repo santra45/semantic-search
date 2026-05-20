@@ -1117,6 +1117,137 @@ def format_cms_block_chunkable(block: Dict[str, Any]) -> Tuple[str, str, Dict[st
     return header_text, content, base_payload
 
 
+# ── Categories ──────────────────────────────────────────────────────────────
+#
+# Magento catalog categories carry merchant-curated taxonomy data that
+# the chatbot needs for browse-style queries: "what departments do you
+# have?", "tell me about your modern water features collection",
+# "do you have anything for kids?". Without this content type the bot
+# can describe individual products (via /retrieve/products) but has no
+# way to talk about the *groupings* the customer sees on the storefront.
+#
+# Chunking rationale: SEO-heavy stores routinely have 1-3k char category
+# landing pages. Single-vector embedding lets the intro paragraph
+# dominate while later sections (sub-collections, sizing guides,
+# "what to look for" content) score poorly even when they're the answer.
+# Same problem cms_page solved via chunking in Phase 1.3 — categories
+# join the chunkable list (see CHUNKABLE_CONTENT_TYPES in
+# qdrant_service.py).
+
+
+def format_category(category: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Build (embedding_text, payload) for one catalog category.
+
+    Kept as a single-output function so the format_item dispatcher's
+    fallback path (non-chunked retrievals, scripts that don't know
+    about the chunkable formatters) still works. The chunked path
+    goes through format_category_chunkable below.
+    """
+    text, _, payload = _format_category_parts(category)
+    # Non-chunked path needs `content` in the payload too — the chunked
+    # path sets content per-chunk, but the single-shot path expects
+    # the LLM to see the full body.
+    payload["content"] = text
+    return _final_clean(text), payload
+
+
+def format_category_chunkable(category: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    """Chunkable variant — returns (header, body, payload).
+
+    The chunked sync (sync._process_chunkable_item) takes these three
+    pieces, chunks `body` into ~500-char chunks with overlap, and
+    upserts each chunk as its own Qdrant point sharing the payload
+    plus chunk-specific {chunk_index, parent_entity_id, total_chunks}.
+
+    Header carries identity (name, breadcrumb, URL key, meta) so every
+    chunk's embedding stays grounded in the category it came from.
+    Body is the description text only — that's what gets sliced.
+    """
+    return _format_category_parts(category)
+
+
+def _format_category_parts(category: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    """Shared field extraction. Single source of truth so the
+    non-chunked and chunked formatters produce identical content,
+    just sliced differently.
+    """
+    name             = str(category.get("name") or "").strip()
+    identifier       = str(category.get("identifier") or category.get("url_key") or "").strip()
+    meta_title       = str(category.get("meta_title") or "").strip()
+    meta_description = str(category.get("meta_description") or "").strip()
+    meta_keywords    = str(category.get("meta_keywords") or "").strip()
+    breadcrumb       = str(category.get("breadcrumb") or "").strip()
+    description      = html_to_structured_text(category.get("description") or "")
+
+    # Snippet — what the customer sees on the chat card. Prefer the
+    # merchant's curated meta_description; fall back to the first 300
+    # chars of the description body when no meta is set.
+    summary = str(category.get("summary") or "").strip()
+    if not summary:
+        summary = meta_description or description[:300]
+
+    # Header — repeated on every chunk's embedding so each chunk stays
+    # grounded in the category it belongs to. Without this, a chunk
+    # from the middle of a long category page would embed as just its
+    # own words, losing the cross-concept signal that ties it back to
+    # the parent category for retrieval.
+    header_parts: list[str] = []
+    if name:
+        # Mark as a category explicitly so the embedding doesn't get
+        # confused with a similarly-named product. Categories are
+        # taxonomy nodes, not items for sale — making that explicit
+        # in the embed text helps disambiguation on
+        # "do you have a Solar category?" type queries.
+        header_parts.append(f"Category: {name}")
+    if breadcrumb and breadcrumb.lower() != name.lower():
+        # "Outdoor > Water Features > Solar" gives the LLM the taxonomy
+        # context — answers like "Solar is part of our Water Features
+        # range" require knowing where in the tree it sits.
+        header_parts.append(f"Path: {breadcrumb}")
+    if meta_title and meta_title.lower() != name.lower():
+        header_parts.append(f"SEO Title: {meta_title}")
+    if identifier:
+        header_parts.append(f"URL Key: {identifier}")
+    if meta_description and meta_description.lower() != summary.lower():
+        header_parts.append(f"Description: {meta_description}")
+    if meta_keywords:
+        # meta_keywords often carries customer-phrased synonyms
+        # ("outdoor, garden, patio, deck") that don't appear in the
+        # category name or description but matter for retrieval.
+        header_parts.append(f"Keywords: {meta_keywords}")
+
+    # Same factual-anchor detection that CMS uses — catches the
+    # ambiguous-naming case where a category description happens to
+    # contain address / phone / hours info (rare but cheap to detect).
+    anchors = _detect_factual_anchors(description)
+    if anchors:
+        header_parts.append(f"Indexing hints: {anchors}")
+
+    header_text = _final_clean("\n".join(header_parts))
+
+    # base_payload omits `content` on purpose — see the chunked-formatter
+    # contract in format_cms_page_chunkable for the rationale. The
+    # non-chunked wrapper (format_category) sets content from text.
+    base_payload: Dict[str, Any] = {
+        "name":              name,
+        "title":             name,           # alias — frontend renders s.title
+        "identifier":        identifier,
+        "url_key":           identifier,
+        "meta_title":        meta_title,
+        "meta_description":  meta_description,
+        "meta_keywords":     meta_keywords,
+        "breadcrumb":        breadcrumb,
+        "summary":           summary[:600],
+        "permalink":         str(category.get("permalink") or ""),
+        "image_url":         str(category.get("image_url") or ""),
+        "parent_id":         category.get("parent_id"),
+        "level":             category.get("level"),
+        "status":            "active" if category.get("is_active", True) else "inactive",
+    }
+
+    return header_text, description, base_payload
+
+
 # ── Dispatcher ───────────────────────────────────────────────────────────────
 
 def format_item(
@@ -1136,6 +1267,8 @@ def format_item(
         return format_cms_page(item)
     if content_type == "cms_block":
         return format_cms_block(item)
+    if content_type == "category":
+        return format_category(item)
     if content_type == "widget":
         return format_widget(item)
     if content_type == "store_config":

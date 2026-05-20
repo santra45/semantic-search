@@ -31,6 +31,7 @@ KNOWN_CONTENT_TYPES = [
     "product",
     "cms_page",
     "cms_block",
+    "category",
     "widget",
     "review",
     "policy",
@@ -50,7 +51,12 @@ KNOWN_CONTENT_TYPES = [
 #
 # Adding a new chunkable type later: just add it here AND make sure
 # product_formatter has a matching format_<type>_chunkable function.
-CHUNKABLE_CONTENT_TYPES = {"cms_page", "cms_block"}
+#
+# `category` joined here because merchant-written category descriptions
+# can be long (SEO-heavy stores often have 2-3k char landing pages).
+# Single-point embedding would let the intro dominate; chunking surfaces
+# the right paragraph the same way it does for cms_page.
+CHUNKABLE_CONTENT_TYPES = {"cms_page", "cms_block", "category"}
 
 
 # ── Hybrid-search named-vector slots (Phase 2.2) ────────────────────────────
