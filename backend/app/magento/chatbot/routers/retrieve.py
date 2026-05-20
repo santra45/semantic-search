@@ -57,6 +57,14 @@ class ProductRetrieveRequest(BaseModel):
     category_id: Optional[str] = None
     limit: int = 8
     rerank: bool = False  # admin-toggled — small LLM rerank of top-N
+    # Cap on how many candidates flow into the LLM reranker after Qdrant
+    # search + MMR. Rerank cost scales linearly with this number, so it's
+    # the main lever once rerank is on. When None / 0 the handler reranks
+    # everything that survives MMR (legacy behaviour). The internal
+    # llm_rerank_service still applies a 25-item safety ceiling on top of
+    # this (prompt-size protection) — see llm_rerank_service.py:410.
+    # Magento threads this through from aichatbot/llm/rerank_limit.
+    rerank_limit: Optional[int] = None
     # When `rerank=True` the reranker uses these to pick the right provider/model
     # (otherwise falls back to the service's defaults, which may not match the
     # tenant's billing config and will lose cost tracking).
@@ -525,6 +533,18 @@ def retrieve_products(
         hits = hits[: req.limit]
 
     if req.rerank and hits:
+        # Trim the rerank pool. By this point `hits` has been shrunk to
+        # req.limit by MMR (or the explicit slice). When the admin set
+        # rerank_limit < req.limit they want the LLM to only score the
+        # top-N most relevant candidates rather than the full display
+        # pool — the cost lever lives here, BEFORE the LLM call. Skipped
+        # cleanly when rerank_limit is unset / 0 / already >= len(hits).
+        if req.rerank_limit and 0 < req.rerank_limit < len(hits):
+            logger.debug(
+                "retrieve/products rerank pool trimmed from %d to %d (rerank_limit)",
+                len(hits), req.rerank_limit,
+            )
+            hits = hits[: req.rerank_limit]
         try:
             hits = _llm_rerank(
                 req.query.strip(),

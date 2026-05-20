@@ -406,7 +406,13 @@ def llm_rerank_content(
     content_summaries = []
     content_map = {}
 
-    # Process mixed content types (products, pages, posts)
+    # Process mixed content types (products, pages, posts).
+    # The [:25] is a safety ceiling on prompt size — the LLM call serialises
+    # one summary per item and we don't want a 100-item query to blow the
+    # context window. The upstream caller (retrieve.py rerank_limit) is the
+    # real knob; this just protects against a misconfigured caller passing
+    # a huge list. If you raise rerank_limit above 25, raise this in lock-
+    # step or items 26+ will be silently dropped from the rerank pool.
     for item in content[:25]:
         content_type = item.get("content_type", "product")
         
