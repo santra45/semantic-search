@@ -236,6 +236,16 @@ class AnswerRequest(BaseModel):
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     llm_api_key_encrypted: Optional[str] = None
+    active_retrieval: bool = False
+    store_code: Optional[str] = None
+    # Phase 3.2 — when active retrieval invokes its retrieve_more_*
+    # tools, they should honor the merchant's INITIAL retrieval
+    # quality settings. `hybrid` here is the same toggle as
+    # ProductRetrieveRequest.hybrid (admin: aichatbot/llm/hybrid_search_enabled).
+    # MMR is intentionally NOT propagated — active-retrieval queries
+    # are already narrow refinements and diversification would push
+    # results toward unrelated content (see retrieval_tools.py).
+    hybrid: bool = False
     # Optional store contact details forwarded by the Magento agents
     # (PolicyAgent / StoreInfoAgent / GenericChatAgent). When set, the
     # prompt instructs the LLM to surface phone/email in any refusal so
@@ -591,6 +601,31 @@ def retrieve_answer(
         temperature=0.2,
     )
 
+    client_id = license_data["client_id"]
+    domain = license_data["domain"]
+
+    # Phase 3.2 — active-retrieval tools are built per-request via the
+    # factory in retrieval_tools.py so the LLM-facing signatures stay
+    # minimal (`query`, `limit`) while the tool bodies have closure
+    # access to client_id / domain / api_key / store_code / hybrid.
+    # Empty tuple when active_retrieval is off so we don't pay the
+    # closure-build cost or pass tools to the LLM that it won't use.
+    from backend.app.magento.chatbot.agents.retrieval_tools import (
+        make_retrieval_tools,
+        MAX_ACTIVE_RETRIEVAL_ITERATIONS,
+    )
+    if req.active_retrieval:
+        tools, tool_map = make_retrieval_tools(
+            client_id=client_id,
+            domain=domain,
+            api_key=api_key,
+            store_code=req.store_code,
+            hybrid=req.hybrid,
+            source_formatter=_format_source_for_prompt,
+        )
+    else:
+        tools, tool_map = [], {}
+
     prompt = _build_answer_prompt(
         query=req.query.strip(),
         sources=req.sources,
@@ -598,40 +633,79 @@ def retrieve_answer(
         conversation_history=req.conversation_history,
         purpose=req.purpose or "answer",
         instruction=req.instruction,
+        active_retrieval=req.active_retrieval,
     )
 
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
     provider_name = (req.llm_provider or "google").lower()
     model_name    = req.llm_model or "gemini-2.0-flash-lite"
+
+    messages = [HumanMessage(content=prompt)]
+    input_tokens = 0
+    output_tokens = 0
+    iterations = 0
+    final_answer = ""
+    last_resp = None
+
+    llm_to_use = llm.bind_tools(tools) if req.active_retrieval and tools else llm
 
     with log_llm_call(
         provider=provider_name,
         model=model_name,
         purpose="chat_answer",
         prompt=prompt,
-        client_id=license_data["client_id"],
+        client_id=client_id,
     ) as _log_ctx:
-        try:
-            resp = llm.invoke([HumanMessage(content=prompt)])
-        except Exception as exc:
-            logger.warning("retrieve/answer LLM invoke failed: %s", exc)
-            raise HTTPException(status_code=502, detail="LLM unavailable")
+        while iterations < MAX_ACTIVE_RETRIEVAL_ITERATIONS:
+            try:
+                resp = llm_to_use.invoke(messages)
+            except Exception as exc:
+                logger.warning("retrieve/answer LLM invoke failed: %s", exc)
+                if iterations == 0:
+                    raise HTTPException(status_code=502, detail="LLM unavailable")
+                break
 
-        answer_text = _extract_text(resp.content).strip()
-        usage = getattr(resp, "usage_metadata", None) or {}
-        input_tokens  = int(usage.get("input_tokens",  0) or 0)
-        output_tokens = int(usage.get("output_tokens", 0) or 0)
+            last_resp = resp
+            usage = getattr(resp, "usage_metadata", None) or {}
+            input_tokens += int(usage.get("input_tokens", 0) or 0)
+            output_tokens += int(usage.get("output_tokens", 0) or 0)
 
-        # Cost is computed from the model pricing table — matches what the
-        # /classify endpoint returns so the Magento per-message billing row
-        # can sum cost across both call types without per-shape branches.
-        # Split into input_cost / output_cost so the token_usage_tracking
-        # row populates both component columns (the tracker computes
-        # total_cost = input_cost + output_cost internally). The previous
-        # version computed `cost` as a single value and never passed it to
-        # the tracker — every chat_answer row ended up with zeroed cost
-        # columns despite token counts being correct.
+            if req.active_retrieval and hasattr(resp, "tool_calls") and resp.tool_calls:
+                messages.append(resp)
+                for tool_call in resp.tool_calls:
+                    t_name = tool_call["name"]
+                    t_args = tool_call["args"]
+                    t_id = tool_call["id"]
+
+                    if t_name in tool_map:
+                        try:
+                            tool_result = tool_map[t_name].invoke(t_args)
+                        except Exception as err:
+                            tool_result = f"Error executing tool: {err}"
+                    else:
+                        tool_result = f"Error: Tool '{t_name}' not found."
+
+                    messages.append(ToolMessage(content=tool_result, tool_call_id=t_id))
+                iterations += 1
+            else:
+                final_answer = _extract_text(resp.content).strip()
+                break
+        else:
+            if last_resp and hasattr(last_resp, "tool_calls") and last_resp.tool_calls:
+                try:
+                    resp = llm.invoke(messages)
+                    usage = getattr(resp, "usage_metadata", None) or {}
+                    input_tokens += int(usage.get("input_tokens", 0) or 0)
+                    output_tokens += int(usage.get("output_tokens", 0) or 0)
+                    final_answer = _extract_text(resp.content).strip()
+                except Exception as exc:
+                    logger.warning("retrieve/answer final forced LLM invoke failed: %s", exc)
+                    final_answer = "I'm sorry, I was unable to complete the search due to an internal error."
+            else:
+                final_answer = _extract_text(last_resp.content).strip() if last_resp else ""
+
+        # Cost calculation
         from backend.app.services.llm_rerank_service import MODEL_PRICING
         pricing = MODEL_PRICING.get(model_name, {})
         input_cost  = input_tokens  * pricing.get("input",  0.0)
@@ -639,15 +713,15 @@ def retrieve_answer(
         cost = input_cost + output_cost
 
         _log_ctx.record(
-            response_text=answer_text,
+            response_text=final_answer,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost=float(cost),
-            extra={"sources": len(req.sources or [])},
+            extra={"sources": len(req.sources or []), "active_retrieval_iterations": iterations},
         )
     try:
         TokenUsageTracker(db).create_usage_record(
-            client_id=license_data["client_id"],
+            client_id=client_id,
             query_type="chat_answer",
             llm_provider=req.llm_provider or "google",
             llm_model=req.llm_model or "gemini-2.0-flash-lite",
@@ -656,13 +730,13 @@ def retrieve_answer(
             input_cost=float(input_cost),
             output_cost=float(output_cost),
             request_text_length=len(prompt),
-            response_text_length=len(answer_text),
+            response_text_length=len(final_answer),
         )
     except Exception:
         pass
 
     return {
-        "answer": answer_text,
+        "answer": final_answer,
         "grounded": True,
         "usage": {
             "input":    input_tokens,
@@ -721,6 +795,30 @@ def retrieve_answer_stream(
         temperature=0.2,
     )
 
+    client_id = license_data["client_id"]
+    domain = license_data["domain"]
+
+    # Phase 3.2 — same per-request tool factory as the one-shot
+    # /retrieve/answer handler. Building once outside the generator
+    # means the tools' closures + the (optional) sparse-embedder
+    # import happen on the request thread, not inside the streaming
+    # generator (where exceptions are harder to surface cleanly).
+    from backend.app.magento.chatbot.agents.retrieval_tools import (
+        make_retrieval_tools,
+        MAX_ACTIVE_RETRIEVAL_ITERATIONS,
+    )
+    if req.active_retrieval:
+        tools, tool_map = make_retrieval_tools(
+            client_id=client_id,
+            domain=domain,
+            api_key=api_key,
+            store_code=req.store_code,
+            hybrid=req.hybrid,
+            source_formatter=_format_source_for_prompt,
+        )
+    else:
+        tools, tool_map = [], {}
+
     # Same prompt as the one-shot endpoint — keeps answer style consistent
     # whether the merchant has streaming on or off.
     prompt = _build_answer_prompt(
@@ -730,9 +828,10 @@ def retrieve_answer_stream(
         conversation_history=req.conversation_history,
         purpose=req.purpose or "answer",
         instruction=req.instruction,
+        active_retrieval=req.active_retrieval,
     )
 
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
     provider_name = (req.llm_provider or "google").lower()
     model_name    = req.llm_model or "gemini-2.0-flash-lite"
@@ -745,21 +844,72 @@ def retrieve_answer_stream(
         full_answer: list[str] = []
         in_tokens  = 0
         out_tokens = 0
+
+        messages = [HumanMessage(content=prompt)]
+
+        if req.active_retrieval and tools:
+            llm_to_use = llm.bind_tools(tools)
+            iterations = 0
+            last_resp = None
+
+            # Tool-call loop runs NON-streaming — each round is a
+            # structured tool_calls response, not natural-language
+            # tokens worth streaming. Once the LLM stops calling tools
+            # (or we hit the iteration cap), the loop exits and the
+            # final answer is streamed via llm.stream(messages) below.
+            while iterations < MAX_ACTIVE_RETRIEVAL_ITERATIONS:
+                try:
+                    resp = llm_to_use.invoke(messages)
+                except Exception as exc:
+                    logger.warning("retrieve/answer/stream tool loop LLM invoke failed: %s", exc)
+                    yield json.dumps({"event": "error", "message": "LLM unavailable"}) + "\n"
+                    return
+
+                last_resp = resp
+                usage = getattr(resp, "usage_metadata", None) or {}
+                in_tokens += int(usage.get("input_tokens", 0) or 0)
+                out_tokens += int(usage.get("output_tokens", 0) or 0)
+
+                if hasattr(resp, "tool_calls") and resp.tool_calls:
+                    messages.append(resp)
+                    for tool_call in resp.tool_calls:
+                        t_name = tool_call["name"]
+                        t_args = tool_call["args"]
+                        t_id = tool_call["id"]
+
+                        if t_name in tool_map:
+                            try:
+                                tool_result = tool_map[t_name].invoke(t_args)
+                            except Exception as err:
+                                tool_result = f"Error executing tool: {err}"
+                        else:
+                            tool_result = f"Error: Tool '{t_name}' not found."
+
+                        messages.append(ToolMessage(content=tool_result, tool_call_id=t_id))
+                    iterations += 1
+                else:
+                    break
+
+        # Now stream the final response turn chunk by chunk
+        stream_in_tokens = 0
+        stream_out_tokens = 0
         try:
-            for chunk in llm.stream([HumanMessage(content=prompt)]):
+            for chunk in llm.stream(messages):
                 token_text = _extract_text(getattr(chunk, "content", "")) or ""
                 if token_text:
                     full_answer.append(token_text)
                     yield json.dumps({"event": "token", "text": token_text}) + "\n"
                 meta = getattr(chunk, "usage_metadata", None) or {}
                 if meta:
-                    in_tokens  = max(in_tokens,  int(meta.get("input_tokens",  0) or 0))
-                    out_tokens = max(out_tokens, int(meta.get("output_tokens", 0) or 0))
+                    stream_in_tokens = max(stream_in_tokens, int(meta.get("input_tokens", 0) or 0))
+                    stream_out_tokens = max(stream_out_tokens, int(meta.get("output_tokens", 0) or 0))
         except Exception as exc:
             logger.warning("retrieve/answer/stream LLM stream failed: %s", exc)
             yield json.dumps({"event": "error", "message": "LLM unavailable"}) + "\n"
             return
 
+        in_tokens += stream_in_tokens
+        out_tokens += stream_out_tokens
         answer_text = "".join(full_answer).strip()
 
         # Cost calculation — split into input/output components so the
@@ -773,7 +923,7 @@ def retrieve_answer_stream(
 
         try:
             TokenUsageTracker(db).create_usage_record(
-                client_id=license_data["client_id"],
+                client_id=client_id,
                 query_type="chat_answer",
                 llm_provider=provider_name,
                 llm_model=model_name,
@@ -812,6 +962,7 @@ def _build_answer_prompt(
     conversation_history: Optional[list[dict]] = None,
     purpose: str = "answer",
     instruction: Optional[str] = None,
+    active_retrieval: bool = False,
 ) -> str:
     """Single source of truth for the /retrieve/answer prompt — shared
     between the one-shot and streaming endpoints so style and rules stay
@@ -910,9 +1061,16 @@ def _build_answer_prompt(
     # instruction and concluded it should refuse to use it). We rely on
     # the chip channel for contact handoff; the LLM should produce
     # clean answers using only the source content.
+    active_retrieval_rule = ""
+    if active_retrieval and purpose == "answer":
+        active_retrieval_rule = (
+            " - **Active Retrieval Tools.** If the initial sources provided are insufficient, incomplete, or lack critical facts needed to answer the question, do NOT refuse or say you don't know yet. Instead, use the active retrieval tools (`retrieve_more_content` or `retrieve_more_products`) to query for more information. Only give up if, after executing your tool-calling step(s), the information remains unavailable.\n"
+        )
+
     return (
         "You are a concise store assistant. Answer the customer's question using ONLY the sources below.\n\n"
         "Rules:\n"
+        + active_retrieval_rule +
         " - If the sources don't contain the answer, say honestly in one sentence that you don't have "
         "that specific information. Do NOT include phone numbers or email addresses in your reply — the "
         "interface renders contact options as separate clickable chips below your message; mentioning "

@@ -9,7 +9,7 @@ python-multipart==0.0.6
 # Database & ORM
 sqlalchemy==2.0.23
 pymysql==1.1.0
-psycopg[binary,pool]==3.1.18
+psycopg[binary,pool]==3.2.9
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
@@ -32,9 +32,9 @@ anthropic
 tiktoken
 
 # LangChain / LangGraph multi-agent
-langchain==0.3.7
-langchain-core==0.3.21
-langchain-google-genai==2.0.6
+langchain==0.3.30
+langchain-core==0.3.86
+langchain-google-genai==2.1.12
 langchain-openai==0.2.10
 langchain-anthropic==0.3.0
 langgraph==0.2.53
@@ -46,7 +46,7 @@ beautifulsoup4==4.12.3
 weasyprint==62.3
 
 # Data Validation
-pydantic==2.5.0
+pydantic==2.9.2
 
 # Caching
 redis==5.0.1
