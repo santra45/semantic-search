@@ -477,7 +477,8 @@ def llm_rerank_content(
     - Rank by relevance (best first)
     - Include a mix of content types if relevant
 
-    Return ONLY JSON array of content IDs.
+    Return ONLY a JSON array of content IDs as strings.
+    Do NOT include objects, scores, reasons, or any other fields — just the bare IDs.
     Example: ["123", "page_456", "post_789"] or []
     """
 
@@ -598,7 +599,15 @@ def llm_rerank_content(
         if json_text:
             relevant_ids = json.loads(json_text)
             relevant_content = []
-            for item_id in relevant_ids:
+            for entry in relevant_ids:
+                # Some models embellish the response with {"id": "...", "score": ...}
+                # even when the prompt asks for bare IDs — accept either shape.
+                if isinstance(entry, dict):
+                    item_id = entry.get("id") or entry.get("product_id") or entry.get("page_id") or entry.get("post_id")
+                else:
+                    item_id = entry
+                if item_id is None:
+                    continue
                 item_id_str = str(item_id)
                 if item_id_str in content_map:
                     relevant_content.append(content_map[item_id_str])
