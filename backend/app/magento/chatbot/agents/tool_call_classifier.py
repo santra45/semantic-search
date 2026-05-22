@@ -54,14 +54,16 @@ matches what the customer is trying to do.
 
 Routing guidance:
 
-  * Use `search_products` for any product discovery — including price
-    constraints (min_price, max_price), attribute filters (color, size,
-    material, etc.), sort intent (cheapest, most expensive, newest),
-    brand mentions, and category mentions.
+  * Use `search_products` for product DISCOVERY / BROWSE — the customer
+    wants to see, find, or filter products. Includes price constraints
+    (min_price, max_price), attribute filters (color, size, material,
+    etc.), sort intent (cheapest, most expensive, newest), brand
+    mentions, and category mentions used as filters.
     - When the customer mentions a brand by name (e.g. "products from
       Altico"), pass it via `brand`.
-    - When the customer mentions a category by name (e.g. "anything in
-      Solar Fountains"), pass it via `category`.
+    - When the customer mentions a category by name AND wants to see
+      its products (e.g. "show me Solar Fountains", "anything in
+      Outdoor Lighting"), pass it via `category`.
     - When the customer mentions specific attribute values (e.g. "red
       stainless steel"), pass them via `attributes` as a dict like
       {"color": "red", "material": "stainless steel"}.
@@ -70,6 +72,14 @@ Routing guidance:
     similarity guess at brand / category / attribute membership.
   * Use `get_product_detail` ONLY when the customer references a
     specific product by name or SKU.
+  * Use `get_category_info` when the customer asks ABOUT a category
+    rather than asking to see products in it. Trigger phrases:
+    "tell me about <X>", "what is <X>", "what is the <X> collection",
+    "describe <X>", "what kinds of things are in <X>", "what does <X>
+    cover". Pass the category name as `category`. The downstream agent
+    returns the merchant-authored category description (with a few
+    representative products as supporting cards) — much richer than
+    just dumping product cards for the same query.
   * Use `get_store_policy` for returns / refunds / shipping / warranty
     / cancellation / delivery questions.
   * Use `get_store_info` for hours / address / contact / payment
@@ -92,11 +102,60 @@ mean before picking the tool.
 """
 
 
+def _render_match_signals(signals: dict[str, Any]) -> str:
+    """Turn the compact match_signals dict into a short natural-language
+    block for the tool-call system prompt.
+
+    Format:
+        Detected matches in the customer's message (use these as hints
+        for which tool to pick and what args to pass):
+          - category: Solar Fountains (id: 47)
+          - brand: Altico
+          - attributes: color=Red, material=Stainless Steel
+
+    Empty / missing sections are omitted. Returns empty string when no
+    signal is present — caller skips appending the block entirely.
+    """
+    lines: list[str] = []
+
+    category = signals.get("category")
+    if isinstance(category, dict):
+        cat_id = category.get("id")
+        cat_name = (category.get("name") or "").strip()
+        if cat_id and cat_name:
+            lines.append(f"  - category: {cat_name} (id: {cat_id})")
+
+    brand = (signals.get("brand") or "").strip() if isinstance(signals.get("brand"), str) else ""
+    if brand:
+        lines.append(f"  - brand: {brand}")
+
+    attributes = signals.get("attributes") or {}
+    if isinstance(attributes, dict) and attributes:
+        rendered = ", ".join(
+            f"{k}={v}"
+            for k, v in attributes.items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip()
+        )
+        if rendered:
+            lines.append(f"  - attributes: {rendered}")
+
+    if not lines:
+        return ""
+
+    return (
+        "Detected matches in the customer's message (use these as hints "
+        "for which tool to pick and what args to pass — they are "
+        "authoritative for THIS merchant's catalogue):\n"
+        + "\n".join(lines)
+    )
+
+
 def select_tool(
     *,
     query: str,
     conversation_history: Optional[list[dict[str, str]]] = None,
     customer_context: Optional[dict[str, Any]] = None,
+    match_signals: Optional[dict[str, Any]] = None,
     provider: str = "google",
     model: str = "gemini-2.5-flash",
     api_key: Optional[str] = None,
@@ -124,6 +183,7 @@ def select_tool(
     """
     conversation_history = conversation_history or []
     customer_context = customer_context or {}
+    match_signals = match_signals or {}
 
     # Build a tiny context preamble for the system prompt — gives the
     # LLM enough situational awareness to route auth-gated tools sanely
@@ -141,12 +201,28 @@ def select_tool(
         ctx_lines.append(f"Active store view: {customer_context['store_code']}.")
     context_block = "\n".join(ctx_lines)
 
+    # Matched signals (structured filter rebuild 2026-05-22+).
+    #
+    # Magento ran BrandVocabulary + CategoryVocabulary + AttributeVocabulary
+    # over the customer's message before calling us and shipped only the
+    # MATCHES — not the entire vocabulary. We render them here as a short
+    # natural-language hint the LLM can use to pick its tool + arguments
+    # correctly without having to recognise merchant-specific names from
+    # generic English (which cheap routing models like flash-lite are bad
+    # at). Skipped entirely when no signal matched, keeping the prompt
+    # minimal in the common case.
+    signal_block = _render_match_signals(match_signals)
+
+    system_content = _SYSTEM_PROMPT + "\n\n" + context_block
+    if signal_block:
+        system_content += "\n\n" + signal_block
+
     # LangChain Message list. SystemMessage carries the routing guide +
     # customer context. We append the recent conversation history (last
     # 6 turns — already capped by retrieve.py's validator on the Magento
     # request side) followed by the current message.
     messages: list[Any] = [
-        SystemMessage(content=f"{_SYSTEM_PROMPT}\n\n{context_block}"),
+        SystemMessage(content=system_content),
     ]
     for turn in conversation_history[-6:]:
         role = (turn.get("role") or "").strip().lower()

@@ -109,6 +109,37 @@ def get_product_detail(
 
 
 @tool
+def get_category_info(category: str) -> str:
+    """Get a descriptive overview of a product CATEGORY itself — what
+    the category covers, what kinds of products belong in it, who it's
+    typically for. Use when the customer asks ABOUT a category rather
+    than asking to SEE products in it.
+
+    Pick this tool when the customer's intent is descriptive / topical:
+      • "tell me about <category>"
+      • "what is the <category> collection"
+      • "describe the <category> section"
+      • "what kinds of things are in <category>"
+      • "what does <category> mean / cover"
+      • "are <category> any good for X?"
+
+    Pick `search_products` instead when the customer wants to BROWSE
+    or FIND products:
+      • "show me <category>"
+      • "products in <category>"
+      • "what do you have in <category>"
+      • "cheapest <category>"
+
+    Args:
+        category: The category name as the customer mentioned it.
+            The Magento side resolves the name to a numeric category id
+            via the per-merchant CategoryVocabulary. Pass the canonical
+            name from the "Detected matches" hint in your system prompt
+            if one was provided.
+    """
+
+
+@tool
 def get_store_policy(query: str) -> str:
     """Answer questions about store policies — returns, refunds, shipping,
     warranty, exchanges, cancellations, delivery timeframes, tracking.
@@ -269,6 +300,7 @@ def general_chat(
 ALL_TOOLS = [
     search_products,
     get_product_detail,
+    get_category_info,
     get_store_policy,
     get_store_info,
     view_cart,

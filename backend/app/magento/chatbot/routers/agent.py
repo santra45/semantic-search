@@ -55,6 +55,35 @@ class _CustomerContext(BaseModel):
     store_code: Optional[str] = None
 
 
+class _CategorySignal(BaseModel):
+    """A category match the Magento side already resolved name → id.
+    Passed to the LLM as a hint so it picks `category` arg accurately
+    without having to know the merchant's catalog tree itself.
+    """
+    id: int
+    name: str
+
+
+class _MatchSignals(BaseModel):
+    """Compact "what Magento already matched in this query" hint
+    (structured filter rebuild 2026-05-22+).
+
+    Replaces the previous full-vocab-dump approach. The Magento side
+    runs BrandVocabulary + CategoryVocabulary + AttributeVocabulary
+    over the customer message once (cached, sub-ms) and ships only
+    the MATCHES — typically 0-50 tokens vs the 1500-3000 tokens the
+    full vocab cost per turn. The tool-call LLM's job shrinks from
+    "is this a brand/category/attribute?" to "given these matches,
+    which tool fits the customer's intent?" — much easier for a
+    small / cheap routing model.
+
+    All fields optional; absent / empty means "no match found".
+    """
+    brand: str = ""
+    category: Optional[_CategorySignal] = None
+    attributes: dict[str, str] = Field(default_factory=dict)
+
+
 class ToolCallRequest(BaseModel):
     license_key: Optional[str] = None
     llm_api_key_encrypted: Optional[str] = None
@@ -68,6 +97,9 @@ class ToolCallRequest(BaseModel):
     conversation_history: list[dict[str, str]] = Field(default_factory=list)
 
     customer_context: _CustomerContext = Field(default_factory=_CustomerContext)
+
+    # Compact pre-matched signals — see _MatchSignals docstring.
+    match_signals: _MatchSignals = Field(default_factory=_MatchSignals)
 
     # Provider/model overrides — admin can pick a cheap fast model for
     # routing (e.g. gemini-2.5-flash-lite) and keep a premium model for
@@ -126,6 +158,7 @@ def tool_call(
         query=req.query.strip(),
         conversation_history=req.conversation_history,
         customer_context=req.customer_context.model_dump(),
+        match_signals=req.match_signals.model_dump(),
         provider=(req.llm_provider or "google"),
         model=(req.llm_model or "gemini-2.5-flash"),
         api_key=api_key,

@@ -1281,6 +1281,60 @@ def _build_answer_prompt(
             f"a SET, never list individual product names):\n{sources_blob}"
         )
 
+    if purpose == "category_info":
+        # CATEGORY OVERVIEW mode (structured filter rebuild 2026-05-22+).
+        # Used by CategoryInfoAgent when the customer asks ABOUT a
+        # category itself rather than asking to see its products.
+        #
+        # The sources blob is constructed as:
+        #   1. The category itself FIRST (name + full description +
+        #      meta_description + breadcrumb + permalink). Read directly
+        #      from Magento's CategoryRepository so the LLM sees the
+        #      MERCHANT-AUTHORED copy, not a chunked retrieval snippet.
+        #   2. 3-5 representative products from the category as
+        #      supporting evidence the LLM can name illustratively.
+        #
+        # The customer asked for a description, not a wall of cards, so
+        # the prompt removes the 1-2 sentence cap and tells the LLM to
+        # write a substantive 2-4 sentence overview. Product cards still
+        # render beneath the answer text (the agent puts them in
+        # response.data.sources separately).
+        return (
+            "You are describing a product category to a customer. The first "
+            "source below is the category itself — its merchant-authored "
+            "description, name, breadcrumb, and meta description. The "
+            "remaining sources are representative products from inside "
+            "that category, included so you can mention one or two "
+            "illustratively.\n\n"
+            "Goal: write a clear 2-4 sentence overview of what the category "
+            "covers, what kinds of products belong in it, and (when you "
+            "can tell) who it would suit. Use the merchant's description "
+            "as your source of truth — paraphrase it naturally, don't "
+            "quote it verbatim. If product examples help illustrate the "
+            "range, name one or two (e.g. \"such as the Tranquillity "
+            "Sphere or the Mini Cascade Bowl\"). Do NOT enumerate every "
+            "product or list SKUs — cards render below this text.\n\n"
+            "Rules:\n"
+            " - Plain prose. No markdown headings. No bulleted or "
+            "numbered lists unless the customer explicitly asked.\n"
+            " - Bold concrete numbers / sizes / prices when they appear "
+            "(**45 cm**, **£199**, **3-year warranty**).\n"
+            " - Don't refuse — the merchant has clearly defined this "
+            "category; produce an overview from what's given even if "
+            "the description is short.\n"
+            " - Don't invent facts beyond what the sources say. If the "
+            "description doesn't cover something the customer asked "
+            "about, acknowledge that the cards below show the actual "
+            "range.\n"
+            " - Speak as the store (\"our Solar Fountains collection\"), "
+            "not as an external assistant (\"according to the data\")."
+            + instruction_block
+            + "\n\n"
+            f"Customer question: {query}"
+            + history_block
+            + f"\n\nCategory + representative products:\n{sources_blob}"
+        )
+
     # Default "answer" purpose + "comparison" (same prompt, comparison
     # gets an extra hint via `instruction`).
     #
