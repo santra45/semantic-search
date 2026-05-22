@@ -510,8 +510,8 @@ def retrieve_products(
     # without parsing structured fields.
     base_mode = "semantic+decomp" if decomposed else "semantic"
     mode = base_mode
+    from backend.app.services.mmr import apply_mmr, strip_vector
     if mmr_active and len(hits) > req.limit:
-        from backend.app.services.mmr import apply_mmr, strip_vector
         try:
             hits = apply_mmr(
                 query_vector=query_vector,
@@ -525,12 +525,15 @@ def retrieve_products(
             # let a numpy hiccup deprive the customer of results.
             logger.warning("retrieve/products MMR failed: %s — falling back to vector order", exc)
             hits = hits[: req.limit]
-        finally:
-            # Always strip — successful MMR or fall-back, the dense
-            # vectors don't belong on the wire to Magento.
-            strip_vector(hits)
     else:
         hits = hits[: req.limit]
+    # Always strip dense vectors before returning. Earlier the strip
+    # only ran inside the MMR branch — when the candidate pool was
+    # smaller than `limit` (very common for narrow catalogues) the
+    # else-branch leaked 3072-float arrays per hit to Magento, which
+    # then forwarded them to /retrieve/answer/stream. ~50KB per hit
+    # for no consumer benefit.
+    strip_vector(hits)
 
     if req.rerank and hits:
         # Trim the rerank pool. By this point `hits` has been shrunk to
@@ -1139,30 +1142,52 @@ def _build_answer_prompt(
 
     if purpose == "preamble":
         # CONFIRMATION mode — used by ProductSearchAgent's NL answer-line.
-        # Drops the strict refusal rule. The product cards render below
-        # the message regardless, so the prompt's job is ONE sentence.
+        # Drops the strict refusal rule. The cards render below the
+        # message regardless, so the prompt's job is a warm, informative
+        # acknowledgment that engages with the category description and
+        # the variety on offer — not a flat one-liner. The earlier
+        # 1-2-sentence cap left rich category + product evidence
+        # unused; the customer asked, we have the data, we should use it.
         return (
-            "You are writing the lead-in sentence for a product search result. "
-            "Vector search has ALREADY confirmed these products match the customer's request — "
-            "your job is to acknowledge that match in natural language, NOT to second-guess "
-            "whether the evidence supports it.\n\n"
-            "Rules:\n"
-            " - Reply with ONE short sentence. Two at most.\n"
-            " - Use the customer's own phrasing where it fits (e.g. if they asked about "
-            "\"indoor water features\", use \"indoor water features\" in your reply — not "
-            "an internal attribute name).\n"
+            "You are writing the lead-in for a product search result page. "
+            "Vector search has ALREADY confirmed these products match the customer's "
+            "request — your job is to acknowledge that match warmly and informatively. "
+            "Do NOT second-guess whether the evidence supports the match.\n\n"
+            "Tone & length:\n"
+            " - 2 to 4 sentences. Substantive but not verbose.\n"
+            " - Match the customer's own phrasing for the topic (\"garden planters\" "
+            "not \"plant containers\"; \"indoor water features\" not \"interior "
+            "fountains\").\n"
             " - For yes/no questions, start with \"Yes\" or \"Yes — \".\n"
-            " - For \"which X would you suggest\" / \"recommend\" / \"help me choose\" "
-            "questions, frame as advice: \"For a small garden, here are some compact "
-            "options to consider:\", \"These would suit a beginner:\".\n"
-            " - Do NOT list product names or SKUs. Cards render below this sentence.\n"
+            " - For \"recommend\" / \"suggest\" / \"help me choose\" questions, "
+            "frame as advice (\"For a small garden, these compact options would "
+            "suit you well:\").\n"
+            " - Plain prose only — no markdown headings, no bullets, no numbered "
+            "lists.\n\n"
+            "What to include (drawing from the evidence below):\n"
+            " - When a matching CATEGORY collection is present in the evidence, "
+            "name it and say a sentence about what it covers (use its description "
+            "as a guide — paraphrase, don't quote verbatim).\n"
+            " - When the matched products show variety, describe that variety as "
+            "a SET: price range (\"from £20 up to around £150\"), common "
+            "materials / styles / finishes, or notable options (e.g. \"including "
+            "both solar-lit and mains-powered choices\"). Pull these details "
+            "from the matched products listed below.\n"
+            " - End with a brief invitation to look at the options below.\n\n"
+            "What to avoid:\n"
+            " - Do NOT list individual product names or SKUs — cards render below "
+            "this sentence and the customer will see every product visually.\n"
             " - Do NOT refuse or claim insufficient information. The match is real.\n"
-            " - Do NOT use markdown headings or bullets — plain prose only.\n"
+            " - Do NOT invent details not present in the evidence (no fake prices, "
+            "no fake brand names).\n"
+            " - Do NOT call attention to your sources (\"according to the data\", "
+            "\"based on what I see\") — speak as the store, not as an assistant.\n"
             + instruction_block
             + "\n\n"
             f"Customer question: {query}"
             + history_block
-            + f"\n\nMatched products (for context — DO NOT list these by name):\n{sources_blob}"
+            + f"\n\nMatched content (categories first, then products — describe as "
+            f"a SET, never list individual product names):\n{sources_blob}"
         )
 
     # Default "answer" purpose + "comparison" (same prompt, comparison
