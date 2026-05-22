@@ -1286,53 +1286,81 @@ def _build_answer_prompt(
         # Used by CategoryInfoAgent when the customer asks ABOUT a
         # category itself rather than asking to see its products.
         #
-        # The sources blob is constructed as:
-        #   1. The category itself FIRST (name + full description +
-        #      meta_description + breadcrumb + permalink). Read directly
-        #      from Magento's CategoryRepository so the LLM sees the
-        #      MERCHANT-AUTHORED copy, not a chunked retrieval snippet.
-        #   2. 3-5 representative products from the category as
-        #      supporting evidence the LLM can name illustratively.
+        # Sources arrive in one of two shapes, dispatched by the agent
+        # based on the matched category's children_count:
         #
-        # The customer asked for a description, not a wall of cards, so
-        # the prompt removes the 1-2 sentence cap and tells the LLM to
-        # write a substantive 2-4 sentence overview. Product cards still
-        # render beneath the answer text (the agent puts them in
-        # response.data.sources separately).
+        # (A) PARENT shape — the matched category is an umbrella that
+        #     contains sub-categories. Sources blob:
+        #       [0] = the parent category itself (description, meta, breadcrumb)
+        #       [1..N] = 3-5 direct child categories, each a category
+        #                source with name + summary + permalink
+        #     The customer wants ORIENTATION — what's IN this section?
+        #     so the LLM describes the parent AND names 2-3 sub-collections
+        #     to give a sense of structure.
+        #
+        # (B) LEAF shape — the matched category has no children, IT IS
+        #     the product collection. Sources blob:
+        #       [0] = the leaf category itself
+        #       [1..N] = 3-5 representative products with full descriptions
+        #     The LLM describes the leaf AND names 1-2 products
+        #     illustratively to anchor the overview in concrete examples.
+        #
+        # Both shapes share the same rules below; the LLM distinguishes
+        # by content_type on each supporting source ([category] vs
+        # [product]).
         return (
             "You are describing a product category to a customer. The first "
-            "source below is the category itself — its merchant-authored "
-            "description, name, breadcrumb, and meta description. The "
-            "remaining sources are representative products from inside "
-            "that category, included so you can mention one or two "
-            "illustratively.\n\n"
+            "source below is the category itself (its merchant-authored "
+            "description, name, breadcrumb, meta description). The remaining "
+            "sources are either SUB-CATEGORIES (if the matched category is "
+            "a navigation umbrella with children) or REPRESENTATIVE PRODUCTS "
+            "(if the matched category is a leaf containing actual products). "
+            "Look at the content_type tag on each supporting source to tell "
+            "them apart — `[category]` = sub-category, `[product]` = a "
+            "product example.\n\n"
             "Goal: write a clear 2-4 sentence overview of what the category "
-            "covers, what kinds of products belong in it, and (when you "
-            "can tell) who it would suit. Use the merchant's description "
-            "as your source of truth — paraphrase it naturally, don't "
-            "quote it verbatim. If product examples help illustrate the "
-            "range, name one or two (e.g. \"such as the Tranquillity "
-            "Sphere or the Mini Cascade Bowl\"). Do NOT enumerate every "
-            "product or list SKUs — cards render below this text.\n\n"
+            "covers, what's inside it, and (when you can tell) who it would "
+            "suit. Use the merchant's description as your source of truth — "
+            "paraphrase it naturally, don't quote verbatim.\n\n"
+            "How to use the supporting sources:\n"
+            " - When SUB-CATEGORIES are present (parent-shape response): "
+            "name 2-3 of them in your overview to give the customer a sense "
+            "of structure. Use the merchant's category names exactly. "
+            "Example: \"Our **Solar Water Features** collection covers "
+            "outdoor pieces that run on solar power. It includes "
+            "sub-collections for **Solar Fountains**, **Solar Bird Baths**, "
+            "and **Solar Pump Systems**, ranging from compact standalone "
+            "pieces to larger installations.\"\n"
+            " - When PRODUCT examples are present (leaf-shape response): "
+            "name 1-2 illustratively to anchor the overview. Use the "
+            "product's actual name. Example: \"Our **Solar Fountains** "
+            "include pieces like the **Tranquillity Sphere** and "
+            "**Mini Cascade Bowl**, both self-contained solar units that "
+            "don't need mains plumbing.\"\n"
+            " - Do NOT enumerate every sub-category or every product, and "
+            "do NOT list SKUs — the supporting items render as cards "
+            "beneath this text and the customer will see them visually.\n\n"
             "Rules:\n"
-            " - Plain prose. No markdown headings. No bulleted or "
-            "numbered lists unless the customer explicitly asked.\n"
-            " - Bold concrete numbers / sizes / prices when they appear "
-            "(**45 cm**, **£199**, **3-year warranty**).\n"
+            " - Plain prose. No markdown headings. No bulleted or numbered "
+            "lists unless the customer explicitly asked.\n"
+            " - Bold concrete category names, sub-collection names, product "
+            "names, sizes, prices, and quantities (**Solar Fountains**, "
+            "**Tranquillity Sphere**, **45 cm**, **£199**, **3-year "
+            "warranty**).\n"
             " - Don't refuse — the merchant has clearly defined this "
-            "category; produce an overview from what's given even if "
-            "the description is short.\n"
+            "category; produce an overview from what's given even if the "
+            "description is short.\n"
             " - Don't invent facts beyond what the sources say. If the "
-            "description doesn't cover something the customer asked "
-            "about, acknowledge that the cards below show the actual "
-            "range.\n"
+            "description doesn't cover something the customer asked about, "
+            "acknowledge that the cards below show the actual range.\n"
             " - Speak as the store (\"our Solar Fountains collection\"), "
             "not as an external assistant (\"according to the data\")."
             + instruction_block
             + "\n\n"
             f"Customer question: {query}"
             + history_block
-            + f"\n\nCategory + representative products:\n{sources_blob}"
+            + f"\n\nCategory + supporting items (sub-categories OR products — "
+              f"check content_type on each):\n{sources_blob}"
         )
 
     # Default "answer" purpose + "comparison" (same prompt, comparison
