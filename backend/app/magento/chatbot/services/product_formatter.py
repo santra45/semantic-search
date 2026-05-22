@@ -105,13 +105,19 @@ def html_to_structured_text(html: str) -> str:
 
 # ── Token normalization ──────────────────────────────────────────────────────
 
+from backend.app.utils.slug import slug as _shared_slug
+
+
 def normalize_token(value: Any) -> str:
-    """Lowercase + collapse non-alphanumerics into single underscores."""
-    s = str(value or "").strip().lower()
-    s = re.sub(r"%", " percent", s)
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    s = re.sub(r"_+", "_", s)
-    return s.strip("_")
+    """Lowercase + collapse non-alphanumerics into single underscores.
+
+    Thin wrapper around the canonical slug() in backend.app.utils.slug —
+    name kept for back-compat with existing call sites. New code should
+    import slug() directly. Same algorithm: sync-time payload keys MUST
+    match runtime filter keys or attribute / category filter lookups
+    silently miss.
+    """
+    return _shared_slug(value)
 
 
 # ── Shortcode expansion (apparel sizes, child ages) ──────────────────────────

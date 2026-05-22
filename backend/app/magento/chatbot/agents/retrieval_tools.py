@@ -165,7 +165,14 @@ def make_retrieval_tools(
             return f"Error performing content search: {exc}"
 
     @tool
-    def retrieve_more_products(query: str, limit: int = _PRODUCT_LIMIT_DEFAULT) -> str:
+    def retrieve_more_products(
+        query: str,
+        limit: int = _PRODUCT_LIMIT_DEFAULT,
+        category_id: Optional[str] = None,
+        min_price: Optional[float] = None,
+        max_price: Optional[float] = None,
+        attribute_filters: Optional[dict[str, str]] = None,
+    ) -> str:
         """Search the store's product catalogue for additional products
         matching the query. Use this when the customer's question would
         benefit from concrete product evidence that wasn't in the
@@ -175,6 +182,18 @@ def make_retrieval_tools(
         Args:
             query: Refined product search phrase.
             limit: How many products to fetch. Default 5, max 10.
+            category_id: Optional numeric category id to filter to
+                products in that category only. Use when the customer
+                or the conversation context names a category.
+            min_price / max_price: Optional price bounds. Use when the
+                customer mentions a budget (e.g. "under £50").
+            attribute_filters: Optional dict like {"color": "red",
+                "size": "m"}. Use when the customer mentions specific
+                product attributes the catalogue exposes. Match the
+                attribute code and value casing exactly. For brand-style
+                filters, use the merchant's brand attribute code as the
+                key (commonly "brand", sometimes "manufacturer" or
+                "vendor") — e.g. {"brand": "Altico"}.
         """
         try:
             limit = max(1, min(int(limit), _PRODUCT_LIMIT_MAX))
@@ -193,6 +212,16 @@ def make_retrieval_tools(
                 hybrid=hybrid and sparse_vec is not None,
                 sparse_query_vector=sparse_vec,
                 with_vectors=False,
+                # Structured filter rebuild (2026-05-22+) — active-retrieval
+                # tool now respects the same FieldCondition pre-filtering as
+                # the primary /retrieve/products handler. Brand is routed
+                # through attribute_filters[<brand_code>] just like the
+                # main pipeline, so the LLM uses the existing attribute
+                # filter rather than a separate brand arg.
+                attribute_filters=attribute_filters or None,
+                category_id=category_id,
+                min_price=min_price,
+                max_price=max_price,
             )
             if not hits:
                 return "No additional products found for that query."

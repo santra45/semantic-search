@@ -29,7 +29,7 @@ Tool naming convention:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from langchain_core.tools import tool
 
@@ -45,10 +45,14 @@ def search_products(
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = None,
     consultative: bool = False,
+    brand: Optional[str] = None,
+    category: Optional[str] = None,
+    attributes: Optional[Dict[str, str]] = None,
 ) -> str:
     """Search the product catalog. Use this when the customer wants to find or
     browse products: "show me X", "do you have Y", "I'm looking for Z",
-    "what's the cheapest A", "any red shoes under £50", "products like B".
+    "what's the cheapest A", "any red shoes under £50", "products like B",
+    "products from Altico", "anything in the Solar Fountains category".
 
     Args:
         query: The customer's product search phrase (cleaned to the noun
@@ -66,6 +70,22 @@ def search_products(
         consultative: True when the query is exploratory rather than a
             specific product search — "I have a small garden, what
             would you suggest", "I need a gift for a 10-year-old".
+        brand: The brand name when the customer mentions one (e.g.
+            "Altico", "Acme Garden"). Pass the canonical brand label as
+            the merchant uses it; the Magento side validates against the
+            known brand vocabulary before applying it as a structured
+            filter. Omit when no brand is mentioned.
+        category: The category name when the customer mentions one
+            (e.g. "Solar Fountains", "Outdoor Lighting"). Pass the
+            category name verbatim; the Magento side resolves it to a
+            numeric category id via the category vocabulary. Omit when
+            no category is mentioned.
+        attributes: Dict of {attribute_code: value} when the customer
+            mentions specific product attributes — colour, size, material,
+            or any merchant-defined attribute. e.g. {"color": "red",
+            "material": "stainless steel"}. Match the attribute code and
+            value casing exactly as they appear in the catalogue. Omit
+            when no attributes are mentioned.
     """
 
 

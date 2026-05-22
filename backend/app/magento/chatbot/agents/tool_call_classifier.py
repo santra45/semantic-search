@@ -55,8 +55,19 @@ matches what the customer is trying to do.
 Routing guidance:
 
   * Use `search_products` for any product discovery — including price
-    constraints, attribute filters (color, size, material), and sort
-    intent (cheapest, most expensive, newest).
+    constraints (min_price, max_price), attribute filters (color, size,
+    material, etc.), sort intent (cheapest, most expensive, newest),
+    brand mentions, and category mentions.
+    - When the customer mentions a brand by name (e.g. "products from
+      Altico"), pass it via `brand`.
+    - When the customer mentions a category by name (e.g. "anything in
+      Solar Fountains"), pass it via `category`.
+    - When the customer mentions specific attribute values (e.g. "red
+      stainless steel"), pass them via `attributes` as a dict like
+      {"color": "red", "material": "stainless steel"}.
+    These structured args apply as exact-match filters BEFORE semantic
+    search runs, which is much more reliable than letting semantic
+    similarity guess at brand / category / attribute membership.
   * Use `get_product_detail` ONLY when the customer references a
     specific product by name or SKU.
   * Use `get_store_policy` for returns / refunds / shipping / warranty

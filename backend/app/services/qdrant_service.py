@@ -226,13 +226,46 @@ def _type_specific_id_key(content_type: str) -> str:
     }.get(content_type, "entity_id")
 
 
+from backend.app.utils.slug import slug as _slug
+# Re-exported as _slug for the existing FieldCondition key-building
+# call sites in _build_content_filter. Single source of truth — see
+# backend/app/utils/slug.py.
+
+
 def _build_content_filter(
     content_types: Optional[Iterable[str]] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     only_in_stock: bool = False,
     store_code: Optional[str] = None,
+    attribute_filters: Optional[dict[str, str]] = None,
+    category_id: Optional[str] = None,
 ) -> Optional[Filter]:
+    """Compose the Qdrant `Filter` applied BEFORE vector search runs.
+
+    Phase: structured filter rebuild (2026-05-22+) — `attribute_filters`
+    and `category_id` are now native FieldConditions instead of the
+    post-fetch Python filter the retrieve.py handler used to apply at
+    lines 482-488. Net effect: semantic ranking is now computed WITHIN
+    the filtered candidate set (the right place), instead of Qdrant
+    ranking the whole corpus by similarity and then Python stripping
+    the non-matches afterwards (the wrong place — relevance order was
+    being computed for the wrong universe).
+
+    Brand routing: brand is intentionally NOT a separate filter arg.
+    The Magento side merges entities['brand'] into
+    attribute_filters[<brand_attribute_code>] inside ProductSearchAgent
+    so the same `attr_<code>_<slug>` boolean-key path handles brand.
+    This means existing product points (whose sync wrote attr_*
+    booleans for every EAV attribute including brand) work without
+    re-sync. See plan.md "Structured filter rebuild" for full
+    rationale.
+
+    Payload-key shape we rely on (written by product_formatter.py at
+    sync time, slugified via backend.app.utils.slug.slug):
+      * attr_<slug(code)>_<slug(value)>: bool True
+      * cat_<id>: bool True
+    """
     must_conditions = []
     content_types = [content_type for content_type in (content_types or []) if content_type]
 
@@ -267,6 +300,38 @@ def _build_content_filter(
         must_conditions.append(
             FieldCondition(key="store_code", match=MatchValue(value=store_code))
         )
+
+    # ── Structured filters (Phase: structured filter rebuild) ────────────
+    # Each non-empty (code, value) pair becomes a FieldCondition matching
+    # the boolean flag written at sync time. Skipped silently when the
+    # slug pair produces an empty string (defensive; shouldn't happen for
+    # well-formed input).
+    if attribute_filters:
+        for raw_code, raw_value in attribute_filters.items():
+            code = _slug(raw_code)
+            value = _slug(raw_value)
+            if not code or not value:
+                continue
+            must_conditions.append(
+                FieldCondition(
+                    key=f"attr_{code}_{value}",
+                    match=MatchValue(value=True),
+                )
+            )
+
+    if category_id:
+        # category_id arrives as a string from the wire (Magento sends it as
+        # string for legacy reasons). Numeric coercion is defensive — the
+        # payload key is built with the verbatim id, so any cast / format
+        # change here would silently break.
+        cid = str(category_id).strip()
+        if cid:
+            must_conditions.append(
+                FieldCondition(
+                    key=f"cat_{cid}",
+                    match=MatchValue(value=True),
+                )
+            )
 
     return Filter(must=must_conditions) if must_conditions else None
 
@@ -370,6 +435,8 @@ def search_content(
     sparse_query_vector: Optional[SparseVector] = None,
     with_vectors: bool = False,
     query_vectors: Optional[list[list[float]]] = None,
+    attribute_filters: Optional[dict[str, str]] = None,
+    category_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Vector search over the per-tenant collection.
 
@@ -413,6 +480,8 @@ def search_content(
         max_price=max_price,
         only_in_stock=only_in_stock,
         store_code=store_code,
+        attribute_filters=attribute_filters,
+        category_id=category_id,
     )
 
     # Over-fetch when dedup is on so the post-filter pass has enough
@@ -564,6 +633,8 @@ def search_products(
     sparse_query_vector: Optional[SparseVector] = None,
     with_vectors: bool = False,
     query_vectors: Optional[list[list[float]]] = None,
+    attribute_filters: Optional[dict[str, str]] = None,
+    category_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     # Phase 2.2: hybrid + sparse args passed through to search_content
     # so the products endpoint participates in BM25 + dense fusion when
@@ -574,6 +645,14 @@ def search_products(
     # Phase 3.3: query_vectors carries N decomposed sub-query embeddings
     # for RRF fusion across sub-queries (in addition to the hybrid
     # sparse fusion when both are on).
+    # Structured filter rebuild (2026-05-22+): attribute_filters +
+    # category_id thread through as native Qdrant FieldConditions —
+    # narrow the candidate pool BEFORE semantic ranking so exact-match
+    # facets gate which products even get scored. Brand is routed via
+    # attribute_filters[<brand_attribute_code>] (Magento merges this
+    # on the wire-payload side), so no separate brand arg is needed —
+    # the existing `attr_<code>_<slug>` boolean keys on every synced
+    # product point are the filter target.
     return search_content(
         client_id=client_id,
         domain=domain,
@@ -588,6 +667,8 @@ def search_products(
         sparse_query_vector=sparse_query_vector,
         with_vectors=with_vectors,
         query_vectors=query_vectors,
+        attribute_filters=attribute_filters,
+        category_id=category_id,
     )
 
 

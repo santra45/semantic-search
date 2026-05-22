@@ -55,6 +55,23 @@ class ProductRetrieveRequest(BaseModel):
     only_in_stock: bool = False
     attribute_filters: dict[str, str] = Field(default_factory=dict)  # {"color": "red", "size": "m"}
     category_id: Optional[str] = None
+    # Note: brand was briefly a top-level field in the structured-filter
+    # rebuild (2026-05-22 morning) but is now routed through
+    # `attribute_filters` instead — Magento merges entities['brand'] into
+    # attribute_filters[<brand_attribute_code>] before sending. This means
+    # the Qdrant filter matches the SAME `attr_<code>_<slug>` boolean key
+    # that the sync pipeline has always been writing, which works on
+    # existing product points without re-sync. See plan.md "Structured
+    # filter rebuild" entry for full rationale.
+    # Compat fallback for the post-filter → pre-filter rebuild (2026-05-22+).
+    # When True AND the structured filters (attribute / category / brand)
+    # produce zero hits, the handler retries WITHOUT those filters and
+    # applies the legacy Python post-filter on the broader semantic pool.
+    # Lets tenants who haven't re-synced after the rebuild keep getting
+    # results until their points carry the new payload shape. Admin
+    # toggles via aichatbot/llm/filter_compat_mode. Default False — once
+    # the tenant has fully re-synced, this should stay off.
+    filter_compat_mode: bool = False
     limit: int = 8
     rerank: bool = False  # admin-toggled — small LLM rerank of top-N
     # Cap on how many candidates flow into the LLM reranker after Qdrant
@@ -172,6 +189,17 @@ class ProductRetrieveRequest(BaseModel):
                         out[str(name)] = str(val)
             return out
         return {}
+
+    @field_validator("category_id", mode="before")
+    @classmethod
+    def _coerce_optional_string(cls, value):
+        """Empty strings and PHP-flavoured falsy values should be None, not
+        passed through as the literal string. Without this, a Magento payload
+        with category_id="" would build a FieldCondition for `cat_` and filter
+        away every product on the planet."""
+        if value in (None, "", [], {}, 0, "0"):
+            return None
+        return value
 
     @field_validator("skus", "content_types", mode="before")
     @classmethod
@@ -446,13 +474,25 @@ def retrieve_products(
     # meaningless if there are only `limit` candidates to choose from.
     # Bump fan_out to ≥5 when MMR is on (and not pre-empted by sort_by;
     # MMR is skipped in that branch — see the apply step below).
-    fan_out = 3 if (req.attribute_filters or req.category_id) else 1
+    #
+    # Structured filter rebuild (2026-05-22+): the historical fan_out=3
+    # for attribute_filters / category_id was compensation for the
+    # post-Qdrant Python filter dropping a fraction of hits. With those
+    # filters now pushed into the Qdrant query as native FieldConditions,
+    # every returned hit already matches — no oversample needed for
+    # filter selectivity. Sort + MMR fan_outs still apply because they
+    # need extra candidate variety to do their job.
+    fan_out = 1
     if req.sort_by:
         fan_out = max(fan_out, 5)
     mmr_active = req.mmr and not req.sort_by
     if mmr_active:
         fan_out = max(fan_out, 5)
     raw_limit = max(req.limit, req.limit * fan_out)
+
+    had_structured_filters = bool(
+        req.attribute_filters or req.category_id
+    )
 
     hits = qdrant_search_products(
         client_id=client_id,
@@ -473,19 +513,70 @@ def retrieve_products(
         # sub-queries. qdrant_service collapses 1-element lists back
         # to the single-vector path internally.
         query_vectors=query_vectors,
+        # Structured filter rebuild (2026-05-22+) — attribute_filters
+        # (which now carries brand under the merchant's configured brand
+        # attribute code, merged Magento-side in ProductSearchAgent) and
+        # category_id land as native Qdrant FieldConditions composed by
+        # _build_content_filter alongside price + stock + store_code, so
+        # semantic ranking computes over the already-filtered candidate
+        # set instead of post-fetch Python filtering after the fact.
+        attribute_filters=req.attribute_filters or None,
+        category_id=req.category_id,
     )
 
-    # Attribute + category filtering — these are stored as payload booleans,
-    # so we filter server-side here (Qdrant's FieldCondition also works but
-    # the Python side is simpler for dynamic keys and lets us keep the
-    # qdrant_service generic).
-    if req.attribute_filters:
-        for attr, value in req.attribute_filters.items():
-            key = f"attr_{_slug(attr)}_{_slug(value)}"
+    # Compat fallback (Phase: structured filter rebuild — 2026-05-22+).
+    # When the pre-filter Qdrant query returns nothing AND the request
+    # carried structured filters AND the admin has opted into compat
+    # mode, re-run WITHOUT those filters and apply the legacy Python
+    # post-filter on the broader semantic pool.
+    #
+    # The post-filter checks payload booleans the sync used to write;
+    # for tenants who synced before the rebuild the booleans were set
+    # then too, so this fallback still finds matches. For tenants whose
+    # data is fully up-to-date this branch never fires (the pre-filter
+    # found their results on the first try).
+    #
+    # A WARNING-level log line surfaces every compat-fallback hit so
+    # operators can spot tenants that need a re-sync. The flag is
+    # documented as a transition aid only — plan to remove after
+    # telemetry shows ~zero usage.
+    if not hits and had_structured_filters and req.filter_compat_mode:
+        logger.warning(
+            "[retrieve/products] compat fallback engaged — structured filter "
+            "returned 0 hits; retrying without filters + post-filter. "
+            "Tenant likely needs a re-sync. attribute_filters=%s category_id=%s",
+            req.attribute_filters, req.category_id,
+        )
+        hits = qdrant_search_products(
+            client_id=client_id,
+            domain=domain,
+            query_vector=query_vector,
+            limit=raw_limit,
+            min_price=req.min_price,
+            max_price=req.max_price,
+            only_in_stock=req.only_in_stock,
+            content_types=req.content_types or ["product"],
+            store_code=req.store_code,
+            hybrid=req.hybrid,
+            sparse_query_vector=sparse_query_vector,
+            with_vectors=mmr_active,
+            query_vectors=query_vectors,
+            # Structured filters dropped — falling back to semantic-only.
+        )
+        # Legacy Python post-filter — kept here only on the compat path.
+        # Equivalent to the pre-rebuild logic but applied to a wider
+        # raw_limit pool. Brand has already been merged into
+        # attribute_filters[brand_code] Magento-side, so the same loop
+        # handles it. Returns empty when the merchant's products genuinely
+        # don't carry the boolean flags either (in which case the tenant
+        # must re-sync — no software fallback fixes that).
+        if req.attribute_filters:
+            for attr, value in req.attribute_filters.items():
+                key = f"attr_{_slug(attr)}_{_slug(value)}"
+                hits = [h for h in hits if h.get(key) is True]
+        if req.category_id:
+            key = f"cat_{req.category_id}"
             hits = [h for h in hits if h.get(key) is True]
-    if req.category_id:
-        key = f"cat_{req.category_id}"
-        hits = [h for h in hits if h.get(key) is True]
 
     # ── Apply customer-requested sort on the on-topic candidate pool ─────
     # Runs AFTER attribute/category narrowing so the sort operates on
@@ -1524,13 +1615,16 @@ def _extract_text(content: Any) -> str:
 
 
 def _slug(value: str) -> str:
-    import re as _re
+    """Compat shim — delegates to the canonical slug() in app.utils.slug.
 
-    s = str(value or "").strip().lower()
-    s = _re.sub(r"%", " percent", s)
-    s = _re.sub(r"[^a-z0-9]+", "_", s)
-    s = _re.sub(r"_+", "_", s)
-    return s.strip("_")
+    Kept as a private name in this module so the compat-fallback block
+    (post-filter retry) keeps working without touching its many literal
+    f-string interpolations. New code should `from backend.app.utils.slug
+    import slug` directly. Same algorithm by definition since this just
+    forwards to it.
+    """
+    from backend.app.utils.slug import slug as _shared_slug
+    return _shared_slug(value)
 
 
 def _apply_sort(hits: list[dict], sort_by: str, sort_order: str) -> list[dict]:
