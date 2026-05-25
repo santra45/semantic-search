@@ -321,7 +321,6 @@ ALL_TOOLS = [
     get_category_info,
     search_products,
     get_product_detail,
-    contact_support,
     general_chat,
 ]
 
