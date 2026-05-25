@@ -858,6 +858,69 @@ def delete_content_items_by_entity(
     )
 
 
+def delete_by_content_type(
+    client_id: str,
+    domain: str,
+    content_type: str,
+    store_code: Optional[str] = None,
+) -> int:
+    """Bulk-delete every point of a given content_type from the tenant's
+    collection. Returns the number of points removed.
+
+    Used by the admin "Purge content type" action — when a merchant
+    needs to wipe a slice of the index (e.g. after changing the
+    product-sync-scope from ALL → VISIBLE_IN_STOCK, the out-of-stock
+    products synced under the old setting need explicit removal before
+    a fresh sync overwrites them).
+
+    Optional store_code scopes the delete to a single store-view. Most
+    callers leave it None (purge everything of that type across all
+    stores in the collection) which mirrors how the admin button is
+    wired today.
+
+    Returns 0 when the collection doesn't exist (no work to do) or
+    when no points matched.
+
+    Implementation: uses Qdrant's filter-based delete with a count()
+    pre-step so the caller can report "deleted N points" in the admin
+    UI. The count + delete is two RTTs but the count is cheap on
+    indexed payload fields (client_id + content_type are both
+    indexed via on_disk_payload=False default) and the admin UX
+    benefit of "deleted 2,847 points" beats the latency cost.
+    """
+    if not _collection_exists(client_id, domain):
+        return 0
+    collection_name = get_collection_name(client_id, domain)
+    must = [
+        FieldCondition(key="client_id",    match=MatchValue(value=str(client_id))),
+        FieldCondition(key="content_type", match=MatchValue(value=str(content_type))),
+    ]
+    if store_code:
+        must.append(
+            FieldCondition(key="store_code", match=MatchValue(value=str(store_code)))
+        )
+    qfilter = Filter(must=must)
+
+    # Count first so we can report it back to the admin. exact=False
+    # is fine — we want a quick approximate; the admin reads "~N
+    # deleted" not "exactly N", and exact=True walks every segment.
+    try:
+        before = qdrant.count(
+            collection_name=collection_name,
+            count_filter=qfilter,
+            exact=False,
+        )
+        before_count = int(before.count or 0)
+    except Exception:
+        before_count = 0
+
+    qdrant.delete(
+        collection_name=collection_name,
+        points_selector=FilterSelector(filter=qfilter),
+    )
+    return before_count
+
+
 def upsert_product(client_id: str, domain: str, product_id: str, vector: list[float], payload: dict[str, Any]) -> None:
     upsert_content_item(client_id, domain, "product", product_id, vector, payload)
 

@@ -29,6 +29,8 @@ from backend.app.services.embedder import embed_document
 from backend.app.services.license_service import increment_ingest_count
 from backend.app.services.qdrant_service import (
     CHUNKABLE_CONTENT_TYPES,
+    delete_by_content_type,
+    delete_client_collection,
     delete_content_item,
     get_client_content_counts,
     get_client_product_count,
@@ -461,4 +463,147 @@ def sync_status(
     return {
         "counts": counts,
         "total_indexed": sum(int(c) for c in counts.values()),
+    }
+
+
+# ── Purge / reset endpoints ──────────────────────────────────────────────────
+#
+# Used by the admin "Manage Indexed Content" dashboard section. Two flavors:
+#
+#   * /sync/purge            — delete every point of a given content_type
+#                              from the tenant's collection (optionally
+#                              scoped to a store_code). Used when the
+#                              merchant wants to drop a stale slice of
+#                              the index after changing sync settings —
+#                              e.g. after switching product-sync-scope
+#                              from ALL → VISIBLE_IN_STOCK, the
+#                              out-of-stock products synced earlier need
+#                              explicit removal.
+#
+#   * /sync/purge/collection — drop the whole per-tenant collection.
+#                              Next sync recreates it from scratch with
+#                              the current named-vector schema (handy when
+#                              upgrading the schema or recovering from a
+#                              corrupt index).
+#
+# Both authorize via the standard license_key + x-api-key headers — same
+# auth posture as every other sync endpoint. Idempotent: purging an
+# already-empty collection / content_type is a no-op.
+
+
+class SyncPurgeRequest(BaseModel):
+    """Selective purge of one content_type. store_code optional — when
+    set, only the per-store-variant points are removed; when absent,
+    every point of that content_type across all stores in the
+    collection is removed."""
+    license_key: Optional[str] = None
+    content_type: str
+    store_code: Optional[str] = None
+
+
+@router.post("/magento/chatbot/agent/sync/purge")
+def sync_purge_content_type(
+    req: SyncPurgeRequest,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    license_data = authorize_request(
+        request=request, db=db,
+        authorization=authorization, x_api_key=x_api_key,
+        request_license=req.license_key,
+    )
+
+    content_type = (req.content_type or "").strip().lower()
+    if content_type not in SUPPORTED_TYPES:
+        return {
+            "success": False,
+            "deleted_count": 0,
+            "message": (
+                f"Unknown content_type '{content_type}'. "
+                f"Supported: {sorted(SUPPORTED_TYPES)}"
+            ),
+        }
+
+    try:
+        deleted = delete_by_content_type(
+            client_id=license_data["client_id"],
+            domain=license_data["domain"],
+            content_type=content_type,
+            store_code=req.store_code,
+        )
+    except Exception as exc:
+        logger.exception("[sync/purge] failed for %s: %s", content_type, exc)
+        return {
+            "success": False,
+            "deleted_count": 0,
+            "message": f"Purge failed: {exc}",
+        }
+
+    # Drop cached retrieval results — the just-purged content shouldn't
+    # keep surfacing from Redis-cached answers in the next 10s window.
+    try:
+        invalidate_client_results(license_data["client_id"])
+    except Exception:
+        pass
+
+    scope_note = f" (store_code={req.store_code})" if req.store_code else ""
+    return {
+        "success":       True,
+        "deleted_count": int(deleted),
+        "message":       f"Purged ~{deleted} {content_type} points{scope_note}.",
+    }
+
+
+@router.post("/magento/chatbot/agent/sync/purge/collection")
+def sync_purge_collection(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    """Drop the tenant's entire Qdrant collection. Destructive. Next
+    sync recreates the collection from scratch via
+    ensure_collection_exists, which is the right behaviour when the
+    named-vector schema needs to be reset (e.g. after a Phase 2.2-style
+    schema migration) OR when the merchant wants a clean slate.
+
+    No body — the license_key from the auth header is the only input
+    needed. Returns {success, dropped: bool, message}.
+    """
+    license_data = authorize_request(
+        request=request, db=db,
+        authorization=authorization, x_api_key=x_api_key,
+        request_license=None,
+    )
+
+    try:
+        dropped = delete_client_collection(
+            client_id=license_data["client_id"],
+            domain=license_data["domain"],
+        )
+    except Exception as exc:
+        logger.exception("[sync/purge/collection] failed: %s", exc)
+        return {
+            "success": False,
+            "dropped": False,
+            "message": f"Collection drop failed: {exc}",
+        }
+
+    try:
+        invalidate_client_results(license_data["client_id"])
+    except Exception:
+        pass
+
+    if dropped:
+        return {
+            "success": True,
+            "dropped": True,
+            "message": "Collection dropped. Run a full sync to rebuild the index.",
+        }
+    return {
+        "success": True,
+        "dropped": False,
+        "message": "Collection did not exist — nothing to drop.",
     }
