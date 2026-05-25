@@ -83,6 +83,39 @@ class _MatchSignals(BaseModel):
     category: Optional[_CategorySignal] = None
     attributes: dict[str, str] = Field(default_factory=dict)
 
+    @field_validator("attributes", mode="before")
+    @classmethod
+    def _coerce_attributes(cls, value):
+        """PHP json-encodes empty arrays as `[]` rather than `{}`,
+        which Pydantic rejects as not-a-dict. Same coercer pattern as
+        ProductRetrieveRequest._coerce_attribute_filters. Accept
+        None / "" / [] / {} / list-of-{name,value}-dicts and normalise
+        to a clean dict[str, str]."""
+        if value in (None, "", [], {}):
+            return {}
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items() if v not in (None, "")}
+        if isinstance(value, list):
+            out: dict[str, str] = {}
+            for entry in value:
+                if isinstance(entry, dict):
+                    name = entry.get("name") or entry.get("key") or entry.get("code")
+                    val  = entry.get("value") or entry.get("option")
+                    if name and val:
+                        out[str(name)] = str(val)
+            return out
+        return {}
+
+    @field_validator("brand", mode="before")
+    @classmethod
+    def _coerce_brand(cls, value):
+        """Defensive — accept None / [] / {} and coerce to empty string
+        so the validator that expects a str doesn't 422 on PHP-empty
+        wire shapes."""
+        if value in (None, [], {}):
+            return ""
+        return str(value) if not isinstance(value, str) else value
+
 
 class ToolCallRequest(BaseModel):
     license_key: Optional[str] = None

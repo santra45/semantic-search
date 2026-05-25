@@ -31,7 +31,7 @@ import logging
 import time
 from typing import Any, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage 
 
 from backend.app.magento.chatbot.agents.llm_factory import build_llm
 from backend.app.magento.chatbot.agents.tools import ALL_TOOLS, TOOL_BY_NAME
@@ -47,58 +47,21 @@ from backend.app.services.llm_rerank_service import MODEL_PRICING, get_token_usa
 logger = logging.getLogger(__name__)
 
 
-_SYSTEM_PROMPT = """\
-You are the intent router for an e-commerce shopping assistant. For every \
-customer message, you MUST call exactly one tool — pick the tool that best \
-matches what the customer is trying to do.
+_SYSTEM_PROMPT = """
+You are an e-commerce intent router.
 
-Routing guidance:
+Rules:
 
-  * Use `search_products` for product DISCOVERY / BROWSE — the customer
-    wants to see, find, or filter products. Includes price constraints
-    (min_price, max_price), attribute filters (color, size, material,
-    etc.), sort intent (cheapest, most expensive, newest), brand
-    mentions, and category mentions used as filters.
-    - When the customer mentions a brand by name (e.g. "products from
-      Altico"), pass it via `brand`.
-    - When the customer mentions a category by name AND wants to see
-      its products (e.g. "show me Solar Fountains", "anything in
-      Outdoor Lighting"), pass it via `category`.
-    - When the customer mentions specific attribute values (e.g. "red
-      stainless steel"), pass them via `attributes` as a dict like
-      {"color": "red", "material": "stainless steel"}.
-    These structured args apply as exact-match filters BEFORE semantic
-    search runs, which is much more reliable than letting semantic
-    similarity guess at brand / category / attribute membership.
-  * Use `get_product_detail` ONLY when the customer references a
-    specific product by name or SKU.
-  * Use `get_category_info` when the customer asks ABOUT a category
-    rather than asking to see products in it. Trigger phrases:
-    "tell me about <X>", "what is <X>", "what is the <X> collection",
-    "describe <X>", "what kinds of things are in <X>", "what does <X>
-    cover". Pass the category name as `category`. The downstream agent
-    returns the merchant-authored category description (with a few
-    representative products as supporting cards) — much richer than
-    just dumping product cards for the same query.
-  * Use `get_store_policy` for returns / refunds / shipping / warranty
-    / cancellation / delivery questions.
-  * Use `get_store_info` for hours / address / contact / payment
-    methods / company details.
-  * Use `view_cart` for "show my cart" type queries.
-  * Use `manage_cart` ONLY when the customer wants to modify the cart
-    (add / remove / update / clear).
-  * Use `view_orders` for order history or "show my order #X" queries.
-  * Use `cancel_order` ONLY when the customer explicitly asks to
-    cancel an order.
-  * Use `view_profile` for "what's my email/address/phone" queries.
-  * Use `manage_wishlist` for wishlist add / remove / view.
-  * Use `greet` ONLY for pure greetings, thank-yous, goodbyes.
-  * Use `general_chat` as the fallback for anything else — including
-    comparative questions and queries that don't fit a specific tool.
+1. You MUST call exactly one tool.
+2. Never answer the customer.
+3. Prefer specific tools over generic ones.
+4. Use conversation history to resolve references like:
+   "that one"
+   "the cheaper one"
+   "tell me more"
+5. Use general_chat ONLY if no other tool applies.
+6. Use detected signals as authoritative hints.
 
-When the customer asks a follow-up like "the cheaper one" or "tell me
-more about it", read the conversation history to resolve what they
-mean before picking the tool.
 """
 
 
@@ -229,13 +192,12 @@ def select_tool(
         content = (turn.get("content") or "").strip()
         if not content:
             continue
-        # We use HumanMessage for both roles deliberately — the conversation
-        # history is context for the routing decision, not a real multi-turn
-        # chat with the LLM. Marking past assistant turns as Human keeps the
-        # LLM focused on routing the CURRENT message rather than continuing
-        # the past assistant's voice.
-        prefix = "Customer" if role == "user" else "Bot"
-        messages.append(HumanMessage(content=f"[{prefix}] {content}"))
+
+        if role == "user":
+            messages.append(HumanMessage(content=content))
+        else:
+            messages.append(AIMessage(content=content))
+
     messages.append(HumanMessage(content=query))
 
     t0 = time.perf_counter()
@@ -362,6 +324,9 @@ def select_tool(
         duration_ms=duration_ms,
         error=error_msg,
         extra={
+            "match_signals": match_signals,
+            "history_count": len(conversation_history),
+            "customer_context": customer_context,
             "tools_offered": len(ALL_TOOLS),
             "picked":        picked_name,
             "confidence":    confidence,

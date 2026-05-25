@@ -247,14 +247,25 @@ def manage_wishlist(
     action: str,
     skus: Optional[List[str]] = None,
 ) -> str:
-    """View, add to, or remove from the customer's wishlist. Use for
-    wishlist-specific requests like "show my wishlist", "add this to my
-    wishlist", "remove X from my wishlist".
-
-    Args:
-        action: One of "view", "add", "remove".
-        skus: SKU(s) for add / remove. Ignored for view.
-    """
+    """View, add, remove or save items for later.
+        ONLY use for:
+        - wishlist
+        - save for later
+        - save this item
+        - favorites
+        - favourite
+        - heart this
+        - bookmark
+        - remember this item
+        Never use for cart actions.
+        Examples:
+        "save this for later"
+        "add this to favourites"
+        "show my wishlist"
+        "remove from saved items"
+        Args:
+        ...
+        """
 
 
 # ── Conversational tools (greetings + catch-all) ───────────────────────────
@@ -298,18 +309,19 @@ def general_chat(
 # could plausibly match, ordering in this list nudges LLM preference
 # (search before detail; view before manage; greet last as a no-op).
 ALL_TOOLS = [
-    search_products,
-    get_product_detail,
-    get_category_info,
-    get_store_policy,
-    get_store_info,
+    greet,
     view_cart,
     manage_cart,
     view_orders,
     cancel_order,
     view_profile,
     manage_wishlist,
-    greet,
+    get_store_policy,
+    get_store_info,
+    get_category_info,
+    search_products,
+    get_product_detail,
+    contact_support,
     general_chat,
 ]
 

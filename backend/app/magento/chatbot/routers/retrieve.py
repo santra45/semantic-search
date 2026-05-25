@@ -1205,8 +1205,16 @@ def _build_answer_prompt(
         doesn't refuse.
       - **Direction-of-flow rule** for damage scenarios.
     """
+    # Source formatting — most purposes use the full per-content-type
+    # formatters. For purpose=category_info we ask for COMPACT product
+    # sources so the supporting product samples don't drown out the
+    # category description; the LLM only needs name + SKU + price +
+    # short description to mention 1-2 illustratively, not the full
+    # 1500-char-per-product dump.
+    _compact_products = purpose == "category_info"
     sources_blob = "\n\n".join(
-        _format_source_for_prompt(s) for s in (sources or [])[:6]
+        _format_source_for_prompt(s, compact_products=_compact_products)
+        for s in (sources or [])[:6]
     )
 
     history_block = ""
@@ -1428,23 +1436,36 @@ def _build_answer_prompt(
     )
 
 
-def _format_source_for_prompt(s: dict) -> str:
+def _format_source_for_prompt(s: dict, compact_products: bool = False) -> str:
     """Flatten one source into the text block the RAG summarizer sees.
 
     Per-content-type formatting because different shapes need different
     framing for the LLM:
       - product             → sku, variants, price, stock, attributes, description.
+                              When `compact_products=True` (purpose=category_info),
+                              uses _format_product_source_compact instead:
+                              name + sku + price + 240-char short.
       - cms_page / cms_block → URL, heading, meta description, content body.
       - store_config         → the full composite body (contact_info, shipping_options,
                                payment_options, store_identity, tax_info, store_rules,
                                locale_info, social_links). Address/phone/hours live
                                in `contact_info`; truncating these at 800 chars meant
                                the LLM saw the anchors but not the actual facts.
+      - category             → breadcrumb + URL + meta_description + FULL description
+                               (15000-char cap). Skips the generic fallback that used
+                               to read `summary` first and cap at 800, which gave
+                               the LLM a meta_description stub instead of the
+                               merchant-authored description.
       - everything else      → generic title + body fallback.
 
     When the source carries a `comparison_side` tag (set by
     GenericChatAgent's comparative branch), the side is prepended so the
     LLM can cleanly attribute facts to the right operand.
+
+    `compact_products` is set by _build_answer_prompt when purpose is
+    category_info — the LLM is describing a category and the supporting
+    products are illustrative anchors, not the primary subject, so the
+    full per-product dump would drown out the category description.
     """
     ct = (s.get("content_type") or "").lower()
     title = s.get("title") or s.get("name") or s.get("identifier") or s.get("sku") or s.get("label") or ""
@@ -1452,6 +1473,14 @@ def _format_source_for_prompt(s: dict) -> str:
     side_prefix = f"[COMPARE-SIDE: {side}] " if side else ""
 
     if ct == "product" or s.get("sku") or s.get("type_id"):
+        # Compact form for category_info supporting sources — the LLM
+        # only needs name + SKU + price + short description to mention
+        # 1-2 products illustratively. Full _format_product_source dumps
+        # ~50 lines per product (all attributes, all variants, child
+        # SKUs, 1500-char description) which drowns out the category
+        # description it's supposed to be building the answer from.
+        if compact_products:
+            return side_prefix + _format_product_source_compact(s, title)
         return side_prefix + _format_product_source(s, title)
 
     if ct in ("cms_page", "cms_block"):
@@ -1460,8 +1489,122 @@ def _format_source_for_prompt(s: dict) -> str:
     if ct == "store_config":
         return side_prefix + _format_store_config_source(s, title)
 
+    if ct == "category":
+        return side_prefix + _format_category_source(s, title)
+
     body = (s.get("summary") or s.get("content") or s.get("description") or "")[:800]
     return f"{side_prefix}[{ct or 'source'}] {title}\n{body}"
+
+
+def _format_category_source(s: dict, title: str) -> str:
+    """Format a category source for the LLM prompt.
+
+    The previous version routed categories through the generic-fallback
+    branch which read `summary` first (= merchant's short meta_description,
+    typically 1-2 sentences) and capped the body at 800 chars. The LLM
+    saw a stub and wrote answers off the supporting products instead of
+    the category description — exactly the bug CategoryInfoAgent was
+    designed to avoid.
+
+    This formatter prioritises the FULL merchant-authored description
+    (passed as `description` / `content` by CategoryInfoAgent.loadCategorySource,
+    or by CategoryContentProvider when the category was retrieved from
+    Qdrant in another path) and keeps meta_description / breadcrumb /
+    URL as structured framing fields the LLM can use to anchor its
+    answer.
+
+    Body cap of 15000 chars matches what CMS pages get — merchant
+    category descriptions can be substantial (SEO-heavy landing pages)
+    and we don't want to truncate them mid-sentence the way the 800-char
+    fallback did.
+
+    Falls back gracefully to summary / meta_description when the full
+    description is empty — this happens for CHILD categories that
+    CategoryInfoAgent slims down on purpose (enumerating sub-collections
+    only needs name + 1-line summary, not full description per child).
+    """
+    parts: list[str] = [f"[category] {title}"]
+
+    breadcrumb = (s.get("breadcrumb") or "").strip()
+    if breadcrumb:
+        parts.append(f"Breadcrumb: {breadcrumb}")
+
+    permalink = (s.get("permalink") or "").strip()
+    if permalink:
+        parts.append(f"URL: {permalink}")
+
+    # Show meta_description as a separate "Summary" line when it's
+    # present AND different from the body description. Gives the LLM
+    # the merchant's curated 1-line take alongside the longer body.
+    meta_desc = (s.get("meta_description") or "").strip()
+    body = (s.get("description") or s.get("content") or "").strip()
+    if meta_desc and meta_desc != body:
+        parts.append(f"Summary: {meta_desc}")
+
+    if body:
+        parts.append("")
+        parts.append(str(body)[:15000])
+    elif meta_desc:
+        # No body — fall back to meta_description as the body itself
+        # (already shown as Summary above, but it's the only content
+        # we have so include it here too in case the LLM only reads
+        # the body section).
+        parts.append("")
+        parts.append(meta_desc)
+    else:
+        # Last-ditch fallback for child categories that only carry a
+        # short summary. Keeps the source non-empty so the LLM knows
+        # the category exists even when description is unavailable.
+        summary = (s.get("summary") or "").strip()
+        if summary:
+            parts.append("")
+            parts.append(summary)
+
+    return "\n".join(parts)
+
+
+def _format_product_source_compact(s: dict, title: str) -> str:
+    """Compact product source for category_info supporting context.
+
+    Used when the LLM is describing a category and the products are
+    illustrative anchors, not the primary subject. ~4 lines per product:
+    name, SKU, price, short description. The full _format_product_source
+    is correct for ProductSearchAgent / ProductDetailAgent (the customer
+    asked about products and wants every detail) but wrong here — we
+    just need the LLM to be able to name 1-2 products.
+
+    Drops: type_id, stock_status, categories, brand, attributes,
+    variant_attributes, children, child_skus, long description. All of
+    those are still on the source dict (Qdrant returned them, the
+    Magento side passed them through) — they just don't go INTO the
+    LLM prompt. The product cards rendered below the answer text still
+    have them.
+    """
+    parts: list[str] = [f"[product] {title}"]
+
+    sku = s.get("sku")
+    if sku:
+        parts.append(f"SKU: {sku}")
+
+    price = s.get("price")
+    if price:
+        currency = s.get("currency") or ""
+        parts.append(f"Price: {price} {currency}".strip())
+
+    # Short description, capped tight. Prefer the explicit short_description
+    # field, then summary, then the first 200 chars of full description.
+    short = (
+        s.get("short_description")
+        or s.get("summary")
+        or ""
+    )
+    if not short:
+        long_desc = (s.get("description") or "")
+        short = str(long_desc)[:200]
+    if short:
+        parts.append(f"Short: {str(short)[:240]}")
+
+    return "\n".join(parts)
 
 
 def _format_store_config_source(s: dict, title: str) -> str:
