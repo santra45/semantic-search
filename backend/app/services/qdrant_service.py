@@ -365,11 +365,16 @@ def _format_hit(hit: Any) -> dict[str, Any]:
         or ""
     )
 
+    # `score` is only set on search hits (ScoredPoint); scroll() returns
+    # Record objects with no score attr. Defensive lookup so the scroll-
+    # based retrieve_content_by_entity_ids path can reuse this formatter
+    # without raising AttributeError.
+    raw_score = getattr(hit, "score", None)
     result = {
         **payload,
         "content_type": content_type,
         "entity_id": str(payload.get(entity_id_key) or payload.get("entity_id") or ""),
-        "score": round(float(hit.score or 0), 4),
+        "score": round(float(raw_score or 0), 4),
         "title": title,
         "summary": snippet[:500],
     }
@@ -590,6 +595,91 @@ def search_content(
     if not dedupe_by_parent:
         return hits[:limit]
     return _dedupe_by_parent(hits, limit, max_per_parent=max_per_parent)
+
+
+def retrieve_content_by_entity_ids(
+    client_id: str,
+    domain: str,
+    entity_ids: Iterable[str],
+    content_types: Iterable[str],
+    store_code: Optional[str] = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Fetch content points by `entity_id` list — no vector search.
+
+    Used by ProductSearchAgent's category-context path. The agent tallies
+    the `category_ids` of the retrieved products, picks every category
+    tied for the top frequency, and asks here for those specific points.
+    Replaces the prior parallel `/retrieve/content` call on the customer
+    query, which routinely surfaced unrelated categories (the query
+    embedding matched a different category's description better than
+    the category-the-products-actually-belong-to did).
+
+    Chunkable types (`category`, `cms_page`, `cms_block`) spread one
+    entity across N points sharing `entity_id`. We dedupe to one
+    representative per entity_id, preferring chunk_index=0 or absent —
+    the "intro" chunk that carries the most representative summary,
+    which is what reads best on a category card.
+
+    Output preserves the input id order so the caller's frequency
+    ordering (top tied first) carries through to the rendered cards.
+    """
+    ids = [str(eid).strip() for eid in (entity_ids or []) if str(eid).strip()]
+    if not ids:
+        return []
+
+    types = [str(t).strip() for t in (content_types or []) if str(t).strip()]
+    if not types:
+        return []
+
+    collection_name = ensure_collection_exists(client_id, domain)
+
+    must = [
+        FieldCondition(
+            key="content_type",
+            match=(MatchValue(value=types[0]) if len(types) == 1 else MatchAny(any=types)),
+        ),
+        FieldCondition(key="entity_id", match=MatchAny(any=ids)),
+    ]
+    if store_code:
+        must.append(FieldCondition(key="store_code", match=MatchValue(value=store_code)))
+
+    # Over-fetch so chunked entities get every chunk in the candidate
+    # pool — the dedupe pass below picks the parent chunk per entity.
+    points, _ = qdrant.scroll(
+        collection_name=collection_name,
+        scroll_filter=Filter(must=must),
+        limit=max(len(ids) * 8, 30),
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    by_entity: dict[str, dict[str, Any]] = {}
+    for point in points:
+        hit = _format_hit(point)
+        eid = str(hit.get("entity_id") or "")
+        if not eid:
+            continue
+        existing = by_entity.get(eid)
+        if existing is None:
+            by_entity[eid] = hit
+            continue
+        # Prefer chunk_index=0 / missing over mid-page chunks.
+        idx = hit.get("chunk_index")
+        prev_idx = existing.get("chunk_index")
+        is_parent = idx in (None, 0, "0")
+        prev_is_parent = prev_idx in (None, 0, "0")
+        if is_parent and not prev_is_parent:
+            by_entity[eid] = hit
+
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for eid in ids:
+        if eid in by_entity and eid not in seen:
+            ordered.append(by_entity[eid])
+            seen.add(eid)
+
+    return ordered[:limit] if limit > 0 else ordered
 
 
 def _dedupe_by_parent(hits: list[dict[str, Any]], limit: int, max_per_parent: int = 2) -> list[dict[str, Any]]:

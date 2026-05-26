@@ -25,6 +25,7 @@ from backend.app.services.embedder import embed_query
 from backend.app.services.qdrant_service import (
     get_collection_name,
     qdrant,
+    retrieve_content_by_entity_ids as qdrant_retrieve_content_by_entity_ids,
     search_content as qdrant_search_content,
     search_products as qdrant_search_products,
 )
@@ -276,6 +277,35 @@ class ContentRetrieveRequest(BaseModel):
         if isinstance(value, list):
             return [str(v) for v in value if v not in (None, "")]
         return ["cms_page", "cms_block"]
+
+
+class ContentByIdsRequest(BaseModel):
+    """Vector-less retrieval by entity_id list.
+
+    Powers ProductSearchAgent's category-context call: the agent tallies
+    the displayed products' `category_ids`, picks every category tied for
+    the top frequency, and asks here for those specific entity_ids. This
+    replaces the prior `/retrieve/content` call on the raw customer
+    query, which used to surface categories unrelated to the products
+    being shown.
+    """
+
+    license_key: Optional[str] = None
+    entity_ids: list[str] = Field(default_factory=list)
+    content_types: list[str] = Field(default_factory=lambda: ["category"])
+    store_code: Optional[str] = None
+    limit: int = 5
+
+    @field_validator("entity_ids", "content_types", mode="before")
+    @classmethod
+    def _coerce_str_list(cls, value):
+        if value in (None, "", [], {}):
+            return []
+        if isinstance(value, str):
+            return [s.strip() for s in value.split(",") if s.strip()]
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        return []
 
 
 class AnswerRequest(BaseModel):
@@ -779,6 +809,42 @@ def retrieve_content(
     else:
         hits = hits[: req.limit]
 
+    return {"results": hits, "count": len(hits)}
+
+
+@router.post("/magento/chatbot/retrieve/content_by_ids")
+def retrieve_content_by_ids(
+    req: ContentByIdsRequest,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    """Scroll-based retrieval keyed on entity_id — no embedding, no vector search.
+
+    Used by ProductSearchAgent to fetch the categories the retrieved
+    products actually belong to (top entries from a frequency tally of
+    product.category_ids), avoiding the "categories don't match products"
+    mismatch that the prior parallel /retrieve/content call on the
+    customer query produced.
+    """
+    license_data = authorize_request(
+        request=request, db=db,
+        authorization=authorization, x_api_key=x_api_key,
+        request_license=req.license_key,
+    )
+
+    if not req.entity_ids:
+        return {"results": [], "count": 0}
+
+    hits = qdrant_retrieve_content_by_entity_ids(
+        client_id=license_data["client_id"],
+        domain=license_data["domain"],
+        entity_ids=req.entity_ids,
+        content_types=req.content_types or ["category"],
+        store_code=req.store_code,
+        limit=req.limit,
+    )
     return {"results": hits, "count": len(hits)}
 
 
