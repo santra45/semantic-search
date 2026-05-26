@@ -117,15 +117,25 @@ def get_product_detail(
 ) -> str:
     """Get detailed information about a specific product the customer has
     named or whose SKU appears in their message. Use when the customer
-    references one product by name or SKU and wants more info, stock
-    status, variants, or price.
+    references ONE product by name or SKU and wants more info, stock
+    status, variants, price, dimensions, materials, etc.
 
     Args:
-        skus: SKU code(s) extracted from the message, or recognised
-            product names that resolved to known SKUs.
+        skus: SKU code(s) OR product name(s) extracted from the message.
+            Pass whatever identifies the product — the downstream agent
+            resolves both forms against the catalog (exact match for
+            SKUs, name-index lookup for names, fuzzy fallback for
+            misspellings of either). Examples of valid values:
+              • "WJ01-XS"               (exact SKU code)
+              • "Kelkay Aqua Cascade"   (product name)
+              • "Argus Tank"            (product name)
+              • "MS-D-4" or "msd4"      (SKU with / without separators)
+            Don't try to resolve names to SKUs yourself — just pass the
+            customer's wording. The downstream agent has catalog
+            access; you don't.
         query: The original natural-language question (e.g. "is it in
-            stock?", "what colours come in?") so the agent's RAG step
-            has the customer's actual phrasing.
+            stock?", "what colours come in?", "what are the dimensions?")
+            so the agent's RAG step has the customer's actual phrasing.
     """
 
 
