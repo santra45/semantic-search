@@ -1211,7 +1211,7 @@ def _build_answer_prompt(
     # category description; the LLM only needs name + SKU + price +
     # short description to mention 1-2 illustratively, not the full
     # 1500-char-per-product dump.
-    _compact_products = purpose == "category_info"
+    _compact_products = purpose in ("category_info", "product_qa")
     sources_blob = "\n\n".join(
         _format_source_for_prompt(s, compact_products=_compact_products)
         for s in (sources or [])[:6]
@@ -1369,6 +1369,78 @@ def _build_answer_prompt(
             + history_block
             + f"\n\nCategory + supporting items (sub-categories OR products — "
               f"check content_type on each):\n{sources_blob}"
+        )
+
+    if purpose == "product_qa":
+        # PRODUCT Q&A mode (post 2026-05-25). Used by ProductQAAgent when
+        # the customer asks a question ABOUT products in general rather
+        # than browsing them. Examples: "are your products waterproof?",
+        # "do you have anything organic?", "what's the typical warranty?",
+        # "is this safe for kids?".
+        #
+        # Sources blob shape:
+        #   1..N (cms_page / cms_block) — PRIMARY. Merchant-curated
+        #        FAQ-style content (Materials & Care, Safety, Sizing,
+        #        Warranty pages, sometimes inline FAQ blocks). This is
+        #        where catalogue-wide product-attribute answers actually
+        #        live.
+        #   N+1..M (product) — SECONDARY. Compact product format
+        #        (name + SKU + price + short description). Used as
+        #        concrete examples the LLM can name inline ("such as our
+        #        X and Y"), not as the primary answer source.
+        #
+        # Display contract:
+        #   The ProductQAAgent puts ONLY the CMS sources into
+        #   data.sources so the frontend renders content cards + the
+        #   citation strip. Products reach the LLM via this prompt for
+        #   grounding but never render as product cards — the customer
+        #   asked a question, not a browse.
+        return (
+            "You are answering a Q&A-style question about the store's "
+            "products in general. The customer asked a question (yes/no, "
+            "attribute, care, safety, sizing, warranty, compatibility) and "
+            "wants a direct text answer — NOT a product listing.\n\n"
+            "Sources below come in two flavors — check the content_type "
+            "tag on each:\n"
+            "  - `[cms_page]` / `[cms_block]` (PRIMARY) — merchant-curated "
+            "FAQ-style content. These hold the authoritative answer to "
+            "catalogue-wide product questions (Materials & Care, Safety, "
+            "Sizing, Warranty, etc.). Prefer these when synthesising the "
+            "answer body.\n"
+            "  - `[product]` (SECONDARY) — concrete product examples. Use "
+            "them to name 1-2 actual products inline as evidence (\"such "
+            "as our Tranquillity Sphere and Mini Cascade Bowl\"), NOT as "
+            "the primary answer source.\n\n"
+            "Goal: write a clear 3-5 sentence answer that directly "
+            "addresses the customer's question, drawing from the CMS "
+            "content. Longer (up to 7-8 sentences) is fine for complex "
+            "questions; shorter is fine for clean yes/no answers. The "
+            "customer will not see product cards beneath this reply, so "
+            "the text must stand on its own.\n\n"
+            "Rules:\n"
+            " - Plain prose. No markdown headings. No bulleted or numbered "
+            "lists unless the customer explicitly asked.\n"
+            " - Bold concrete facts: materials, dimensions, prices, "
+            "timeframes, warranty terms (**600D Oxford cloth**, **3-year "
+            "warranty**, **30 days**, **£199**).\n"
+            " - When the answer is yes/no, lead with \"Yes\" / \"No\" / "
+            "\"Mostly yes — \" / \"It depends — \" so the customer gets "
+            "the conclusion before the explanation.\n"
+            " - Don't invent specs, warranty terms, materials, or product "
+            "names that aren't in the sources. If the sources don't fully "
+            "cover the question, share what they DO cover and acknowledge "
+            "the gap (\"the curated info doesn't spell out X — happy to "
+            "check with our team\"). Don't refuse outright.\n"
+            " - Speak as the store (\"our outdoor covers are...\"), not as "
+            "an external assistant (\"the documentation says...\").\n"
+            " - Do NOT include phone numbers or email addresses inline — "
+            "the interface renders contact options as separate clickable "
+            "chips below your message."
+            + instruction_block
+            + "\n\n"
+            f"Customer question: {query}"
+            + history_block
+            + f"\n\nFAQ-style content (PRIMARY) + product examples (SECONDARY):\n{sources_blob}"
         )
 
     # Default "answer" purpose + "comparison" (same prompt, comparison

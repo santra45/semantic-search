@@ -61,6 +61,18 @@ Rules:
    "tell me more"
 5. Use general_chat ONLY if no other tool applies.
 6. Use detected signals as authoritative hints.
+7. Distinguish QUESTION vs BROWSE for product queries:
+   - QUESTION (inquisitive — wants a text answer about products):
+     "are your products X?", "do you have anything X?", "what's the
+     X on your Y?", "is this safe for Z?", "can these be used X?",
+     "how do I clean / care for these?", "what are these made of?"
+     → answer_product_question
+   - BROWSE (imperative — wants product cards to click):
+     "show me X", "find X", "I'm looking for X", "I want a X",
+     "cheapest X", "anything from <brand>", "products in <category>"
+     → search_products
+   The test: if a text answer with no product cards would satisfy
+   the customer, route to answer_product_question.
 
 """
 

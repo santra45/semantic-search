@@ -49,10 +49,31 @@ def search_products(
     category: Optional[str] = None,
     attributes: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Search the product catalog. Use this when the customer wants to find or
-    browse products: "show me X", "do you have Y", "I'm looking for Z",
-    "what's the cheapest A", "any red shoes under £50", "products like B",
-    "products from Altico", "anything in the Solar Fountains category".
+    """Search the product catalog to BROWSE / FIND products the customer
+    can look at and buy. Use this for IMPERATIVE / DESIDERATIVE intent —
+    the customer wants to see products, not ask a question about them.
+
+    Pick this tool for:
+      • "show me X" / "find X" / "I'm looking for X"
+      • "I want a X" / "I need a X"
+      • "what's the cheapest / most expensive / newest X"
+      • "any red X under £50" / "products like X" / "X similar to Y"
+      • "products from <brand>" / "stuff in the <category> section"
+      • Anything where the customer's intent is to RECEIVE a list of
+        products (a catalog view).
+
+    Do NOT pick this tool when the customer is asking a QUESTION about
+    products — those go to `answer_product_question` instead. Examples
+    that are NOT this tool:
+      • "are your products waterproof?"          → answer_product_question
+      • "do you have anything organic?"          → answer_product_question
+      • "what's the warranty on your fixtures?"  → answer_product_question
+      • "is this safe for kids?"                 → answer_product_question
+      • "can I use these outdoors?"              → answer_product_question
+
+    The distinguishing test: if the customer would be satisfied by a
+    text answer with no product cards, route to answer_product_question.
+    If they want product cards to click through to PDPs, route here.
 
     Args:
         query: The customer's product search phrase (cleaned to the noun
@@ -105,6 +126,52 @@ def get_product_detail(
         query: The original natural-language question (e.g. "is it in
             stock?", "what colours come in?") so the agent's RAG step
             has the customer's actual phrasing.
+    """
+
+
+@tool
+def answer_product_question(query: str) -> str:
+    """Answer a Q&A-style question about the store's products in general.
+    Use when the customer asks a YES/NO or open question about product
+    properties, materials, care, safety, usage, compatibility, sizing,
+    warranty, or any general catalogue-wide question — NOT when they're
+    trying to BROWSE products or BUY them.
+
+    Pick this tool when the customer's intent is INQUISITIVE (asking
+    for information about products):
+      • "are your products waterproof?"
+      • "do you have anything organic?"
+      • "what's the typical warranty on your fixtures?"
+      • "is this material safe for kids / pets?"
+      • "can your products be used outdoors?"
+      • "how long do your batteries last?"
+      • "do you have larger sizes available?"
+      • "what are these made of?"
+      • "how do I clean these / care for them?"
+
+    Pick `search_products` INSTEAD when the customer wants to BROWSE or
+    FIND products to look at / buy (imperative intent):
+      • "show me waterproof products"
+      • "I'm looking for organic options"
+      • "find me something under £50"
+      • "cheapest stainless steel fountain"
+
+    Pick `get_product_detail` instead when the customer references ONE
+    specific product by name or SKU.
+
+    Pick `get_category_info` instead when the customer asks about a
+    CATEGORY itself ("tell me about the X collection").
+
+    The downstream agent searches FAQ-style CMS content (the merchant's
+    Materials / Care / Safety / Sizing pages) as the primary source and
+    a handful of product specs as secondary evidence. Returns a text
+    answer; the response intentionally has NO product cards because the
+    customer asked a question, not a browse.
+
+    Args:
+        query: The customer's question verbatim — kept close to the
+            original wording so the downstream search hits the right
+            CMS content. Don't rewrite the question into a noun phrase.
     """
 
 
@@ -319,6 +386,13 @@ ALL_TOOLS = [
     get_store_policy,
     get_store_info,
     get_category_info,
+    # answer_product_question sits BEFORE search_products in this list so
+    # the LLM sees the Q&A tool first when a query is ambiguous between
+    # "answer a question about products" and "browse products". The
+    # tool docstrings make the boundary explicit, but list ordering is
+    # the tie-breaker nudge for cheap routing models that don't always
+    # read every docstring in full.
+    answer_product_question,
     search_products,
     get_product_detail,
     general_chat,
