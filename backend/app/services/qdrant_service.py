@@ -240,6 +240,8 @@ def _build_content_filter(
     store_code: Optional[str] = None,
     attribute_filters: Optional[dict[str, str]] = None,
     category_id: Optional[str] = None,
+    brand: Optional[str] = None,
+    brand_attribute_codes: Optional[list[str]] = None,
 ) -> Optional[Filter]:
     """Compose the Qdrant `Filter` applied BEFORE vector search runs.
 
@@ -332,6 +334,30 @@ def _build_content_filter(
                     match=MatchValue(value=True),
                 )
             )
+
+    # Multi-brand-attribute OR (2026-06-03). When Magento has more than one
+    # configured brand attribute (e.g. "brand" + "pump_brand"), it sends the
+    # brand VALUE + the list of attribute codes. A product matches if the
+    # value is set on ANY of those attributes, so we build a nested
+    # should-group — `attr_brand_<val>` OR `attr_pump_brand_<val>` — and add
+    # it to the must list. Qdrant treats a should-only sub-filter as
+    # "≥1 must match", giving us the OR. (The SINGLE-code path doesn't use
+    # this — brand rides attribute_filters as one AND key, unchanged.)
+    if brand and brand_attribute_codes:
+        value_slug = _slug(brand)
+        should = []
+        for raw_code in brand_attribute_codes:
+            code_slug = _slug(raw_code)
+            if code_slug and value_slug:
+                should.append(
+                    FieldCondition(
+                        key=f"attr_{code_slug}_{value_slug}",
+                        match=MatchValue(value=True),
+                    )
+                )
+        if should:
+            # Nested should-only filter = OR across the brand attribute keys.
+            must_conditions.append(Filter(should=should))
 
     return Filter(must=must_conditions) if must_conditions else None
 
@@ -442,6 +468,8 @@ def search_content(
     query_vectors: Optional[list[list[float]]] = None,
     attribute_filters: Optional[dict[str, str]] = None,
     category_id: Optional[str] = None,
+    brand: Optional[str] = None,
+    brand_attribute_codes: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """Vector search over the per-tenant collection.
 
@@ -487,6 +515,8 @@ def search_content(
         store_code=store_code,
         attribute_filters=attribute_filters,
         category_id=category_id,
+        brand=brand,
+        brand_attribute_codes=brand_attribute_codes,
     )
 
     # Over-fetch when dedup is on so the post-filter pass has enough
@@ -725,6 +755,8 @@ def search_products(
     query_vectors: Optional[list[list[float]]] = None,
     attribute_filters: Optional[dict[str, str]] = None,
     category_id: Optional[str] = None,
+    brand: Optional[str] = None,
+    brand_attribute_codes: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     # Phase 2.2: hybrid + sparse args passed through to search_content
     # so the products endpoint participates in BM25 + dense fusion when
@@ -759,6 +791,8 @@ def search_products(
         query_vectors=query_vectors,
         attribute_filters=attribute_filters,
         category_id=category_id,
+        brand=brand,
+        brand_attribute_codes=brand_attribute_codes,
     )
 
 

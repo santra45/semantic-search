@@ -56,9 +56,20 @@ class ProductRetrieveRequest(BaseModel):
     only_in_stock: bool = False
     attribute_filters: dict[str, str] = Field(default_factory=dict)  # {"color": "red", "size": "m"}
     category_id: Optional[str] = None
+    # Brand routing. SINGLE configured brand attribute → Magento still folds
+    # brand into `attribute_filters[<brand_code>]` (the historical path,
+    # unchanged). MULTIPLE configured brand attributes (e.g. "brand" +
+    # "pump_brand", admin enters them comma-separated) → Magento sends the
+    # brand VALUE here plus the list of brand attribute codes, and
+    # _build_content_filter ORs across the per-attribute boolean keys
+    # (attr_<code>_<slug(value)>) so the value matches whichever attribute
+    # actually holds it. No re-sync — those attr_* keys are already on the
+    # synced points for every attribute. Empty string / list coerced to None.
+    brand: Optional[str] = None
+    brand_attribute_codes: list[str] = Field(default_factory=list)
     # Note: brand was briefly a top-level field in the structured-filter
-    # rebuild (2026-05-22 morning) but is now routed through
-    # `attribute_filters` instead — Magento merges entities['brand'] into
+    # rebuild (2026-05-22 morning) but the SINGLE-code path is routed through
+    # `attribute_filters` — Magento merges entities['brand'] into
     # attribute_filters[<brand_attribute_code>] before sending. This means
     # the Qdrant filter matches the SAME `attr_<code>_<slug>` boolean key
     # that the sync pipeline has always been writing, which works on
@@ -520,8 +531,15 @@ def retrieve_products(
         fan_out = max(fan_out, 5)
     raw_limit = max(req.limit, req.limit * fan_out)
 
+    # Normalise the brand-OR inputs: only active when BOTH a value and at
+    # least one attribute code are present (the multi-brand-attribute path).
+    brand_value = (req.brand or "").strip() or None
+    brand_codes = [c.strip() for c in (req.brand_attribute_codes or []) if c and c.strip()]
+    if not brand_value or not brand_codes:
+        brand_value, brand_codes = None, []
+
     had_structured_filters = bool(
-        req.attribute_filters or req.category_id
+        req.attribute_filters or req.category_id or brand_value
     )
 
     hits = qdrant_search_products(
@@ -552,6 +570,10 @@ def retrieve_products(
         # set instead of post-fetch Python filtering after the fact.
         attribute_filters=req.attribute_filters or None,
         category_id=req.category_id,
+        # Multi-brand-attribute OR (2026-06-03): match the brand value
+        # against ANY of these attributes' boolean keys.
+        brand=brand_value,
+        brand_attribute_codes=brand_codes or None,
     )
 
     # Compat fallback (Phase: structured filter rebuild — 2026-05-22+).
