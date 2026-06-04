@@ -56,7 +56,11 @@ KNOWN_CONTENT_TYPES = [
 # can be long (SEO-heavy stores often have 2-3k char landing pages).
 # Single-point embedding would let the intro dominate; chunking surfaces
 # the right paragraph the same way it does for cms_page.
-CHUNKABLE_CONTENT_TYPES = {"cms_page", "cms_block", "category"}
+#
+# `faq` joined for the same reason — merchant-authored FAQ answers can run
+# long, and chunking keeps each answer grounded in its title (the embedding
+# anchor) on every chunk.
+CHUNKABLE_CONTENT_TYPES = {"cms_page", "cms_block", "category", "faq"}
 
 
 # ── Hybrid-search named-vector slots (Phase 2.2) ────────────────────────────

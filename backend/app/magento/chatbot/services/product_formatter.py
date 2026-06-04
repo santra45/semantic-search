@@ -1123,6 +1123,61 @@ def format_cms_block_chunkable(block: Dict[str, Any]) -> Tuple[str, str, Dict[st
     return header_text, content, base_payload
 
 
+# ── FAQ (merchant-authored knowledge) ────────────────────────────────────────
+#
+# FAQ entries are the merchant's catch-all for questions the catalog + CMS
+# don't answer. Authored in the admin as one textarea, parsed Magento-side
+# into (title, content) entries by the `#`-heading convention — each `#`
+# line is a title, the lines under it are that entry's answer. They reach
+# the chatbot ONLY as a last resort: the three CMS-style agents
+# (policy_faq / store_info / general) consult faq only when their primary
+# sources retrieve nothing relevant.
+#
+# Chunkable like cms_block — short answers stay one chunk; a long answer is
+# sliced with the title repeated as the header anchor on every chunk. The
+# title is the whole point: a bare paragraph has nothing distinctive to
+# embed on, so the merchant's title (ideally phrased as the customer's
+# question) is what a query actually matches.
+
+
+def format_faq_chunkable(faq: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    """Chunkable variant for one parsed FAQ entry — returns (header, body, payload).
+
+    `title` is the merchant's heading line; `content` is the answer body.
+    The title becomes the header repeated on every chunk's embedding (see
+    sync._process_chunkable_item) — the semantic anchor for short answers.
+    """
+    title   = str(faq.get("title") or "").strip()
+    content = html_to_structured_text(faq.get("content") or "")
+
+    header_parts: list[str] = []
+    if title:
+        header_parts.append(f"FAQ: {title}")
+    anchors = _detect_factual_anchors(content)
+    if anchors:
+        header_parts.append(f"Indexing hints: {anchors}")
+
+    header_text = _final_clean("\n".join(header_parts))
+
+    base_payload = {
+        "title":   title,
+        # `content` deliberately omitted — set per chunk by the sync router.
+        "summary": content[:300],
+        "status":  "active",
+    }
+    return header_text, content, base_payload
+
+
+def format_faq(faq: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Single-point variant for the format_item fallback path (faq normally
+    chunks via format_faq_chunkable). Mirrors format_category's wrapper.
+    """
+    header, body, payload = format_faq_chunkable(faq)
+    payload["content"] = body
+    text = f"{header}\nContent: {body}" if header else body
+    return _final_clean(text), payload
+
+
 # ── Categories ──────────────────────────────────────────────────────────────
 #
 # Magento catalog categories carry merchant-curated taxonomy data that
@@ -1281,6 +1336,8 @@ def format_item(
         return format_store_config(item)
     if content_type == "promotion":
         return format_promotion(item)
+    if content_type == "faq":
+        return format_faq(item)
     title = str(item.get("title") or item.get("name") or item.get("identifier") or "")
     content = html_to_structured_text(item.get("content") or item.get("description") or "")
     return (

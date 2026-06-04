@@ -11,19 +11,25 @@ r = redis.Redis(
     decode_responses=True    # returns strings not bytes
 )
 
-def make_key(prefix: str, text: str) -> str:
+def make_key(prefix: str, text: str, namespace: str = "") -> str:
     """
     Hash the text so long queries don't become huge keys.
     'blue dress for a party' → 'search:client_A:a3f2b1...'
     Uses SHA-256 for better collision resistance with minimal performance cost.
+
+    `namespace` (optional) is folded into the hashed material so callers that
+    embed with a different model / task_type get isolated keys. Default ""
+    preserves the legacy key shape for the existing search.py / magento.py
+    callers, so wiring a new namespaced caller can never collide with them.
     """
-    text_hash = hashlib.sha256(text.lower().strip().encode()).hexdigest()
+    material  = f"{namespace}|{text.lower().strip()}" if namespace else text.lower().strip()
+    text_hash = hashlib.sha256(material.encode()).hexdigest()
     return f"{prefix}:{text_hash}"
 
 
-def get_cached_embedding(query: str):
+def get_cached_embedding(query: str, namespace: str = ""):
     """Returns cached embedding vector or None if not cached."""
-    key  = make_key("embed", query)
+    key  = make_key("embed", query, namespace)
     data = r.get(key)
 
     if data:
@@ -31,9 +37,9 @@ def get_cached_embedding(query: str):
     return None
 
 
-def set_cached_embedding(query: str, vector: list):
+def set_cached_embedding(query: str, vector: list, namespace: str = ""):
     """Cache an embedding vector for 24 hours."""
-    key = make_key("embed", query)
+    key = make_key("embed", query, namespace)
     r.setex(key, 86400, json.dumps(vector))   # 86400 = 24 hours
 
 

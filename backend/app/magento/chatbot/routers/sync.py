@@ -54,6 +54,7 @@ from backend.app.magento.chatbot.services.product_formatter import (
     format_category_chunkable,
     format_cms_block_chunkable,
     format_cms_page_chunkable,
+    format_faq_chunkable,
     format_item,
 )
 from backend.app.magento.chatbot.services.text_chunker import chunk_text
@@ -69,7 +70,7 @@ _CHUNK_OVERLAP     = 200
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-SUPPORTED_TYPES = {"product", "cms_page", "cms_block", "category", "widget", "store_config", "promotion"}
+SUPPORTED_TYPES = {"product", "cms_page", "cms_block", "category", "widget", "store_config", "promotion", "faq"}
 
 # Window for the "did we just embed this exact payload?" guard. Long enough
 # to absorb any near-simultaneous fires from multiple Magento modules sharing
@@ -175,6 +176,8 @@ def _process_chunkable_item(
         header, body, base_payload = format_cms_block_chunkable(item.payload)
     elif item.content_type == "category":
         header, body, base_payload = format_category_chunkable(item.payload)
+    elif item.content_type == "faq":
+        header, body, base_payload = format_faq_chunkable(item.payload)
     else:
         # Defensive: outer loop should only route chunkable types here.
         raise ValueError(f"non-chunkable content_type routed to chunked path: {item.content_type}")
