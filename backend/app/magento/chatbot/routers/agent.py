@@ -117,6 +117,32 @@ class _MatchSignals(BaseModel):
         return str(value) if not isinstance(value, str) else value
 
 
+class _PageContext(BaseModel):
+    """The storefront page the customer is on, when known — lets the routing
+    LLM resolve deictic questions ("do they freeze in winter?") to the product
+    the customer is actually viewing. Empty `type` means no page context."""
+    type: str = ""
+    id: int = 0
+    sku: str = ""
+    name: str = ""
+    url: str = ""
+
+    @field_validator("type", "sku", "name", "url", mode="before")
+    @classmethod
+    def _coerce_str(cls, value):
+        if value in (None, [], {}):
+            return ""
+        return str(value)
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _coerce_id(cls, value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+
 class ToolCallRequest(BaseModel):
     license_key: Optional[str] = None
     llm_api_key_encrypted: Optional[str] = None
@@ -133,6 +159,10 @@ class ToolCallRequest(BaseModel):
 
     # Compact pre-matched signals — see _MatchSignals docstring.
     match_signals: _MatchSignals = Field(default_factory=_MatchSignals)
+
+    # What product / category the widget is open on, when known. Lets the
+    # routing LLM resolve deictic questions to the page's product.
+    page_context: _PageContext = Field(default_factory=_PageContext)
 
     # Provider/model overrides — admin can pick a cheap fast model for
     # routing (e.g. gemini-2.5-flash-lite) and keep a premium model for
@@ -192,6 +222,7 @@ def tool_call(
         conversation_history=req.conversation_history,
         customer_context=req.customer_context.model_dump(),
         match_signals=req.match_signals.model_dump(),
+        page_context=req.page_context.model_dump(),
         provider=(req.llm_provider or "google"),
         model=(req.llm_model or "gemini-2.5-flash"),
         api_key=api_key,

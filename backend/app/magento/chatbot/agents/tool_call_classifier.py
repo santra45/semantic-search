@@ -73,6 +73,7 @@ Rules:
      → search_products
    The test: if a text answer with no product cards would satisfy
    the customer, route to answer_product_question.
+8. Always prioritize the page_context if customer didn't include specific information.
 
 """
 
@@ -131,6 +132,7 @@ def select_tool(
     conversation_history: Optional[list[dict[str, str]]] = None,
     customer_context: Optional[dict[str, Any]] = None,
     match_signals: Optional[dict[str, Any]] = None,
+    page_context: Optional[dict[str, Any]] = None,
     provider: str = "google",
     model: str = "gemini-2.5-flash",
     api_key: Optional[str] = None,
@@ -159,6 +161,7 @@ def select_tool(
     conversation_history = conversation_history or []
     customer_context = customer_context or {}
     match_signals = match_signals or {}
+    page_context = page_context or {}
 
     # Build a tiny context preamble for the system prompt — gives the
     # LLM enough situational awareness to route auth-gated tools sanely
@@ -174,6 +177,33 @@ def select_tool(
         ctx_lines.append("The customer is a guest (not logged in).")
     if customer_context.get("store_code"):
         ctx_lines.append(f"Active store view: {customer_context['store_code']}.")
+
+    # Page context — the product / category the customer is viewing. This is
+    # what lets the router resolve deictic questions ("do they freeze in
+    # winter?", "is this in stock?") to a concrete product even though the
+    # message names none.
+    if page_context.get("type") == "product":
+        name = (page_context.get("name") or "").strip()
+        sku = (page_context.get("sku") or "").strip()
+        label = name or sku
+        if label:
+            line = f"The customer is currently viewing the product: {label}"
+            if sku:
+                line += f" (SKU: {sku})"
+            line += (
+                ". If the customer refers to a product with words like 'this', "
+                "'these', 'it', 'they', or asks about a product without naming "
+                "one, assume they mean THIS product: route usage / attribute / "
+                "care / safety questions to answer_product_question, and stock / "
+                "price / variant questions to get_product_detail with this "
+                "product's SKU in the `skus` argument."
+            )
+            ctx_lines.append(line)
+    elif page_context.get("type") == "category":
+        cat_name = (page_context.get("name") or "").strip()
+        if cat_name:
+            ctx_lines.append(f"The customer is currently browsing the category: {cat_name}.")
+
     context_block = "\n".join(ctx_lines)
 
     # Matched signals (structured filter rebuild 2026-05-22+).
