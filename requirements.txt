@@ -14,8 +14,6 @@ psycopg[binary,pool]==3.2.9
 # Authentication & Security
 python-jose[cryptography]==3.3.0
 cryptography>=41.0.0
-crypto
-pycrypto
 pycryptodome
 
 # Vector Database & Search
@@ -26,7 +24,8 @@ qdrant-client==1.17.0
 fastembed>=0.3,<0.4
 
 # AI / Embeddings
-google-genai
+google-genai==1.4.0
+google-ai-generativelanguage==0.12.0
 openai
 anthropic
 tiktoken

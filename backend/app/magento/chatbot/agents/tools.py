@@ -303,6 +303,53 @@ def cancel_order(order_ids: List[str], action: str = "cancel") -> str:
     """
 
 
+@tool
+def get_order_info(order_ids: Optional[List[str]] = None, query: str = "") -> str:
+    """Answer a QUESTION or REQUEST about the customer's OWN specific order
+    — anything beyond just showing the card. Use for:
+      - order status / delivery ("has my order shipped?", "where's my
+        order?", "when will order #1000064522 arrive?")
+      - order contents ("what did I buy in order #1000064522?", "what's
+        in my last order?")
+      - change / modify requests ("I want to change the shipping address
+        on my order", "can I add an item to order #X?", "change my
+        delivery date")
+
+    The Magento side fetches the live order (status, items, shipping,
+    tracking, whether it can still be cancelled / has shipped) and answers
+    grounded in those facts — and for changes a customer can't self-serve,
+    it explains and points them to support rather than refusing.
+
+    Pick `view_orders` instead when the customer just wants to SEE their
+    order(s) ("show my orders", "list my orders"). Pick `cancel_order` for
+    cancellations. Pick `get_store_policy` ONLY for general store policy
+    ("what's your return policy?") that isn't tied to one of their orders.
+
+    Args:
+        order_ids: The order number(s) the customer named, if any. Empty
+            means "their most recent order".
+        query: The customer's question/request, verbatim.
+    """
+
+
+@tool
+def get_purchase_history() -> str:
+    """Show the customer what they buy most often, from their own order
+    history — "your usuals" / "buy again". Use when the customer asks:
+      - "what do I usually buy?"
+      - "what do I order the most?"
+      - "show my favourite products"
+      - "what have I bought before?"
+      - "buy again" / "reorder my usuals"
+
+    The Magento side aggregates the customer's past orders, ranks their
+    most-frequently-bought products, and offers one-tap reorder. Requires
+    login (the PHP side returns an auth card for guests).
+
+    No arguments — it reads the logged-in customer's full order history.
+    """
+
+
 # ── Profile + wishlist tools (auth-gated; PHP side returns auth card if
 # the customer is a guest) ──────────────────────────────────────────────────
 
@@ -391,6 +438,8 @@ ALL_TOOLS = [
     manage_cart,
     view_orders,
     cancel_order,
+    get_order_info,
+    get_purchase_history,
     view_profile,
     manage_wishlist,
     get_store_policy,

@@ -1531,6 +1531,84 @@ def _build_answer_prompt(
             + f"\n\nFAQ-style content (PRIMARY) + product examples (SECONDARY):\n{sources_blob}"
         )
 
+    if purpose == "order_answer":
+        # ORDER-GROUNDED ANSWER mode (2026-06-09). Used by OrderAgent for
+        # free-text questions/requests about a logged-in customer's OWN
+        # order — status ("did it ship?", "where's my order?"), contents
+        # ("what did I buy in order X?"), or change/modify requests
+        # ("change my shipping address"). The single `[order]` source
+        # carries that order's facts, scoped to non-PII (no street address,
+        # no payment, no customer name). NEVER refuse — the customer is
+        # authenticated and we have their order in hand.
+        return (
+            "You are a store assistant answering a logged-in customer's "
+            "question about their OWN order. The source below ([order]) "
+            "contains that order's facts: order number, status, items, "
+            "totals, shipping method, tracking, and whether it can still "
+            "be cancelled or has already shipped. Answer using ONLY these "
+            "facts.\n\n"
+            "Rules:\n"
+            " - Lead with the direct answer. Always name the order number "
+            "(**#1000064522**) and its current **status**.\n"
+            " - ORDER CONTENTS (\"what did I buy?\"): list the items "
+            "naturally in prose (\"You ordered **2x Solar Fountain** and "
+            "**1x Pump Kit**\"). Don't dump SKUs.\n"
+            " - STATUS / tracking: state the status and, if present, the "
+            "tracking carrier + number. If it hasn't shipped, say so "
+            "plainly. NEVER invent a delivery date that isn't in the "
+            "facts.\n"
+            " - CHANGE / MODIFY requests (shipping address, items, "
+            "delivery): a customer CANNOT change a placed order "
+            "themselves. Say so clearly, then — if it has NOT shipped — "
+            "tell them the team can help and to reach out; if it HAS "
+            "shipped, explain it's too late to change and to contact "
+            "support about options. NEVER promise the change will happen.\n"
+            " - Bold concrete values (order number, status, prices, "
+            "quantities, tracking numbers).\n"
+            " - Plain prose, 2-4 sentences. No markdown headings, no lists "
+            "unless asked.\n"
+            " - Do NOT put phone numbers or emails inline — the interface "
+            "renders clickable contact chips below your message.\n"
+            " - NEVER say you have no information about the order — the "
+            "facts are right here. If the exact thing asked isn't in the "
+            "facts, give the relevant status and point them to support."
+            + instruction_block
+            + "\n\n"
+            f"Customer question: {query}"
+            + history_block
+            + f"\n\nThe customer's order:\n{sources_blob}"
+        )
+
+    if purpose == "purchase_history":
+        # PURCHASE-HISTORY / "your usuals" mode (2026-06-09). Used by
+        # PurchaseHistoryAgent. Sources are the customer's most-bought
+        # products (name + how many separate orders included it + total
+        # quantity) — catalog data + counts, no PII. Warmly summarise
+        # their buying habits and invite a reorder; the product list +
+        # "Buy again" actions render separately.
+        return (
+            "You are a store assistant telling a logged-in customer what "
+            "they buy most often, from their own purchase history. The "
+            "sources below are their top products, each with how many "
+            "separate orders included it and the total quantity bought.\n\n"
+            "Rules:\n"
+            " - Open with a short, friendly summary naming their top 1-3 "
+            "products and roughly how often (\"You order **Solar "
+            "Fountain** most — it's been in **5** of your orders\").\n"
+            " - 2-3 sentences, plain prose. The product list + one-tap "
+            "'Buy again' actions render below your text, so don't "
+            "enumerate everything or list SKUs.\n"
+            " - Invite them to reorder (\"want me to add your usuals to "
+            "your cart?\").\n"
+            " - Bold product names and counts. Don't invent products or "
+            "numbers beyond the sources."
+            + instruction_block
+            + "\n\n"
+            f"Customer question: {query}"
+            + history_block
+            + f"\n\nThe customer's most-bought products:\n{sources_blob}"
+        )
+
     # Default "answer" purpose + "comparison" (same prompt, comparison
     # gets an extra hint via `instruction`).
     #
