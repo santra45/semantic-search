@@ -1326,6 +1326,25 @@ def _build_answer_prompt(
     instruction_block = ""
     if instruction:
         instruction_block = f"\n\nAdditional framing instruction: {instruction.strip()}"
+        
+    # FAQ-link rule (2026-06-09). Surfaced ONLY when a faq source is actually
+    # present, so neither the rule nor its tokens touch non-FAQ answers. Tells
+    # the model to turn a URL the merchant put inside a FAQ answer into a
+    # clickable markdown link — the widget's renderMarkdown only linkifies
+    # [text](url) syntax, so a bare URL would otherwise render as plain,
+    # unclickable text. Scoped to [faq] sources so links never leak from other
+    # content types (cms_page links etc. stay as they are today).
+    faq_link_rule = ""
+    if any((s.get("content_type") or "").lower() == "faq" for s in (sources or [])):
+        faq_link_rule = (
+            " - **Links in FAQ answers.** When you use a fact from a `[faq]` source "
+            "that contains a URL (a tracking page, returns form, guide, etc.), "
+            "surface that link to the customer as a clickable **markdown link** with "
+            "short descriptive text — e.g. `[track your order](https://example.com/"
+            "track)` — never a bare URL and never a raw HTML `<a>` tag. Only do this "
+            "for URLs that actually appear in a `[faq]` source; never invent a link "
+            "and never surface URLs from non-FAQ sources.\n"
+        )
 
     if purpose == "preamble":
         # CONFIRMATION mode — used by ProductSearchAgent's NL answer-line.
@@ -1643,6 +1662,7 @@ def _build_answer_prompt(
         " - Never invent SKUs, prices, dates, dimensions, or policy terms that aren't in the sources.\n"
         " - No markdown headings. No bulleted lists unless the customer explicitly asked for a list.\n"
         " - Plain prose only — write the way a helpful human store assistant would.\n"
+        + faq_link_rule +
         " - **Direction of flow matters.** If the customer describes RECEIVING a damaged, broken, or "
         "defective product, and the evidence only covers RETURNING such items (e.g. 'damaged-on-return' "
         "or 'sender's responsibility'), do NOT apply that evidence to the customer's situation. Say plainly "
@@ -1730,8 +1750,23 @@ def _format_source_for_prompt(s: dict, compact_products: bool = False) -> str:
     if ct == "category":
         return side_prefix + _format_category_source(s, title)
 
+    if ct == "faq":
+        return side_prefix + _format_faq_source(s, title)
+
     body = (s.get("summary") or s.get("content") or s.get("description") or "")[:800]
     return f"{side_prefix}[{ct or 'source'}] {title}\n{body}"
+
+def _format_faq_source(s: dict, title: str) -> str:
+    """Format a merchant-authored FAQ source for the prompt.
+
+    Unlike the generic fallback (which reads the 300-char `summary` first),
+    this uses the FULL answer body so any link the merchant put inside the FAQ
+    answer survives into the prompt intact — the answer-purpose FAQ-link rule
+    then turns that URL into a clickable markdown link in the reply. FAQ
+    answers are short, so a 4000-char cap is plenty.
+    """
+    body = (s.get("content") or s.get("summary") or s.get("description") or "")[:4000]
+    return f"[faq] {title}\n{body}"
 
 
 def _format_category_source(s: dict, title: str) -> str:
