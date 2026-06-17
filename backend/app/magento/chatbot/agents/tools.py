@@ -217,6 +217,36 @@ def get_category_info(category: str) -> str:
 
 
 @tool
+def get_brand_info(brand: str) -> str:
+    """Get a descriptive overview of a BRAND / manufacturer itself — what
+    the brand makes, what its range covers, what it's known for. Use when
+    the customer asks ABOUT a brand rather than asking to SEE its products.
+
+    Pick this tool when the customer's intent is descriptive / topical:
+      • "tell me about <brand>"
+      • "what is <brand> / who is <brand>"
+      • "who makes <brand> / what does <brand> make"
+      • "describe the <brand> range"
+      • "is <brand> any good?"
+
+    Pick `search_products` instead when the customer wants to BROWSE
+    or FIND products:
+      • "show me <brand> products"
+      • "products by <brand>"
+      • "what do you have from <brand>"
+      • "cheapest <brand>"
+
+    Args:
+        brand: The brand name as the customer mentioned it. The Magento
+            side validates it against the per-merchant BrandVocabulary and
+            bridges brand → its products → those products' category
+            descriptions to build the answer. Pass the canonical name from
+            the "Detected matches" hint in your system prompt if one was
+            provided.
+    """
+
+
+@tool
 def get_store_policy(query: str) -> str:
     """Answer questions about store policies — returns, refunds, shipping,
     warranty, exchanges, cancellations, delivery timeframes, tracking.
@@ -445,6 +475,7 @@ ALL_TOOLS = [
     get_store_policy,
     get_store_info,
     get_category_info,
+    get_brand_info,
     # answer_product_question sits BEFORE search_products in this list so
     # the LLM sees the Q&A tool first when a query is ambiguous between
     # "answer a question about products" and "browse products". The

@@ -1299,7 +1299,7 @@ def _build_answer_prompt(
     # category description; the LLM only needs name + SKU + price +
     # short description to mention 1-2 illustratively, not the full
     # 1500-char-per-product dump.
-    _compact_products = purpose in ("category_info", "product_qa")
+    _compact_products = purpose in ("category_info", "product_qa", "comparison", "brand_info")
     sources_blob = "\n\n".join(
         _format_source_for_prompt(s, compact_products=_compact_products)
         for s in (sources or [])[:10]
@@ -1480,6 +1480,55 @@ def _build_answer_prompt(
             + history_block
             + f"\n\nCategory + supporting items (sub-categories OR products — "
               f"check content_type on each):\n{sources_blob}"
+        )
+
+    if purpose == "brand_info":
+        # BRAND OVERVIEW mode (2026-06-08). Used by BrandInfoAgent when the
+        # customer asks ABOUT a brand itself ("tell me about Altico", "what
+        # is Tranquility"). Brands have no page of their own, so the
+        # evidence is the description(s) of the merchant's brand-named
+        # collection(s) — the categories the brand's products live in —
+        # plus a few representative products. content_type=category sources
+        # carry the brand's story; content_type=product sources are concrete
+        # examples.
+        return (
+            "You are describing a BRAND to a customer. The sources below are "
+            "the merchant's collection description(s) for this brand "
+            "(content_type `[category]`) and a few representative products "
+            "from the brand (content_type `[product]`). The brand itself has "
+            "no standalone page — build the overview from the collection "
+            "description(s), using the products as concrete examples.\n\n"
+            "Goal: write a clear 2-4 sentence overview of what the brand "
+            "makes, what its range covers, and (when you can tell) who it "
+            "would suit. Use the collection description(s) as your source of "
+            "truth — paraphrase naturally, don't quote verbatim.\n\n"
+            "How to use the sources:\n"
+            " - Lead with what the brand is known for, drawn from its "
+            "collection description(s). When the brand spans more than one "
+            "collection, name them. Example: \"**Tranquility** specialises "
+            "in water-feature pumps and stone water features — its range "
+            "runs from compact pond pumps to larger cascade systems.\"\n"
+            " - Name 1-2 products illustratively to anchor the overview in "
+            "concrete examples. Use the product's actual name. Do NOT list "
+            "SKUs or every product — they render as cards beneath this text.\n\n"
+            "Rules:\n"
+            " - Plain prose. No markdown headings. No bulleted or numbered "
+            "lists unless the customer explicitly asked.\n"
+            " - Bold concrete brand names, collection names, product names, "
+            "sizes, prices (**Tranquility**, **Stone Water Features**, "
+            "**£199**).\n"
+            " - Don't refuse — produce an overview from what's given even if "
+            "the description is short. If the evidence is thin, say what you "
+            "know and note the cards below show the actual range.\n"
+            " - Don't invent facts beyond what the sources say.\n"
+            " - Speak as the store (\"we stock **Altico**'s range\"), not as "
+            "an external assistant."
+            + instruction_block
+            + "\n\n"
+            f"Customer question: {query}"
+            + history_block
+            + f"\n\nBrand collection description(s) + representative products "
+              f"(check content_type on each):\n{sources_blob}"
         )
 
     if purpose == "product_qa":
