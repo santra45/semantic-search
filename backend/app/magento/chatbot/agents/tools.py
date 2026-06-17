@@ -248,12 +248,27 @@ def get_brand_info(brand: str) -> str:
 
 @tool
 def get_store_policy(query: str) -> str:
-    """Answer questions about store policies — returns, refunds, shipping,
-    warranty, exchanges, cancellations, delivery timeframes, tracking.
+    """Answer questions about store POLICIES and how to RESOLVE ORDER
+    PROBLEMS — returns, refunds, exchanges, shipping, warranty,
+    cancellations, delivery timeframes, and what to do when something is
+    wrong with an order. Backed by the merchant's CMS / FAQ content; works
+    for guests (no login needed).
+
+    Use THIS tool — not `get_order_info` — for order PROBLEMS and "what do
+    I do" questions, EVEN WHEN the customer mentions their order:
+      - missing items / missing parts / part of the order didn't arrive
+      - order arrived damaged / broken / faulty
+      - received the wrong / incorrect item
+      - order hasn't arrived / never showed up / is late
+      - how to return an item or get a refund
+
+    (`get_order_info` is only for factual lookups of an order's own data —
+    status, contents, tracking — or requests to change an order.)
 
     Args:
-        query: The customer's policy question, kept close to verbatim
-            so the downstream RAG search hits the relevant CMS page.
+        query: The customer's policy or order-problem question, kept close
+            to verbatim so the downstream RAG search hits the relevant
+            CMS / FAQ page.
     """
 
 
@@ -335,25 +350,32 @@ def cancel_order(order_ids: List[str], action: str = "cancel") -> str:
 
 @tool
 def get_order_info(order_ids: Optional[List[str]] = None, query: str = "") -> str:
-    """Answer a QUESTION or REQUEST about the customer's OWN specific order
-    — anything beyond just showing the card. Use for:
-      - order status / delivery ("has my order shipped?", "where's my
-        order?", "when will order #1000064522 arrive?")
+    """Answer a factual QUESTION about the DATA of the customer's own
+    specific order, or handle a request to CHANGE one. Use ONLY for:
+      - order status / delivery of THIS order ("has my order shipped?",
+        "where's my order?", "when will order #1000064522 arrive?")
       - order contents ("what did I buy in order #1000064522?", "what's
         in my last order?")
-      - change / modify requests ("I want to change the shipping address
-        on my order", "can I add an item to order #X?", "change my
-        delivery date")
+      - change / modify requests ("change the shipping address on my
+        order", "can I add an item to order #X?", "change my delivery
+        date")
 
     The Magento side fetches the live order (status, items, shipping,
-    tracking, whether it can still be cancelled / has shipped) and answers
-    grounded in those facts — and for changes a customer can't self-serve,
-    it explains and points them to support rather than refusing.
+    tracking) and answers grounded in those facts. Requires the customer
+    to be logged in.
 
-    Pick `view_orders` instead when the customer just wants to SEE their
-    order(s) ("show my orders", "list my orders"). Pick `cancel_order` for
-    cancellations. Pick `get_store_policy` ONLY for general store policy
-    ("what's your return policy?") that isn't tied to one of their orders.
+    DO NOT use this tool for an order PROBLEM or complaint that needs the
+    store's help process — those are answered by the merchant's FAQ /
+    policy content via `get_store_policy` (which works for guests), EVEN
+    THOUGH they mention an order. Route all of these to `get_store_policy`:
+      - "I received my order but items are missing" / "missing parts"
+      - "my order arrived damaged / broken / faulty"
+      - "I received the wrong / incorrect item"
+      - "my order hasn't arrived / never showed up / is late"
+      - "how do I return an item / get a refund"
+
+    Also use `view_orders` when the customer just wants to SEE their
+    order(s) ("show my orders"), and `cancel_order` for cancellations.
 
     Args:
         order_ids: The order number(s) the customer named, if any. Empty
