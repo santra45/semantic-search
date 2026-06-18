@@ -94,6 +94,13 @@ class ProductRetrieveRequest(BaseModel):
     # this (prompt-size protection) — see llm_rerank_service.py:410.
     # Magento threads this through from aichatbot/llm/rerank_limit.
     rerank_limit: Optional[int] = None
+    # Pagination ("show more products"). `page_size` > 0 opts into paginated
+    # mode (ProductSearchAgent sends it = the display result_limit); `offset`
+    # is the start index into the MMR-ordered candidate pool for this page.
+    # Other callers (category samples, comparison) leave page_size=0 and keep
+    # the historical single-page behaviour. See plan.md "Show more products".
+    offset: int = 0
+    page_size: int = 0
     # When `rerank=True` the reranker uses these to pick the right provider/model
     # (otherwise falls back to the service's defaults, which may not match the
     # tenant's billing config and will lose cost tracking).
@@ -529,6 +536,11 @@ def retrieve_products(
     mmr_active = req.mmr and not req.sort_by
     if mmr_active:
         fan_out = max(fan_out, 5)
+    # Paginated ("show more") → fetch a deep pool to page over, even when
+    # MMR / sort wouldn't otherwise oversample.
+    paginated = req.page_size > 0
+    if paginated:
+        fan_out = max(fan_out, 5)
     raw_limit = max(req.limit, req.limit * fan_out)
 
     # Normalise the brand-OR inputs: only active when BOTH a value and at
@@ -654,38 +666,65 @@ def retrieve_products(
     base_mode = "semantic+decomp" if decomposed else "semantic"
     mode = base_mode
     from backend.app.services.mmr import apply_mmr, strip_vector
-    if mmr_active and len(hits) > req.limit:
+
+    # ── Order the candidate pool ─────────────────────────────────────────
+    # Paginated mode MMR-orders the FULL pool (k=len) so later "show more"
+    # pages have a stable, fully-ranked list to window over. Greedy MMR's
+    # first picks are identical to k=req.limit, so page 1 (offset=0) is
+    # unchanged. Non-paginated callers keep the historical k=req.limit slice.
+    if mmr_active and len(hits) > (1 if paginated else req.limit):
         try:
             hits = apply_mmr(
                 query_vector=query_vector,
                 candidates=hits,
                 lambda_val=req.mmr_lambda,
-                k=req.limit,
+                k=len(hits) if paginated else req.limit,
             )
             mode = base_mode + "+mmr"
         except Exception as exc:
             # MMR failures fall back to vector-similarity order. Never
             # let a numpy hiccup deprive the customer of results.
             logger.warning("retrieve/products MMR failed: %s — falling back to vector order", exc)
-            hits = hits[: req.limit]
-    else:
+            if not paginated:
+                hits = hits[: req.limit]
+    elif not paginated:
         hits = hits[: req.limit]
-    # Always strip dense vectors before returning. Earlier the strip
-    # only ran inside the MMR branch — when the candidate pool was
-    # smaller than `limit` (very common for narrow catalogues) the
-    # else-branch leaked 3072-float arrays per hit to Magento, which
-    # then forwarded them to /retrieve/answer/stream. ~50KB per hit
-    # for no consumer benefit.
+    # Always strip dense vectors before returning (avoids leaking 3072-float
+    # arrays per hit to Magento, which would forward them downstream).
     strip_vector(hits)
 
+    # ── Pagination window ("show more products") ─────────────────────────
+    pool_total = len(hits)
+    has_more = False
+    next_offset = 0
+    if paginated:
+        offset = max(0, req.offset)
+        # Rerank ON: window a rerank_limit-sized slice (Magento shows
+        # page_size of it); stride = rerank_limit. Rerank OFF: the window IS
+        # the page; stride = page_size. Advancing by the rerank window (not
+        # the display page) means no overlap between pages.
+        stride = req.rerank_limit if (req.rerank and req.rerank_limit and req.rerank_limit > 0) else req.page_size
+        stride = max(1, stride)
+        next_offset = offset + stride
+        has_more = next_offset < pool_total
+        # Relevance-floor gate — stop "show more" once the next window has no
+        # genuinely-relevant items left, so we don't paginate into noise.
+        # Skipped for explicit sorts (the customer asked for price/etc. order,
+        # not relevance). Uses the original cosine score MMR preserved on each
+        # hit (rerank hasn't reshaped these yet).
+        if has_more and not req.sort_by:
+            _pagination_floor = 0.40
+            nxt = hits[next_offset : next_offset + stride]
+            best = max((float(h.get("score") or 0) for h in nxt), default=0.0)
+            if best < _pagination_floor:
+                has_more = False
+        hits = hits[offset : offset + stride]
+
     if req.rerank and hits:
-        # Trim the rerank pool. By this point `hits` has been shrunk to
-        # req.limit by MMR (or the explicit slice). When the admin set
-        # rerank_limit < req.limit they want the LLM to only score the
-        # top-N most relevant candidates rather than the full display
-        # pool — the cost lever lives here, BEFORE the LLM call. Skipped
-        # cleanly when rerank_limit is unset / 0 / already >= len(hits).
-        if req.rerank_limit and 0 < req.rerank_limit < len(hits):
+        # Trim the rerank pool (non-paginated only — paginated already windowed
+        # to the rerank stride above). The cost lever lives here, before the
+        # LLM call; skipped when rerank_limit is unset / 0 / already >= len.
+        if (not paginated) and req.rerank_limit and 0 < req.rerank_limit < len(hits):
             logger.debug(
                 "retrieve/products rerank pool trimmed from %d to %d (rerank_limit)",
                 len(hits), req.rerank_limit,
@@ -701,10 +740,7 @@ def retrieve_products(
                 llm_model=req.llm_model,
                 db=db,
             )
-            # Always append — mode is built from earlier stages
-            # (semantic, +decomp, +mmr) and "+rerank" is the terminal
-            # suffix. The old "mode != 'semantic'" guard pre-dated
-            # the +decomp prefix and now misclassifies.
+            # "+rerank" is the terminal mode suffix after semantic/+decomp/+mmr.
             mode = mode + "+rerank"
         except Exception as exc:
             logger.warning("retrieve/products rerank failed: %s", exc)
@@ -713,6 +749,9 @@ def retrieve_products(
         "results": hits,
         "count": len(hits),
         "mode": mode,
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "pool_total": pool_total,
     }
 
 
