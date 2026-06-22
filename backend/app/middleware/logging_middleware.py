@@ -62,6 +62,20 @@ class APILoggingMiddleware(BaseHTTPMiddleware):
         # ── Pass to the app, capture response body ────────────────────────────
         response = await call_next(request)
 
+        # Streaming responses (NDJSON / SSE): never drain body_iterator — that
+        # buffers the whole stream and silently kills token-by-token delivery
+        # (the request-timing instrumentation caught exactly this: first_token
+        # == stream_done). Log the request + status + rid WITHOUT touching the
+        # body and hand the stream straight back. The full stream duration
+        # lives in Magento's [Timeline]; a per-token NDJSON body isn't worth
+        # capturing.
+        if _is_streaming(request, response):
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            rid = request.headers.get("x-request-id", "")
+            response_block = self._format_streaming_response(response, duration_ms, rid)
+            api_logger.info("\n" + RULE + "\n" + request_block + "\n" + INNER + "\n" + response_block + "\n" + RULE)
+            return response
+
         resp_chunks: list[bytes] = []
         async for chunk in response.body_iterator:
             resp_chunks.append(chunk)
@@ -111,8 +125,33 @@ class APILoggingMiddleware(BaseHTTPMiddleware):
         ]
         return "\n".join(lines)
 
+    def _format_streaming_response(self, response: Response, duration_ms: int, rid: str = "") -> str:
+        status = response.status_code
+        icon = "✅" if 200 <= status < 300 else ("⚠️ " if 300 <= status < 500 else "❌")
+        header = f"{icon} RESPONSE  {status}  ({duration_ms} ms to response-start, streaming)"
+        if rid:
+            header += f"  rid={rid}"
+        return (
+            header
+            + "\n   Body:\n     (streaming NDJSON — body not captured; "
+            "full duration in Magento [Timeline])"
+        )
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _is_streaming(request: Request, response: Response) -> bool:
+    """Whether the response body must be left alone (draining it for logging
+    buffers the stream and breaks token-by-token delivery).
+
+    Detected by the conventional `/stream` path suffix OR a streaming media
+    type, so any future NDJSON / SSE endpoint is covered automatically.
+    """
+    if request.url.path.endswith("/stream"):
+        return True
+    ct = response.headers.get("content-type", "")
+    return "x-ndjson" in ct or "text/event-stream" in ct
 
 
 def _sanitize_headers(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
