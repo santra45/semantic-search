@@ -218,16 +218,17 @@ def select_tool(
     # minimal in the common case.
     signal_block = _render_match_signals(match_signals)
 
-    system_content = _SYSTEM_PROMPT + "\n\n" + context_block
-    if signal_block:
-        system_content += "\n\n" + signal_block
-
-    # LangChain Message list. SystemMessage carries the routing guide +
-    # customer context. We append the recent conversation history (last
-    # 6 turns — already capped by retrieve.py's validator on the Magento
-    # request side) followed by the current message.
+    # Prompt-prefix cacheability (2026-06-19): the SystemMessage is kept
+    # byte-for-byte STATIC — only `_SYSTEM_PROMPT` — so that, together with
+    # the bound tool schemas (also constant across requests), it forms a
+    # stable ~5k-token prefix the provider can cache instead of re-processing
+    # it every call. The per-request pieces (customer / page context and the
+    # detected match-signals) therefore do NOT go in the system instruction;
+    # they ride in the user turn instead, prefixed onto the current message.
+    # The LLM sees identical information either way — only its position moved,
+    # off the cacheable head and onto the variable tail.
     messages: list[Any] = [
-        SystemMessage(content=system_content),
+        SystemMessage(content=_SYSTEM_PROMPT),
     ]
     for turn in conversation_history[-6:]:
         role = (turn.get("role") or "").strip().lower()
@@ -240,7 +241,18 @@ def select_tool(
         else:
             messages.append(AIMessage(content=content))
 
-    messages.append(HumanMessage(content=query))
+    # Current turn — per-request context + detected signals are prefixed onto
+    # the customer's message so the system prefix above stays cache-stable.
+    preamble_parts = [p for p in (context_block, signal_block) if p]
+    if preamble_parts:
+        final_user_content = (
+            "\n\n".join(preamble_parts)
+            + "\n\n---\nCustomer message: "
+            + query
+        )
+    else:
+        final_user_content = query
+    messages.append(HumanMessage(content=final_user_content))
 
     t0 = time.perf_counter()
     response = None
