@@ -68,7 +68,8 @@ class APILoggingMiddleware(BaseHTTPMiddleware):
         resp_body = b"".join(resp_chunks)
 
         duration_ms = int((time.perf_counter() - start) * 1000)
-        response_block = self._format_response(response, resp_body, duration_ms)
+        rid = request.headers.get("x-request-id", "")
+        response_block = self._format_response(response, resp_body, duration_ms, rid)
 
         api_logger.info("\n" + RULE + "\n" + request_block + "\n" + INNER + "\n" + response_block + "\n" + RULE)
 
@@ -98,11 +99,14 @@ class APILoggingMiddleware(BaseHTTPMiddleware):
         lines.append(f"   Body:\n{_format_body(body)}")
         return "\n".join(lines)
 
-    def _format_response(self, response: Response, body: bytes, duration_ms: int) -> str:
+    def _format_response(self, response: Response, body: bytes, duration_ms: int, rid: str = "") -> str:
         status = response.status_code
         icon = "✅" if 200 <= status < 300 else ("⚠️ " if 300 <= status < 500 else "❌")
+        header = f"{icon} RESPONSE  {status}  ({duration_ms} ms)"
+        if rid:
+            header += f"  rid={rid}"
         lines = [
-            f"{icon} RESPONSE  {status}  ({duration_ms} ms)",
+            header,
             f"   Body:\n{_format_body(body)}",
         ]
         return "\n".join(lines)

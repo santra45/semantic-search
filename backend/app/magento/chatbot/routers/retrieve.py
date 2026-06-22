@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.services.database import get_db
 from backend.app.services.embedder import embed_query
+from backend.app.utils.stage_timer import StageTimer
 from backend.app.services.qdrant_service import (
     get_collection_name,
     qdrant,
@@ -463,6 +464,8 @@ def retrieve_products(
 
     embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
 
+    timer = StageTimer("retrieve/products", request)
+
     # Phase 3.3 — query decomposition. Runs BEFORE embedding so each
     # sub-query gets its own dense vector + its own RRF prefetch slot.
     # The decomposer's heuristic gate skips simple queries even when
@@ -511,6 +514,7 @@ def retrieve_products(
             sparse_query_vector = embed_sparse_query(req.query.strip())
         except Exception as exc:
             logger.warning("retrieve/products hybrid sparse-embed failed: %s — dense-only", exc)
+    timer.mark("embed")
 
     # Fetch over-broad so the post-filter has room to narrow down. When a
     # sort intent is present we widen even further — we want enough
@@ -641,6 +645,7 @@ def retrieve_products(
         if req.category_id:
             key = f"cat_{req.category_id}"
             hits = [h for h in hits if h.get(key) is True]
+    timer.mark("qdrant")
 
     # ── Apply customer-requested sort on the on-topic candidate pool ─────
     # Runs AFTER attribute/category narrowing so the sort operates on
@@ -692,6 +697,7 @@ def retrieve_products(
     # Always strip dense vectors before returning (avoids leaking 3072-float
     # arrays per hit to Magento, which would forward them downstream).
     strip_vector(hits)
+    timer.mark("mmr")
 
     # ── Pagination window ("show more products") ─────────────────────────
     pool_total = len(hits)
@@ -745,6 +751,8 @@ def retrieve_products(
         except Exception as exc:
             logger.warning("retrieve/products rerank failed: %s", exc)
 
+    timer.mark("rerank")
+    timer.flush()
     return {
         "results": hits,
         "count": len(hits),
@@ -774,6 +782,8 @@ def retrieve_content(
         raise HTTPException(status_code=400, detail="query is required")
 
     embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
+
+    timer = StageTimer("retrieve/content", request)
 
     # Phase 3.3 — query decomposition for CMS / policy queries. Same
     # heuristic gate as retrieve_products; especially useful for
@@ -820,6 +830,7 @@ def retrieve_content(
             sparse_query_vector = embed_sparse_query(req.query.strip())
         except Exception as exc:
             logger.warning("retrieve/content hybrid sparse-embed failed: %s — dense-only", exc)
+    timer.mark("embed")
 
     # Phase 2.3 — MMR over-sampling. CMS retrieval doesn't have the
     # fan_out logic the products handler uses, so we apply the
@@ -842,6 +853,7 @@ def retrieve_content(
         with_vectors=req.mmr,
         query_vectors=query_vectors,
     )
+    timer.mark("qdrant")
 
     # Apply MMR (when on) then strip the internal `_dense_vector` field
     # whether MMR ran or not — search_content stamped it on every hit
@@ -870,6 +882,8 @@ def retrieve_content(
     else:
         hits = hits[: req.limit]
 
+    timer.mark("mmr")
+    timer.flush()
     return {"results": hits, "count": len(hits)}
 
 
