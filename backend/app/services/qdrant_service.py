@@ -15,6 +15,7 @@ from qdrant_client.models import (
     MatchValue,
     NamedSparseVector,
     PayloadField,
+    PayloadSchemaType,
     PointStruct,
     Prefetch,
     Range,
@@ -121,7 +122,60 @@ def ensure_collection_exists(client_id: str, domain: str) -> str:
                 SPARSE_VECTOR_NAME: SparseVectorParams(),
             },
         )
+    ensure_payload_indexes(collection_name)
     return collection_name
+
+
+# Collections whose payload indexes we've already ensured this process — guards
+# against re-issuing create_payload_index on every search.
+_payload_indexes_ensured: set[str] = set()
+
+# Clean, bounded / list payload fields the filters actually use. Each gets a
+# Qdrant payload index so FILTERED search rides the index instead of degrading
+# to an unindexed scan (the cause of the ~2-3s filtered-query latency vs ~0.4s
+# unfiltered). Deliberately EXCLUDES the attr_<code>_<value> boolean sprawl —
+# that is unbounded (one field per attribute VALUE, incl. weight / warehouse
+# codes / marketing flags) and cannot be sanely indexed; reshaping it is tracked
+# as future work in plan.md.
+_INDEXED_PAYLOAD_FIELDS: dict[str, PayloadSchemaType] = {
+    "content_type": PayloadSchemaType.KEYWORD,
+    "store_code":   PayloadSchemaType.KEYWORD,
+    # list of category-id strings (e.g. ["1446","1057"]) — a keyword index
+    # indexes each element, so a MatchValue(id) rides the index.
+    "category_ids": PayloadSchemaType.KEYWORD,
+    "stock_status": PayloadSchemaType.KEYWORD,
+    "price":        PayloadSchemaType.FLOAT,
+    "client_id":    PayloadSchemaType.KEYWORD,
+    "entity_id":    PayloadSchemaType.KEYWORD,
+    "chunk_index":  PayloadSchemaType.INTEGER,
+}
+
+
+def ensure_payload_indexes(collection_name: str) -> None:
+    """Create payload indexes on the clean filter fields for an existing (or
+    freshly created) collection. Idempotent + guarded so it runs once per
+    collection per process and never re-issues on every search.
+
+    Qdrant builds the index over the data ALREADY in the collection in the
+    background — no re-upsert, no re-sync. Creating an index that already exists
+    is a harmless no-op (wrapped defensively regardless), so this safely
+    retrofits the indexes onto live collections on the first query after deploy.
+    """
+    if collection_name in _payload_indexes_ensured:
+        return
+    for field, schema in _INDEXED_PAYLOAD_FIELDS.items():
+        try:
+            qdrant.create_payload_index(
+                collection_name=collection_name,
+                field_name=field,
+                field_schema=schema,
+            )
+        except Exception:
+            # Already indexed, or a transient Qdrant hiccup — either way the
+            # search still works (just unindexed for that field), so never let
+            # index creation break a query.
+            pass
+    _payload_indexes_ensured.add(collection_name)
 
 
 def _collection_exists(client_id: str, domain: str) -> bool:
@@ -326,16 +380,20 @@ def _build_content_filter(
             )
 
     if category_id:
-        # category_id arrives as a string from the wire (Magento sends it as
-        # string for legacy reasons). Numeric coercion is defensive — the
-        # payload key is built with the verbatim id, so any cast / format
-        # change here would silently break.
+        # Filter on the INDEXED `category_ids` list (e.g. ["1446","1057"]) every
+        # product point already carries, instead of the legacy per-id boolean
+        # `cat_<id>` flag. A keyword index on category_ids matches a MatchValue
+        # against any element, and — unlike the unbounded cat_<id> flag-per-
+        # category sprawl — it's a single field we can actually index, so
+        # category-filtered search rides the index. Works on existing data with
+        # no re-sync (category_ids is written by product_formatter today). The
+        # legacy cat_<id> booleans are now dead weight (see plan.md future work).
         cid = str(category_id).strip()
         if cid:
             must_conditions.append(
                 FieldCondition(
-                    key=f"cat_{cid}",
-                    match=MatchValue(value=True),
+                    key="category_ids",
+                    match=MatchValue(value=cid),
                 )
             )
 
