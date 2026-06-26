@@ -535,6 +535,20 @@ def format_product(
         parts.append(
             f"Price: {symbol}{price_str} {currency}. Budget level: {bucket}"
         )
+    # Weight — readable spec, NOT a facet (continuous value; exact-match
+    # faceting is useless). Emitted as a top-level field by the PHP
+    # provider, so it never enters the attribute loop / facet_tokens.
+    raw_weight = product.get("weight")
+    try:
+        weight_val = float(raw_weight) if raw_weight not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        weight_val = 0.0
+    if weight_val > 0:
+        weight_unit = str(product.get("weight_unit") or "kg").strip()
+        weight_str = str(int(weight_val)) if weight_val.is_integer() else str(weight_val)
+        parts.append(f"Weight: {weight_str} {weight_unit}")
+    else:
+        weight_unit = ""
 
     image_url = _resolve_image(product.get("images") or product.get("image_url") or "")
 
@@ -553,6 +567,8 @@ def format_product(
             "regular_price": float(product.get("regular_price") or price_val or 0),
             "sale_price": float(product.get("sale_price") or 0),
             "on_sale": bool(product.get("on_sale", False)),
+            "weight": weight_val if weight_val > 0 else None,           # ← add
+            "weight_unit": weight_unit if weight_val > 0 else None,     # ← add
             # Store full paths in the payload so the agent can display breadcrumbs.
             "categories": cats_str,
             "category_paths": path_strings,                    # ← NEW: list of full paths
