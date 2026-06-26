@@ -91,6 +91,34 @@ def _payload_fingerprint(payload: dict[str, Any]) -> str:
         blob = repr(payload)
     return hashlib.md5(blob.encode("utf-8")).hexdigest()[:12]
 
+def _repair_mojibake_str(s: str) -> str:
+    """Reverse a cp1252/Latin-1 misdecode of UTF-8 bytes (e.g. ℃ → „ƒ).
+
+    Strict round-trip: if the string doesn't cleanly re-encode as cp1252
+    and re-decode as UTF-8, it's either already clean or not this
+    corruption pattern, so we return it untouched. This makes the repair
+    a no-op on well-formed UTF-8 (accented brand names, real °C glyphs).
+    """
+    if not s:
+        return s
+    try:
+        return s.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
+def _repair_payload_mojibake(value: Any) -> Any:
+    """Recursively repair mojibake in every string within a payload
+    (nested dicts and lists included). Non-string scalars pass through.
+    """
+    if isinstance(value, str):
+        return _repair_mojibake_str(value)
+    if isinstance(value, dict):
+        return {k: _repair_payload_mojibake(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_repair_payload_mojibake(v) for v in value]
+    return value
+
 
 def _claim_sync_slot(client_id: str, content_type: str, entity_id: str, fingerprint: str) -> bool:
     """Atomic 'is this sync already in flight or just done?' check via Redis SETNX.
@@ -317,6 +345,13 @@ def sync_batch(
             # retrieve can filter) AND as part of the point id (so two
             # store-views of the same entity don't overwrite each other).
             store_code = item.store_code or req.store_code
+            
+            # Repair upstream UTF-8/cp1252 mojibake (e.g. ℃ → „ƒ) before
+            # formatting + embedding, so neither the stored payload nor
+            # the dense/sparse vectors carry corrupted text. Runs once
+            # over the raw payload for both chunkable and single-point
+            # paths. No-op on already-clean UTF-8.
+            item.payload = _repair_payload_mojibake(item.payload)
 
             if item.content_type in CHUNKABLE_CONTENT_TYPES:
                 # Chunked path — N points per item. Each chunk's embedding
