@@ -640,11 +640,21 @@ def retrieve_products(
         # must re-sync — no software fallback fixes that).
         if req.attribute_filters:
             for attr, value in req.attribute_filters.items():
-                key = f"attr_{_slug(attr)}_{_slug(value)}"
-                hits = [h for h in hits if h.get(key) is True]
+                token = f"{_slug(attr)}:{_slug(value)}"
+                legacy_key = f"attr_{_slug(attr)}_{_slug(value)}"
+                hits = [
+                    h for h in hits
+                    if token in (h.get("attribute_facets") or [])
+                    or h.get(legacy_key) is True
+                ]
         if req.category_id:
-            key = f"cat_{req.category_id}"
-            hits = [h for h in hits if h.get(key) is True]
+            cid = str(req.category_id)
+            legacy_key = f"cat_{req.category_id}"
+            hits = [
+                h for h in hits
+                if cid in [str(c) for c in (h.get("category_ids") or [])]
+                or h.get(legacy_key) is True
+            ]
     timer.mark("qdrant")
 
     # ── Apply customer-requested sort on the on-topic candidate pool ─────
@@ -2174,7 +2184,7 @@ _KNOWN_PRODUCT_FIELDS = frozenset({
     "regular_price", "sale_price", "on_sale", "average_rating",
     "categories", "category_paths", "category_ids", "tags",
     "stock_status", "type_id", "is_configurable", "has_variants",
-    "variant_attributes", "children", "child_skus",
+    "variant_attributes", "children", "child_skus", "attribute_facets",
     "content_type", "entity_id", "client_id", "store_code", "embedded_text",
     "score", "product_id", "page_id", "post_id", "value", "label", "key",
     "identifier", "status", "meta_description", "updated_at",

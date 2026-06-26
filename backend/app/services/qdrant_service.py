@@ -143,6 +143,9 @@ _INDEXED_PAYLOAD_FIELDS: dict[str, PayloadSchemaType] = {
     # list of category-id strings (e.g. ["1446","1057"]) — a keyword index
     # indexes each element, so a MatchValue(id) rides the index.
     "category_ids": PayloadSchemaType.KEYWORD,
+    # single keyword-list of "<code>:<value>" attribute facet tokens (replaces
+    # the unindexable attr_<code>_<value> boolean-per-value sprawl).
+    "attribute_facets": PayloadSchemaType.KEYWORD,
     "stock_status": PayloadSchemaType.KEYWORD,
     "price":        PayloadSchemaType.FLOAT,
     "client_id":    PayloadSchemaType.KEYWORD,
@@ -323,8 +326,11 @@ def _build_content_filter(
 
     Payload-key shape we rely on (written by product_formatter.py at
     sync time, slugified via backend.app.utils.slug.slug):
-      * attr_<slug(code)>_<slug(value)>: bool True
-      * cat_<id>: bool True
+      * attribute_facets: ["<slug(code)>:<slug(value)>", ...]  (indexed keyword list)
+      * category_ids:     ["<id>", ...]                        (indexed keyword list)
+    (The legacy attr_<code>_<value> / cat_<id> booleans are retired — they
+    linger on points synced before the reshape until the next full re-sync,
+    harmless because nothing reads them anymore.)
     """
     must_conditions = []
     content_types = [content_type for content_type in (content_types or []) if content_type]
@@ -372,10 +378,12 @@ def _build_content_filter(
             value = _slug(raw_value)
             if not code or not value:
                 continue
+            # Match the "<code>:<value>" token in the indexed attribute_facets
+            # list (replaces the unindexed per-value attr_<code>_<value> flag).
             must_conditions.append(
                 FieldCondition(
-                    key=f"attr_{code}_{value}",
-                    match=MatchValue(value=True),
+                    key="attribute_facets",
+                    match=MatchValue(value=f"{code}:{value}"),
                 )
             )
 
@@ -413,12 +421,12 @@ def _build_content_filter(
             if code_slug and value_slug:
                 should.append(
                     FieldCondition(
-                        key=f"attr_{code_slug}_{value_slug}",
-                        match=MatchValue(value=True),
+                        key="attribute_facets",
+                        match=MatchValue(value=f"{code_slug}:{value_slug}"),
                     )
                 )
         if should:
-            # Nested should-only filter = OR across the brand attribute keys.
+            # Nested should-only filter = OR across the brand attribute facets.
             must_conditions.append(Filter(should=should))
 
     return Filter(must=must_conditions) if must_conditions else None

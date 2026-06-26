@@ -437,13 +437,28 @@ async def magento_search(
             with_vectors=mmr_active,
             query_vectors=query_vectors,
         )
+        # Dual-read both payload shapes: the new indexed lists
+        # (`attribute_facets` / `category_ids`) on reshaped points AND the
+        # legacy `attr_<code>_<value>` / `cat_<id>` booleans on points synced
+        # before the reshape — so this legacy route's post-filter works across a
+        # mid-rollout collection and after a full re-sync.
         if req.attribute_filters:
             for attr, value in req.attribute_filters.items():
-                key = f"attr_{_slug(attr)}_{_slug(value)}"
-                results = [h for h in results if h.get(key) is True]
+                token = f"{_slug(attr)}:{_slug(value)}"
+                legacy_key = f"attr_{_slug(attr)}_{_slug(value)}"
+                results = [
+                    h for h in results
+                    if token in (h.get("attribute_facets") or [])
+                    or h.get(legacy_key) is True
+                ]
         if req.category_id:
-            key = f"cat_{req.category_id}"
-            results = [h for h in results if h.get(key) is True]
+            cid = str(req.category_id)
+            legacy_key = f"cat_{req.category_id}"
+            results = [
+                h for h in results
+                if cid in [str(c) for c in (h.get("category_ids") or [])]
+                or h.get(legacy_key) is True
+            ]
 
     # ── Customer-requested sort (operates on the on-topic candidate pool) ─────
     if req.sort_by:

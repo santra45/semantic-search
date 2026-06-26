@@ -4,10 +4,12 @@ Rich content formatter for the multi-agent chatbot.
 Design goals:
   * One function per content type (product, cms_page, cms_block, widget, store_config).
   * Emits (embedding_text, qdrant_payload) tuples.
-  * Qdrant payload includes the flattened filter keys the agents rely on:
-      attr_{name}_{value} = True   (e.g. attr_color_red)
-      cat_{id}             = True  (e.g. cat_37)
-    so the product agent can build structured Qdrant filters from vocabulary hits.
+  * Qdrant payload includes the indexed list fields the structured filters match:
+      attribute_facets = ["<code>:<value>", ...]   (e.g. "color:red")
+      category_ids     = ["<id>", ...]             (e.g. "37")
+    so the product agent can build structured (and indexable) Qdrant filters from
+    vocabulary hits. (The legacy per-value attr_<code>_<value> / cat_<id> boolean
+    keys were retired in the 2026-06-23 reshape.)
   * HTML strips via BeautifulSoup where available, plus a final regex pass so
     residual tags / entities never reach the embedder or the admin UI.
 
@@ -397,6 +399,9 @@ def format_product(
 
     parts: list[str] = []
     payload: Dict[str, Any] = {}
+    # Composite "<code>:<value>" tokens for the single indexed attribute-facet
+    # field — replaces the old per-value attr_<code>_<value> boolean sprawl.
+    facet_tokens: list[str] = []
 
     sku = str(product.get("sku") or "").strip()
     if sku:
@@ -438,7 +443,7 @@ def format_product(
         for raw_value in options:
             value_key = normalize_token(raw_value)
             if key and value_key:
-                payload[f"attr_{key}_{value_key}"] = True
+                facet_tokens.append(f"{key}:{value_key}")
                 if attribute_vocab_sink is not None and value_key != "none":
                     attribute_vocab_sink.setdefault(key, set()).add(value_key)
 
@@ -448,7 +453,9 @@ def format_product(
     for cid, leaf_name, full_path in cat_triples:
         if not cid:
             continue
-        payload[f"cat_{cid}"] = True
+        # cat_<id> boolean flags are retired — category filtering now rides the
+        # indexed `category_ids` list (set in the payload below). Still feed the
+        # category vocab sink here.
         if category_vocab_sink is not None:
             # Prefer leaf_name for the display label; fall back to last segment of path.
             display_name = leaf_name or (full_path.split(">")[-1].strip() if full_path else "")
@@ -503,7 +510,7 @@ def format_product(
             for raw_value in values:
                 value_key = normalize_token(raw_value)
                 if value_key:
-                    payload[f"attr_{key}_{value_key}"] = True
+                    facet_tokens.append(f"{key}:{value_key}")
                     if attribute_vocab_sink is not None and value_key != "none":
                         attribute_vocab_sink.setdefault(key, set()).add(value_key)
         for ch in children:
@@ -571,6 +578,12 @@ def format_product(
             **attr_map,
         }
     )
+
+    # Single indexed facet field for structured attribute filtering — one
+    # keyword-indexed list of "<code>:<value>" tokens instead of a payload field
+    # per attribute value. Set AFTER update() so a merchant attribute can't
+    # collide with / clobber it via **attr_map.
+    payload["attribute_facets"] = sorted(set(facet_tokens))
 
     embedded_text = _final_clean("\n".join(p for p in parts if p))
     return embedded_text, payload
