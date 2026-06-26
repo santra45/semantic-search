@@ -55,6 +55,24 @@ class MagentoSearchRequest(BaseModel):
     sort_order: Optional[str] = None
     store_code: Optional[str] = None
 
+    # ── Multi-brand-attribute OR (mirror of ProductRetrieveRequest) ───────────
+    # SINGLE configured brand attribute → Magento still folds brand into
+    # attribute_filters[<brand_code>] (the historical path, unchanged, brand
+    # stays None here). MULTIPLE configured brand attributes (admin enters them
+    # comma-separated) → Magento sends the brand VALUE here + the list of codes,
+    # and the value matches whichever brand attribute holds it (OR group built
+    # by qdrant_service._build_content_filter — already shared, no re-sync).
+    brand: Optional[str] = None
+    brand_attribute_codes: List[str] = Field(default_factory=list)
+
+    # ── Pagination ("show more") (mirror of ProductRetrieveRequest) ───────────
+    # page_size > 0 opts into paginated mode (AISearch sends it = the display
+    # result_limit); offset is the page start. Page 1 (offset 0) is byte-
+    # identical to the pre-pagination first slice. Other callers leave
+    # page_size = 0 and keep the legacy single-window behaviour.
+    offset: int = 0
+    page_size: int = 0
+
     # ── Full-parity retrieval toggles (mirror of ProductRetrieveRequest) ──────
     rerank: bool = False
     rerank_limit: Optional[int] = None
@@ -134,6 +152,29 @@ class MagentoSearchRequest(BaseModel):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @field_validator("offset", "page_size", mode="before")
+    @classmethod
+    def _coerce_non_negative_int(cls, value):
+        """PHP may send '' / null for an absent pagination field; coerce to 0."""
+        if value in (None, "", [], {}):
+            return 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @field_validator("brand_attribute_codes", mode="before")
+    @classmethod
+    def _coerce_brand_codes(cls, value):
+        """Accept None / '' / a single string / a list; return a clean str list."""
+        if value in (None, "", [], {}):
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        return []
 
 
 class MagentoChild(BaseModel):
@@ -223,11 +264,17 @@ def _build_cache_key(query: str, req: "MagentoSearchRequest") -> str:
         "stock": req.only_in_stock,
         "attrs": sorted((req.attribute_filters or {}).items()),
         "cat": req.category_id,
+        "brand": req.brand,
+        "brand_codes": sorted(req.brand_attribute_codes or []),
         "sort": [req.sort_by, req.sort_order],
         "mmr": [req.mmr, req.mmr_lambda],
         "decomp": req.query_decomposition,
         "rerank": [req.rerank, req.rerank_limit],
         "store": req.store_code,
+        # Pagination: each page caches separately so "show more" (offset>0)
+        # never returns page 1's window.
+        "offset": req.offset,
+        "page_size": req.page_size,
     }
     return json.dumps(parts, sort_keys=True, default=str)
 
@@ -332,8 +379,14 @@ async def magento_search(
         except Exception:
             embedding_api_key = None
 
-    cached_results = get_cached_results(f"{client_id}_{domain}", cache_key)
-    if cached_results is not None:
+    cached = get_cached_results(f"{client_id}_{domain}", cache_key)
+    if cached is not None:
+        # Back-compat: entries written before pagination stored a bare list
+        # (results only). Newer entries store a dict carrying the page's
+        # pagination meta so a cache-hit "show more" still knows has_more.
+        if isinstance(cached, list):
+            cached = {"results": cached}
+        cached_results = cached.get("results", [])
         response_time = int((time.time() - start_time) * 1000)
         increment_search_count(db, client_id)
         log_search(db, client_id, query_text, len(cached_results), response_time, cached=True)
@@ -343,6 +396,9 @@ async def magento_search(
             "cached": True,
             "results": cached_results,
             "mode": "cached",
+            "has_more": bool(cached.get("has_more", False)),
+            "next_offset": int(cached.get("next_offset", 0)),
+            "pool_total": int(cached.get("pool_total", len(cached_results))),
         }
 
     # ── Query decomposition (optional, admin-toggled) ─────────────────────────
@@ -387,9 +443,23 @@ async def magento_search(
     mmr_active = req.mmr and not req.sort_by
     if mmr_active:
         fan_out = max(fan_out, 5)
+    # Paginated ("show more") → fetch a deep pool to page over, even when
+    # MMR / sort wouldn't otherwise oversample.
+    paginated = req.page_size > 0
+    if paginated:
+        fan_out = max(fan_out, 5)
     raw_limit = max(req.limit, req.limit * fan_out)
 
-    had_structured_filters = bool(req.attribute_filters or req.category_id)
+    # Normalise the brand-OR inputs: only active when BOTH a value and at least
+    # one attribute code are present (the multi-brand-attribute path). A single
+    # configured brand code rides attribute_filters[<code>] Magento-side, so
+    # brand stays None here.
+    brand_value = (req.brand or "").strip() or None
+    brand_codes = [c.strip() for c in (req.brand_attribute_codes or []) if c and c.strip()]
+    if not brand_value or not brand_codes:
+        brand_value, brand_codes = None, []
+
+    had_structured_filters = bool(req.attribute_filters or req.category_id or brand_value)
 
     results = search_products(
         client_id=client_id,
@@ -410,6 +480,10 @@ async def magento_search(
         query_vectors=query_vectors,
         attribute_filters=req.attribute_filters or None,
         category_id=req.category_id,
+        # Multi-brand-attribute OR (2026-06-03): match the brand value against
+        # ANY of these attributes' boolean keys. None for the single-code path.
+        brand=brand_value,
+        brand_attribute_codes=brand_codes or None,
     )
 
     # Compat fallback — when structured filters return nothing AND the admin
@@ -464,30 +538,65 @@ async def magento_search(
     if req.sort_by:
         results = _apply_sort(results, req.sort_by, req.sort_order or "asc")
 
-    # ── MMR diversification — BEFORE rerank, skipped when sort_by is set ──────
+    # ── Order the candidate pool ──────────────────────────────────────────────
+    # MMR runs BEFORE rerank and is skipped when sort_by is set. Paginated mode
+    # MMR-orders the FULL pool (k=len) so later "show more" pages window over a
+    # stable, fully-ranked list. Greedy MMR's first picks are identical to
+    # k=req.limit, so page 1 (offset=0) is unchanged. Non-paginated callers keep
+    # the historical k=req.limit slice.
     base_mode = "semantic+decomp" if decomposed else "semantic"
     mode = base_mode
-    if mmr_active and len(results) > req.limit:
+    if mmr_active and len(results) > (1 if paginated else req.limit):
         try:
             results = apply_mmr(
                 query_vector=query_vector,
                 candidates=results,
                 lambda_val=req.mmr_lambda,
-                k=req.limit,
+                k=len(results) if paginated else req.limit,
             )
             mode = base_mode + "+mmr"
         except Exception as exc:
             logger.warning("magento/search MMR failed: %s — vector order", exc)
-            results = results[: req.limit]
-    else:
+            if not paginated:
+                results = results[: req.limit]
+    elif not paginated:
         results = results[: req.limit]
     # Always drop the dense vectors search_products stamped on (with_vectors)
     # before they reach the wire — Magento has no consumer for 3072-dim arrays.
     strip_vector(results)
 
+    # ── Pagination window ("show more products") ──────────────────────────────
+    pool_total = len(results)
+    has_more = False
+    next_offset = 0
+    if paginated:
+        offset = max(0, req.offset)
+        # Rerank ON: window a rerank_limit-sized slice (Magento shows page_size
+        # of it); stride = rerank_limit. Rerank OFF: the window IS the page;
+        # stride = page_size. Advancing by the rerank window (not the display
+        # page) means no overlap between pages.
+        stride = req.rerank_limit if (req.rerank and req.rerank_limit and req.rerank_limit > 0) else req.page_size
+        stride = max(1, stride)
+        next_offset = offset + stride
+        has_more = next_offset < pool_total
+        # Relevance-floor gate — stop "show more" once the next window has no
+        # genuinely-relevant items left, so we don't paginate into noise.
+        # Skipped for explicit sorts (the customer asked for price/etc. order).
+        # Uses the original cosine score MMR preserved (rerank hasn't reshaped
+        # these yet).
+        if has_more and not req.sort_by:
+            _pagination_floor = 0.40
+            nxt = results[next_offset : next_offset + stride]
+            best = max((float(h.get("score") or 0) for h in nxt), default=0.0)
+            if best < _pagination_floor:
+                has_more = False
+        results = results[offset : offset + stride]
+
     # ── Optional LLM rerank (admin-toggled) ───────────────────────────────────
     if req.rerank and results:
-        if req.rerank_limit and 0 < req.rerank_limit < len(results):
+        # Trim the rerank pool (non-paginated only — paginated already windowed
+        # to the rerank stride above).
+        if (not paginated) and req.rerank_limit and 0 < req.rerank_limit < len(results):
             results = results[: req.rerank_limit]
         try:
             reranked = llm_rerank_products(
@@ -509,7 +618,14 @@ async def magento_search(
         except Exception as exc:
             logger.warning("magento/search rerank failed: %s", exc)
 
-    set_cached_results(f"{client_id}_{domain}", cache_key, results)
+    # Cache the page as a dict so a cache-hit "show more" recovers has_more /
+    # next_offset (older bare-list entries are still read — see the hit branch).
+    set_cached_results(f"{client_id}_{domain}", cache_key, {
+        "results": results,
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "pool_total": pool_total,
+    })
 
     response_time = int((time.time() - start_time) * 1000)
     increment_search_count(db, client_id)
@@ -521,6 +637,9 @@ async def magento_search(
         "cached": False,
         "results": results,
         "mode": mode,
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "pool_total": pool_total,
     }
 
 
