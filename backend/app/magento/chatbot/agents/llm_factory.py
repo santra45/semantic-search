@@ -33,6 +33,7 @@ def build_llm(
     model: Optional[str] = None,
     api_key: Optional[str] = None,
     temperature: float = 0.7,
+    allow_thinking_disable=True,
 ):
     """Return a LangChain chat model. Imports are deferred so the backend boots without
     LangChain when no chat request has been served yet (helpful for minimal deployments
@@ -71,6 +72,6 @@ def build_llm(
     # pass, and the default (ON for 2.5 Flash) was adding seconds of dead
     # time before the first streamed token. Gated to flash models, which
     # accept budget=0 — see thinking_can_be_disabled().
-    if thinking_can_be_disabled(resolved_model):
+    if allow_thinking_disable and thinking_can_be_disabled(resolved_model):
         kwargs["thinking_budget"] = 0
     return ChatGoogleGenerativeAI(**kwargs)
