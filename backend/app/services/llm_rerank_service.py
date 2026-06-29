@@ -12,6 +12,7 @@ from google import genai
 from openai import OpenAI
 import anthropic
 from backend.app.services.token_usage_service import track_usage
+from backend.app.utils.gemini import thinking_can_be_disabled
 from backend.app.utils.llm_logger import log_llm_interaction
 
 # ---------------------------
@@ -497,9 +498,16 @@ def llm_rerank_content(
         if provider == "gemini":
             log_gemini_request(model, prompt)
             client = genai.Client(api_key=api_key)
+            # Reranking a short candidate list needs no reasoning pass — turn
+            # the thinking phase off on the flash family (was costing ~2s).
+            gen_config = (
+                {"thinkingConfig": {"thinkingBudget": 0}}
+                if thinking_can_be_disabled(model) else None
+            )
             response = client.models.generate_content(
                 model=model,
                 contents=prompt,
+                config=gen_config,
             )
             log_gemini_response(response)
             response_text = response.text.strip()

@@ -736,7 +736,23 @@ def retrieve_products(
                 has_more = False
         hits = hits[offset : offset + stride]
 
-    if req.rerank and hits:
+    # ── Rerank skip-gate ─────────────────────────────────────────────────
+    # Rerank earns its latency by SELECTING the best K from a larger pool.
+    # When the candidate pool is already <= what we'll display, every hit
+    # shows regardless of order, so the LLM call would only reshuffle the
+    # visible page — not worth a multi-second round-trip (a 4-candidate pool
+    # was costing ~2.3s to reorder 4 items into 4). Display size is page_size
+    # in paginated mode; non-paginated callers (category samples, comparison)
+    # don't express a display size, so they only skip the degenerate <=1 pool.
+    display_n = req.page_size if paginated else 0
+    rerank_pointless = len(hits) <= 1 or (display_n > 0 and len(hits) <= display_n)
+
+    if req.rerank and hits and rerank_pointless:
+        logger.info(
+            "[rerank] skipped pool=%d display=%d — every candidate shown, "
+            "rerank would only reorder the visible page", len(hits), display_n or 1,
+        )
+    elif req.rerank and hits:
         # Trim the rerank pool (non-paginated only — paginated already windowed
         # to the rerank stride above). The cost lever lives here, before the
         # LLM call; skipped when rerank_limit is unset / 0 / already >= len.

@@ -1,3 +1,4 @@
+import logging
 import re
 import uuid
 from typing import Any, Iterable, Optional
@@ -19,6 +20,9 @@ from qdrant_client.models import (
     PointStruct,
     Prefetch,
     Range,
+    ScalarQuantization,
+    ScalarQuantizationConfig,
+    ScalarType,
     SparseVector,
     SparseVectorParams,
     VectorParams,
@@ -26,7 +30,24 @@ from qdrant_client.models import (
 
 from backend.app.config import EMBED_DIM, QDRANT_HOST, QDRANT_PORT
 
+logger = logging.getLogger("qdrant_service")
+
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+# Int8 scalar quantization config, shared by collection creation (new tenants)
+# and the retrofit path (existing tenants). Quantizing the 3072-dim dense
+# vectors to int8 makes the per-comparison distance math ~4x cheaper — the main
+# cost of a filtered search over high-dim vectors — at negligible recall loss
+# because Qdrant rescores the shortlist against the original vectors by default.
+# `always_ram` keeps the compact int8 vectors in memory (tiny: 3072 bytes each)
+# for fast scoring while the originals can live on disk for the rescore pass.
+_DENSE_QUANTIZATION = ScalarQuantization(
+    scalar=ScalarQuantizationConfig(
+        type=ScalarType.INT8,
+        quantile=0.99,
+        always_ram=True,
+    ),
+)
 
 KNOWN_CONTENT_TYPES = [
     "product",
@@ -121,9 +142,47 @@ def ensure_collection_exists(client_id: str, domain: str) -> str:
                 # knobs needed until we have benchmark evidence.
                 SPARSE_VECTOR_NAME: SparseVectorParams(),
             },
+            # Born quantized — new tenants get the int8 speedup from day one.
+            quantization_config=_DENSE_QUANTIZATION,
         )
     ensure_payload_indexes(collection_name)
+    ensure_quantization(collection_name)
     return collection_name
+
+
+# Collections whose quantization we've already ensured this process — same
+# once-per-process guard as the payload indexes.
+_quantization_ensured: set[str] = set()
+
+
+def ensure_quantization(collection_name: str) -> None:
+    """Retrofit int8 scalar quantization onto an existing collection.
+
+    For collections created before quantization shipped, enable it via
+    update_collection. Qdrant re-quantizes the vectors ALREADY in the
+    collection in the background — no re-upsert, no re-sync. Idempotent +
+    guarded so it runs once per collection per process, and a no-op when the
+    collection already carries a quantization config (freshly-created ones do).
+    """
+    if collection_name in _quantization_ensured:
+        return
+    try:
+        info = qdrant.get_collection(collection_name)
+        already = getattr(getattr(info, "config", None), "quantization_config", None)
+        if already is None:
+            qdrant.update_collection(
+                collection_name=collection_name,
+                quantization_config=_DENSE_QUANTIZATION,
+            )
+            logger.info(
+                "[qdrant] enabled int8 scalar quantization on %s "
+                "(background re-quantize, no re-sync)", collection_name,
+            )
+    except Exception as exc:
+        # Never let a quantization retrofit break a query — the unquantized
+        # search still works, just slower.
+        logger.warning("[qdrant] could not ensure quantization on %s: %s", collection_name, exc)
+    _quantization_ensured.add(collection_name)
 
 
 # Collections whose payload indexes we've already ensured this process — guards
