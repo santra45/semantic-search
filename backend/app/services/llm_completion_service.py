@@ -26,7 +26,7 @@ from backend.app.services.llm_rerank_service import (
     make_http_client,
 )
 from backend.app.services.token_usage_service import track_usage
-from backend.app.utils.gemini import thinking_can_be_disabled
+from backend.app.utils.gemini import gemini_thinking_off, thinking_can_be_disabled
 from backend.app.utils.llm_logger import log_llm_interaction
 
 logger = logging.getLogger("llm_completion")
@@ -79,9 +79,10 @@ def complete(
         if thinking_can_be_disabled(model):
             # Single-shot completions (decomposition, legacy classify) need no
             # reasoning pass — drop the thinking latency on the flash family.
-            # Typed value: a camelCase dict is rejected (extra_forbidden), so use
-            # the real ThinkingConfig object inside the config dict.
-            gen_config["thinking_config"] = genai.types.ThinkingConfig(thinking_budget=0)
+            # None on an older SDK without thinking_budget (degrade, don't crash).
+            _tc = gemini_thinking_off()
+            if _tc is not None:
+                gen_config["thinking_config"] = _tc
         response = client.models.generate_content(
             model=model,
             contents=prompt,

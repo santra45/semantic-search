@@ -8,7 +8,34 @@ drift between them.
 
 from __future__ import annotations
 
-from typing import Optional
+from functools import lru_cache
+from typing import Any, Optional
+
+
+@lru_cache(maxsize=1)
+def _thinking_budget_supported() -> bool:
+    """True when the installed google-genai SDK's ThinkingConfig accepts a
+    `thinking_budget`. Older SDKs ship a ThinkingConfig WITHOUT that field and
+    reject it as `extra_forbidden`, which would crash the call. Detected once."""
+    try:
+        from google import genai
+        genai.types.ThinkingConfig(thinking_budget=0)
+        return True
+    except Exception:
+        return False
+
+
+def gemini_thinking_off() -> Optional[Any]:
+    """A ``ThinkingConfig(thinking_budget=0)`` for the raw ``genai.Client`` paths
+    (rerank, completion), or ``None`` when the installed SDK is too old to
+    support it. Returning None lets callers disable thinking where the SDK
+    supports it and degrade gracefully — thinking stays on, but no crash —
+    where it doesn't (pin/upgrade ``google-genai`` to actually disable it
+    there). Never raises."""
+    if not _thinking_budget_supported():
+        return None
+    from google import genai
+    return genai.types.ThinkingConfig(thinking_budget=0)
 
 
 def thinking_can_be_disabled(model: Optional[str]) -> bool:
