@@ -500,8 +500,12 @@ def llm_rerank_content(
             client = genai.Client(api_key=api_key)
             # Reranking a short candidate list needs no reasoning pass — turn
             # the thinking phase off on the flash family (was costing ~2s).
+            # Typed config: the SDK's GenerateContentConfig rejects a camelCase
+            # dict (extra_forbidden on thinkingBudget), so use the real objects.
             gen_config = (
-                {"thinkingConfig": {"thinkingBudget": 0}}
+                genai.types.GenerateContentConfig(
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0)
+                )
                 if thinking_can_be_disabled(model) else None
             )
             response = client.models.generate_content(

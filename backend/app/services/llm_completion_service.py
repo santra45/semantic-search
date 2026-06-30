@@ -79,7 +79,9 @@ def complete(
         if thinking_can_be_disabled(model):
             # Single-shot completions (decomposition, legacy classify) need no
             # reasoning pass — drop the thinking latency on the flash family.
-            gen_config["thinkingConfig"] = {"thinkingBudget": 0}
+            # Typed value: a camelCase dict is rejected (extra_forbidden), so use
+            # the real ThinkingConfig object inside the config dict.
+            gen_config["thinking_config"] = genai.types.ThinkingConfig(thinking_budget=0)
         response = client.models.generate_content(
             model=model,
             contents=prompt,
