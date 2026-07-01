@@ -31,7 +31,7 @@ from backend.app.services.qdrant_service import (
     search_products as qdrant_search_products,
 )
 from backend.app.services.token_usage_service import TokenUsageTracker
-from backend.app.utils.llm_logger import log_llm_call
+from backend.app.utils.llm_logger import log_llm_call, log_llm_interaction
 
 from backend.app.magento.chatbot.routers.common import (
     authorize_request,
@@ -1299,6 +1299,26 @@ def retrieve_answer_stream(
         input_cost  = in_tokens  * pricing.get("input",  0.0)
         output_cost = out_tokens * pricing.get("output", 0.0)
         cost = input_cost + output_cost
+        
+        # Write the llm.log entry — the non-streaming /retrieve/answer path
+        # logs via log_llm_call, but this streaming generator only recorded the
+        # token-usage DB row, so chat_answer never appeared in llm.log. Fire the
+        # single-shot logger now that the stream is done and the totals are in.
+        try:
+            log_llm_interaction(
+                provider=provider_name,
+                model=model_name,
+                purpose="chat_answer",
+                prompt=prompt,
+                response_text=answer_text,
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+                cost=float(cost),
+                client_id=client_id,
+                extra={"sources": len(req.sources or []), "streaming": True},
+            )
+        except Exception:
+            pass
 
         try:
             TokenUsageTracker(db).create_usage_record(
