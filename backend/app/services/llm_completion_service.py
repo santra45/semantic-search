@@ -75,6 +75,13 @@ def complete(
         if json_mode:
             # Gemini honours this on 1.5+ and silently ignores on older.
             gen_config["responseMimeType"] = "application/json"
+        # Disable the thinking phase on the 2.5 Flash family — these single-shot
+        # completions (decomposition, legacy classify) need no reasoning pass.
+        # Typed ThinkingConfig (needs the modern google-genai SDK — see the pin
+        # in requirements.txt); a camelCase dict is rejected as extra_forbidden.
+        _m = (model or "").lower()
+        if "2.5" in _m and "flash" in _m:
+            gen_config["thinking_config"] = genai.types.ThinkingConfig(thinking_budget=0)
         response = client.models.generate_content(
             model=model,
             contents=prompt,

@@ -1,6 +1,11 @@
 # Core Web Framework
-fastapi==0.104.1
+# Bumped off 0.104.1 (which dragged in starlette 0.27 → anyio<4) so the modern
+# google-genai SDK (ThinkingConfig.thinking_budget, needs anyio>=4.8) can
+# install — see the AI/Embeddings block below. Matches the versions already
+# resolved on the dev environment.
+fastapi==0.136.0
 uvicorn[standard]==0.24.0
+anyio==4.9.0
 
 # Templates & Forms
 jinja2==3.1.2
@@ -24,8 +29,10 @@ qdrant-client==1.17.0
 fastembed>=0.3,<0.4
 
 # AI / Embeddings
-google-genai==1.4.0
-google-ai-generativelanguage==0.12.0
+# Pinned to a build whose ThinkingConfig carries `thinking_budget` so Gemini 2.5
+# thinking can be disabled on the raw genai.Client rerank / completion paths.
+# Requires anyio>=4.8 (hence the fastapi bump above).
+google-genai==1.73.1
 openai
 anthropic
 tiktoken

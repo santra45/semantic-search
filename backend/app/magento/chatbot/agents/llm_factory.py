@@ -58,9 +58,22 @@ def build_llm(
 
     from langchain_google_genai import ChatGoogleGenerativeAI
 
-    return ChatGoogleGenerativeAI(
-        model=model or DEFAULT_LLM_MODEL or "gemini-2.0-flash-lite",
-        google_api_key=api_key or GEMINI_API_KEY,
-        temperature=temperature,
-        convert_system_message_to_human=True,
-    )
+    resolved_model = model or DEFAULT_LLM_MODEL or "gemini-2.0-flash-lite"
+    kwargs = {
+        "model": resolved_model,
+        "google_api_key": api_key or GEMINI_API_KEY,
+        "temperature": temperature,
+        "convert_system_message_to_human": True,
+    }
+    # Gemini 2.5 Flash defaults thinking ON — the reasoning pass adds several
+    # seconds of dead air before the first streamed token on the answer model,
+    # and neither routing nor answer generation needs it. thinking_budget=0
+    # disables it. This rides langchain-google-genai's google-ai-generativelanguage
+    # transport, independent of the separate google-genai SDK used by the raw
+    # rerank client — so it is unaffected by that SDK's version. Applied only to
+    # the 2.5 Flash family, which accepts a zero budget (Flash-Lite already
+    # defaults off, so budget=0 is a harmless no-op there).
+    _m = resolved_model.lower()
+    if "2.5" in _m and "flash" in _m:
+        kwargs["thinking_budget"] = 0
+    return ChatGoogleGenerativeAI(**kwargs)

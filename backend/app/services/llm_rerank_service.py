@@ -497,9 +497,21 @@ def llm_rerank_content(
         if provider == "gemini":
             log_gemini_request(model, prompt)
             client = genai.Client(api_key=api_key)
+            # Disable the thinking phase on the 2.5 Flash family — reranking a
+            # short candidate list needs no reasoning pass. Requires the modern
+            # google-genai SDK (ThinkingConfig.thinking_budget); older builds
+            # reject it, hence the SDK bump in requirements.txt.
+            _m = (model or "").lower()
+            _cfg = (
+                genai.types.GenerateContentConfig(
+                    thinking_config=genai.types.ThinkingConfig(thinking_budget=0)
+                )
+                if ("2.5" in _m and "flash" in _m) else None
+            )
             response = client.models.generate_content(
                 model=model,
                 contents=prompt,
+                config=_cfg,
             )
             log_gemini_response(response)
             response_text = response.text.strip()
