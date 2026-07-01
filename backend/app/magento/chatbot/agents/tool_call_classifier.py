@@ -267,7 +267,6 @@ def select_tool(
             # the same message produces the same tool selection across
             # retries / shadow-mode A/B logging.
             temperature=0.0,
-            allow_thinking_disable=False,
         )
         # tool_choice="any" forces a tool call (LangChain >= 0.3 abstracts
         # the per-provider syntax — Gemini, OpenAI, and Anthropic all

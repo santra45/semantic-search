@@ -13,7 +13,6 @@ from typing import Optional
 
 from backend.app.config import GEMINI_API_KEY
 from backend.app.magento.chatbot.services.config import DEFAULT_LLM_PROVIDER, DEFAULT_LLM_MODEL
-from backend.app.utils.gemini import thinking_can_be_disabled
 
 
 def _normalize_provider(provider: Optional[str]) -> str:
@@ -33,7 +32,6 @@ def build_llm(
     model: Optional[str] = None,
     api_key: Optional[str] = None,
     temperature: float = 0.7,
-    allow_thinking_disable=True,
 ):
     """Return a LangChain chat model. Imports are deferred so the backend boots without
     LangChain when no chat request has been served yet (helpful for minimal deployments
@@ -60,18 +58,9 @@ def build_llm(
 
     from langchain_google_genai import ChatGoogleGenerativeAI
 
-    resolved_model = model or DEFAULT_LLM_MODEL or "gemini-2.0-flash-lite"
-    kwargs = {
-        "model": resolved_model,
-        "google_api_key": api_key or GEMINI_API_KEY,
-        "temperature": temperature,
-        "convert_system_message_to_human": True,
-    }
-    # Disable Gemini's "thinking" phase on the flash family. Routing
-    # (tool-call classifier) and answer generation don't need a reasoning
-    # pass, and the default (ON for 2.5 Flash) was adding seconds of dead
-    # time before the first streamed token. Gated to flash models, which
-    # accept budget=0 — see thinking_can_be_disabled().
-    if allow_thinking_disable and thinking_can_be_disabled(resolved_model):
-        kwargs["thinking_budget"] = 0
-    return ChatGoogleGenerativeAI(**kwargs)
+    return ChatGoogleGenerativeAI(
+        model=model or DEFAULT_LLM_MODEL or "gemini-2.0-flash-lite",
+        google_api_key=api_key or GEMINI_API_KEY,
+        temperature=temperature,
+        convert_system_message_to_human=True,
+    )
