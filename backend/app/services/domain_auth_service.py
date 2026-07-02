@@ -1,12 +1,24 @@
 import hashlib
 import hmac
 import json
+import os
 import time
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
 from fastapi import Request, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+
+
+# ── In-process burst limiter ────────────────────────────────────────────────
+# A short-window request cap layered UNDER the authoritative per-hour DB limit,
+# to blunt rapid-fire flooding (and the LLM-cost blowout it triggers) from a
+# single client+IP. Best-effort by design: in-process, so per-worker and reset
+# on restart — a burst damper, not a distributed quota. Fails safe (pure memory,
+# no external calls). Move to Redis if a cross-worker guarantee is ever needed.
+_BURST_WINDOW_SEC = 15
+_BURST_MAX = 30
+_burst_hits: Dict[tuple, list] = {}
 
 
 class DomainAuthorizer:
@@ -49,12 +61,23 @@ class DomainAuthorizer:
             )
             return True
         
-        # Layer 1: IP-based validation (most reliable)
-        #self._validate_ip_address(client_id, allowed_domain, request)
-        
-        # Layer 2: Enhanced header validation with multiple checks
-        #self._validate_request_headers(client_id, allowed_domain, request)
-        
+        # Layer 1: IP-based validation — DISABLED ON PURPOSE. This is a
+        # client-side storefront widget: the request comes from the SHOPPER's
+        # browser, whose IP has nothing to do with the merchant's licensed
+        # domain, so IP-to-domain matching would reject every real customer.
+        # The Origin/Referer header check (Layer 2) is the correct gate here.
+        # self._validate_ip_address(client_id, allowed_domain, request)
+
+        # Layer 2: Origin / Referer / X-Forwarded-Host validation against the
+        # licensed domain. Re-enabled 2026-07-01 — previously commented off,
+        # which left a valid license key as the ONLY thing standing between an
+        # attacker and a tenant's data. Guarded by an env kill-switch: if a
+        # merchant's domain setup trips a false 403 (odd subdomain, apex/www
+        # mismatch), set AICHATBOT_DOMAIN_ENFORCEMENT=0 and restart — no
+        # redeploy needed — then fix the domain list and turn it back on.
+        if os.getenv("AICHATBOT_DOMAIN_ENFORCEMENT", "1") == "1":
+            self._validate_request_headers(client_id, allowed_domain, request)
+
         # Layer 3: API key validation if provided
         if api_key:
             self._validate_api_key(client_id, api_key)
@@ -192,7 +215,30 @@ class DomainAuthorizer:
         """Check rate limiting per client."""
         client_ip = self._get_client_ip(request)
         current_time = int(time.time())
-        
+
+        # In-process burst damper (see _burst_hits above) — catches rapid-fire
+        # flooding within a short window before the hourly DB limit would.
+        _bkey = (client_id, client_ip)
+        _now = time.time()
+        _recent = [t for t in _burst_hits.get(_bkey, ()) if _now - t < _BURST_WINDOW_SEC]
+        _recent.append(_now)
+        _burst_hits[_bkey] = _recent
+        if len(_burst_hits) > 5000:
+            # Bound memory: drop keys with no hits left inside the window.
+            for _k in [k for k, v in _burst_hits.items()
+                       if not v or _now - v[-1] >= _BURST_WINDOW_SEC]:
+                _burst_hits.pop(_k, None)
+        if len(_recent) > _BURST_MAX:
+            self._log_security_event(
+                client_id,
+                "burst_limit_exceeded",
+                f"Burst limit exceeded for IP {client_ip}",
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests in a short time. Please slow down.",
+            )
+
         # Get current usage for this client/IP
         usage = self.db.execute(text("""
             SELECT request_count, window_start
@@ -268,15 +314,18 @@ class DomainAuthorizer:
         return request.client.host if request.client else "unknown"
     
     def _get_all_valid_domains(self, allowed_domain: str) -> List[str]:
-        """Get list of all valid domains including subdomains."""
-        domains = [allowed_domain]
-        
-        # Add common subdomains
-        subdomains = ["www", "api", "app", "admin"]
-        for subdomain in subdomains:
-            domains.append(f"{subdomain}.{allowed_domain}")
-        
-        return domains
+        """Get list of all valid domains including subdomains.
+
+        Normalises apex <-> www so a license registered EITHER way accepts both
+        (the most common false-403 cause), then whitelists the usual subdomains
+        of the apex.
+        """
+        allowed_domain = (allowed_domain or "").strip().lower()
+        apex = allowed_domain[4:] if allowed_domain.startswith("www.") else allowed_domain
+        domains = {allowed_domain, apex}
+        for subdomain in ("www", "api", "app", "admin"):
+            domains.add(f"{subdomain}.{apex}")
+        return list(domains)
     
     def _is_ip_allowed_for_domain(self, ip: str, domain: str) -> bool:
         """Check if IP is allowed for the given domain."""

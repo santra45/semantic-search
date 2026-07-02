@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from fastapi import HTTPException, Request
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.services.domain_auth_service import DomainAuthorizer
 from backend.app.services.license_service import (
+    check_search_quota,
     extract_license_key_from_authorization,
     validate_license_key,
 )
@@ -43,8 +45,39 @@ def authorize_request(
         raise HTTPException(status_code=403, detail=str(exc))
 
     DomainAuthorizer(db).validate_request(request, license_data, api_key=x_api_key)
+    _enforce_search_quota(db, license_data)
     license_data["license_key"] = license_key
     return license_data
+
+
+def _enforce_search_quota(db: Session, license_data: dict) -> None:
+    """Reject over-quota tenants with 429 instead of only tracking usage.
+
+    Env-gated OFF by default (AICHATBOT_QUOTA_ENFORCEMENT=1 to arm): a wrong
+    limit or a stale usage row would take a whole storefront down, so this
+    ships disabled until the plan + usage data is verified in the target env.
+    Fails OPEN on any lookup error — a quota check must never be the reason a
+    paying merchant's bot goes dark.
+    """
+    if os.getenv("AICHATBOT_QUOTA_ENFORCEMENT", "0") != "1":
+        return
+    try:
+        client_id = license_data.get("client_id")
+        search_limit = int(
+            license_data.get("search_limit_per_month")
+            or license_data.get("search_limit")
+            or 0
+        )
+        if not client_id or search_limit <= 0:
+            return  # no usable limit configured → don't block
+        within_quota = check_search_quota(db, str(client_id), search_limit)
+    except Exception:
+        return  # fail open — never block on a lookup/DB error
+    if not within_quota:
+        raise HTTPException(
+            status_code=429,
+            detail="Monthly usage limit reached. Please contact the store.",
+        )
 
 
 def maybe_persist_magento_creds(
