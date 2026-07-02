@@ -212,12 +212,29 @@ class DomainAuthorizer:
             )
     
     def _check_rate_limit(self, client_id: str, request: Request):
-        """Check rate limiting per client."""
+        """Rate limit per client+IP. Redis-first (atomic INCR+TTL — no race, no
+        table bloat, cross-worker), with an in-process burst damper + hardened
+        MySQL hourly path as the Redis-down fallback. Fails open if both fail."""
         client_ip = self._get_client_ip(request)
-        current_time = int(time.time())
 
-        # In-process burst damper (see _burst_hits above) — catches rapid-fire
-        # flooding within a short window before the hourly DB limit would.
+        from backend.app.services import rate_limiter
+
+        try:
+            if rate_limiter.redis_enforce(client_id, client_ip):
+                return  # Redis handled both the burst and hourly windows
+        except HTTPException:
+            self._log_security_event(
+                client_id, "rate_limit_exceeded", f"Rate limit exceeded for IP {client_ip}"
+            )
+            raise
+
+        # Redis unavailable → per-worker burst damper + MySQL hourly fallback.
+        self._inprocess_burst(client_id, client_ip)
+        rate_limiter.mysql_enforce_hourly(self.db, client_id, client_ip)
+
+    def _inprocess_burst(self, client_id: str, client_ip: str) -> None:
+        """Per-worker short-window burst damper — the Redis-down fallback for the
+        burst window (best-effort, process-local, no external deps)."""
         _bkey = (client_id, client_ip)
         _now = time.time()
         _recent = [t for t in _burst_hits.get(_bkey, ()) if _now - t < _BURST_WINDOW_SEC]
@@ -230,58 +247,12 @@ class DomainAuthorizer:
                 _burst_hits.pop(_k, None)
         if len(_recent) > _BURST_MAX:
             self._log_security_event(
-                client_id,
-                "burst_limit_exceeded",
-                f"Burst limit exceeded for IP {client_ip}",
+                client_id, "burst_limit_exceeded", f"Burst limit exceeded for IP {client_ip}"
             )
             raise HTTPException(
                 status_code=429,
                 detail="Too many requests in a short time. Please slow down.",
             )
-
-        # Get current usage for this client/IP
-        usage = self.db.execute(text("""
-            SELECT request_count, window_start
-            FROM rate_limits
-            WHERE client_id = :client_id AND ip_address = :ip
-            AND window_start > :window_start
-        """), {
-            "client_id": client_id,
-            "ip": client_ip,
-            "window_start": current_time - 3600  # 1 hour window
-        }).fetchone()
-        
-        max_requests_per_hour = 1000  # Configurable per plan
-        
-        if usage and usage.request_count >= max_requests_per_hour:
-            self._log_security_event(
-                client_id, 
-                "rate_limit_exceeded", 
-                f"Rate limit exceeded for IP {client_ip}"
-            )
-            raise HTTPException(
-                status_code=429,
-                detail="Rate limit exceeded. Please try again later."
-            )
-        
-        # Update rate limit counter
-        if usage:
-            self.db.execute(text("""
-                UPDATE rate_limits
-                SET request_count = request_count + 1
-                WHERE client_id = :client_id AND ip_address = :ip
-            """), {"client_id": client_id, "ip": client_ip})
-        else:
-            self.db.execute(text("""
-                INSERT INTO rate_limits (client_id, ip_address, request_count, window_start)
-                VALUES (:client_id, :ip, 1, :window_start)
-            """), {
-                "client_id": client_id,
-                "ip": client_ip,
-                "window_start": current_time
-            })
-        
-        self.db.commit()
     
     def _get_client_ip(self, request: Request) -> str:
         """Get real client IP address."""
