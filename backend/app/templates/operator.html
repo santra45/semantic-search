@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Operator Console — AI Chatbot</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#080b14; --bg2:#0d1424; --card:rgba(22,29,48,.62); --card-solid:#121a2e;
+    --border:rgba(120,140,190,.14); --border-str:rgba(120,140,190,.28);
+    --text:#e8ecf6; --muted:#8b93a7; --faint:#5b6377;
+    --accent:#7c83ff; --accent2:#a855f7; --pos:#34d399; --neg:#fb7185; --warn:#fbbf24; --info:#38bdf8;
+    --grad:linear-gradient(135deg,#7c83ff 0%,#a855f7 100%);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);
+       -webkit-font-smoothing:antialiased;min-height:100vh;overflow-x:hidden}
+  body::before{content:"";position:fixed;inset:0;z-index:-1;
+    background:
+      radial-gradient(900px 500px at 12% -8%,rgba(124,131,255,.18),transparent 60%),
+      radial-gradient(800px 500px at 100% 0%,rgba(168,85,247,.14),transparent 55%),
+      linear-gradient(180deg,var(--bg) 0%,var(--bg2) 100%);}
+  .mono{font-family:'JetBrains Mono',monospace}
+  .muted{color:var(--muted)} .faint{color:var(--faint)}
+  .glass{background:var(--card);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    border:1px solid var(--border);border-radius:18px}
+  .card{background:var(--card);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    border:1px solid var(--border);border-radius:18px;padding:20px;transition:transform .25s cubic-bezier(.2,.8,.2,1),border-color .25s,box-shadow .25s}
+  .card.hover:hover{transform:translateY(-3px);border-color:var(--border-str);box-shadow:0 18px 40px -20px rgba(0,0,0,.7)}
+  .grad-text{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .btn{border:1px solid var(--border-str);background:rgba(255,255,255,.03);color:var(--text);
+    padding:9px 16px;border-radius:11px;font-weight:600;font-size:13px;cursor:pointer;transition:all .18s}
+  .btn:hover{background:rgba(255,255,255,.08);border-color:var(--accent)}
+  .btn-primary{background:var(--grad);border:none;color:#fff;box-shadow:0 8px 22px -8px rgba(124,131,255,.7)}
+  .btn-primary:hover{filter:brightness(1.08)}
+  .seg{display:inline-flex;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:11px;padding:3px}
+  .seg button{border:none;background:transparent;color:var(--muted);padding:7px 14px;border-radius:8px;font-weight:600;font-size:12px;cursor:pointer;transition:all .18s}
+  .seg button.on{background:var(--grad);color:#fff}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.02em}
+  .pill.ok{background:rgba(52,211,153,.14);color:var(--pos)} .pill.off{background:rgba(251,113,133,.14);color:var(--neg)}
+  .pill.plan{background:rgba(124,131,255,.14);color:var(--accent)}
+  .fade-up{opacity:0;transform:translateY(14px);animation:fadeUp .6s cubic-bezier(.2,.8,.2,1) forwards}
+  @keyframes fadeUp{to{opacity:1;transform:none}}
+  .grid{display:grid;gap:16px}
+  table{width:100%;border-collapse:collapse}
+  th{ text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);
+      font-weight:700;padding:10px 14px;border-bottom:1px solid var(--border)}
+  td{padding:13px 14px;border-bottom:1px solid var(--border);font-size:14px}
+  tbody tr{cursor:pointer;transition:background .15s}
+  tbody tr:hover{background:rgba(124,131,255,.06)}
+  .qbar{height:6px;border-radius:6px;background:rgba(255,255,255,.07);overflow:hidden;min-width:80px}
+  .qbar>span{display:block;height:100%;border-radius:6px;transition:width 1s cubic-bezier(.2,.8,.2,1)}
+  .spin{width:38px;height:38px;border-radius:50%;border:3px solid rgba(255,255,255,.12);border-top-color:var(--accent);animation:sp .8s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .hidden{display:none!important}
+  input.key{background:rgba(255,255,255,.04);border:1px solid var(--border-str);border-radius:12px;color:var(--text);
+    padding:13px 16px;font-size:15px;width:100%;outline:none;transition:border-color .2s}
+  input.key:focus{border-color:var(--accent)}
+  a.link{color:var(--accent);text-decoration:none} a.link:hover{text-decoration:underline}
+  .scroll::-webkit-scrollbar{width:8px;height:8px}.scroll::-webkit-scrollbar-thumb{background:var(--border-str);border-radius:8px}
+</style>
+</head>
+<body>
+
+<!-- ── Login gate ─────────────────────────────────────────────────────────── -->
+<div id="login" class="hidden" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;z-index:50">
+  <div class="glass fade-up" style="width:100%;max-width:420px;padding:34px">
+    <div style="font-size:30px;font-weight:800;letter-spacing:-.02em" class="grad-text">Operator Console</div>
+    <p class="muted" style="margin:8px 0 24px;font-size:14px">All-tenant usage &amp; cost analytics. Enter your operator key to continue.</p>
+    <input id="keyInput" class="key mono" type="password" placeholder="AICHATBOT_OPERATOR_KEY" autocomplete="off">
+    <div id="loginErr" class="hidden" style="color:var(--neg);font-size:13px;margin-top:10px;font-weight:600"></div>
+    <button id="loginBtn" class="btn btn-primary" style="width:100%;margin-top:18px;padding:13px">Unlock dashboard</button>
+    <p class="faint" style="font-size:12px;margin-top:16px">The key is checked server-side and kept only in this tab's memory.</p>
+  </div>
+</div>
+
+<!-- ── App ────────────────────────────────────────────────────────────────── -->
+<div id="app" class="hidden" style="max-width:1200px;margin:0 auto;padding:22px 22px 60px">
+
+  <!-- topbar -->
+  <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:26px">
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="width:38px;height:38px;border-radius:11px;background:var(--grad);display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff">◆</div>
+      <div>
+        <div style="font-weight:800;font-size:19px;letter-spacing:-.01em">Operator Console</div>
+        <div class="faint" style="font-size:12px">Per-tenant usage &amp; cost</div>
+      </div>
+    </div>
+    <div style="margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <div class="seg" id="daysSeg">
+        <button data-d="7">7d</button><button data-d="30" class="on">30d</button><button data-d="90">90d</button>
+      </div>
+      <button id="refreshBtn" class="btn">↻ Refresh</button>
+      <button id="logoutBtn" class="btn">Lock</button>
+    </div>
+  </div>
+
+  <div id="loader" style="display:flex;justify-content:center;padding:80px 0"><div class="spin"></div></div>
+
+  <!-- ══ OVERVIEW ══ -->
+  <div id="view-overview" class="hidden">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))" id="kpis"></div>
+
+    <div class="grid" style="grid-template-columns:1.6fr 1fr;margin-top:18px" id="ovCharts">
+      <div class="card fade-up">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <div style="font-weight:700">Cost over time</div><div class="faint mono" id="ovSeriesSum" style="font-size:12px"></div>
+        </div>
+        <div style="height:230px"><canvas id="chSeries"></canvas></div>
+      </div>
+      <div class="card fade-up">
+        <div style="font-weight:700;margin-bottom:6px">Spend by pipeline stage</div>
+        <div style="height:230px"><canvas id="chType"></canvas></div>
+      </div>
+    </div>
+
+    <div class="card fade-up" style="margin-top:18px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <div style="font-weight:700">Tenants <span class="faint" id="tenantCount" style="font-weight:500"></span></div>
+        <input id="tenantSearch" class="key" style="width:220px;padding:8px 12px;font-size:13px" placeholder="Search name / email / domain…">
+      </div>
+      <div class="scroll" style="overflow-x:auto">
+        <table>
+          <thead><tr>
+            <th>Tenant</th><th>Plan</th><th style="text-align:right">Cost</th><th style="text-align:right">Tokens</th>
+            <th style="text-align:right">Requests</th><th>Quota (mo)</th><th>Status</th>
+          </tr></thead>
+          <tbody id="tenantRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ TENANT DETAIL ══ -->
+  <div id="view-tenant" class="hidden">
+    <button id="backBtn" class="btn" style="margin-bottom:18px">← All tenants</button>
+    <div class="card" style="margin-bottom:18px">
+      <div style="display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:flex-start">
+        <div>
+          <div id="tName" style="font-size:24px;font-weight:800;letter-spacing:-.02em"></div>
+          <div class="muted" id="tMeta" style="font-size:13px;margin-top:6px"></div>
+        </div>
+        <div id="tBadges" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+      </div>
+    </div>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr))" id="tKpis"></div>
+    <div class="grid" style="grid-template-columns:1.6fr 1fr;margin-top:18px">
+      <div class="card fade-up">
+        <div style="font-weight:700;margin-bottom:6px">Cost over time</div>
+        <div style="height:220px"><canvas id="tSeries"></canvas></div>
+      </div>
+      <div class="card fade-up">
+        <div style="font-weight:700;margin-bottom:6px">By pipeline stage</div>
+        <div style="height:220px"><canvas id="tType"></canvas></div>
+      </div>
+    </div>
+    <div class="grid" style="grid-template-columns:1fr 1fr;margin-top:18px">
+      <div class="card fade-up">
+        <div style="font-weight:700;margin-bottom:12px">Cost by model</div>
+        <div id="tModels"></div>
+      </div>
+      <div class="card fade-up">
+        <div style="font-weight:700;margin-bottom:12px">Chat quality</div>
+        <div class="grid" style="grid-template-columns:1fr 1fr" id="tQuality"></div>
+      </div>
+    </div>
+    <div class="card fade-up" style="margin-top:18px">
+      <div style="font-weight:700;margin-bottom:12px">Recent thumbs-down answers</div>
+      <div id="tDisliked"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var KEY_STORE="aichatbot_operator_key";
+  var state={key:sessionStorage.getItem(KEY_STORE)||"",days:30,tenants:[],charts:{}};
+
+  // ── helpers ───────────────────────────────────────────────────────────────
+  var $=function(s,r){return (r||document).querySelector(s);};
+  var el=function(t,c,h){var e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e;};
+  function fmtMoney(n){n=+n||0;if(n>=1)return "$"+n.toLocaleString(undefined,{maximumFractionDigits:2});
+    if(n>=0.01)return "$"+n.toFixed(4);return "$"+n.toFixed(6);}
+  function fmtNum(n){n=+n||0;if(n>=1e6)return (n/1e6).toFixed(2)+"M";if(n>=1e3)return (n/1e3).toFixed(1)+"k";return String(Math.round(n));}
+  function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];});}
+  function timeAgo(iso){if(!iso)return "never";var d=(Date.now()-new Date(iso).getTime())/1000;
+    if(d<60)return "just now";if(d<3600)return Math.floor(d/60)+"m ago";if(d<86400)return Math.floor(d/3600)+"h ago";
+    return Math.floor(d/86400)+"d ago";}
+  function stageLabel(q){return (q||"").replace(/^chat_/,"").replace(/_/g," ");}
+
+  function api(path){
+    return fetch(path,{headers:{"X-Operator-Key":state.key}}).then(function(r){
+      if(r.status===403)throw {code:403};
+      if(!r.ok)throw {code:r.status};
+      return r.json();
+    });
+  }
+
+  // count-up animation
+  function countUp(node,to,fmt){
+    var from=0,start=null,dur=900;
+    function step(ts){if(!start)start=ts;var p=Math.min((ts-start)/dur,1);
+      var e=1-Math.pow(1-p,3); node.textContent=fmt(from+(to-from)*e);
+      if(p<1)requestAnimationFrame(step);}
+    requestAnimationFrame(step);
+  }
+
+  var palette=["#7c83ff","#a855f7","#38bdf8","#34d399","#fbbf24","#fb7185","#f472b6","#22d3ee","#c084fc","#4ade80"];
+  Chart.defaults.color="#8b93a7";Chart.defaults.font.family="Inter";Chart.defaults.font.size=11;
+
+  function destroyChart(id){if(state.charts[id]){state.charts[id].destroy();delete state.charts[id];}}
+
+  function lineChart(id,series){
+    destroyChart(id);var ctx=$("#"+id).getContext("2d");
+    var g=ctx.createLinearGradient(0,0,0,220);
+    g.addColorStop(0,"rgba(124,131,255,.42)");g.addColorStop(1,"rgba(124,131,255,0)");
+    state.charts[id]=new Chart(ctx,{type:"line",data:{labels:series.map(function(p){return p.date.slice(5);}),
+      datasets:[{data:series.map(function(p){return p.cost;}),borderColor:"#7c83ff",backgroundColor:g,
+        borderWidth:2,fill:true,tension:.35,pointRadius:0,pointHoverRadius:5,pointHoverBackgroundColor:"#a855f7"}]},
+      options:{responsive:true,maintainAspectRatio:false,animation:{duration:900,easing:"easeOutCubic"},
+        plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){return fmtMoney(c.parsed.y);}}}},
+        scales:{x:{grid:{display:false}},y:{grid:{color:"rgba(120,140,190,.08)"},ticks:{callback:function(v){return "$"+(+v).toFixed(v<0.1?4:2);}}}}}});
+  }
+  function doughnut(id,items){
+    destroyChart(id);var ctx=$("#"+id).getContext("2d");
+    state.charts[id]=new Chart(ctx,{type:"doughnut",
+      data:{labels:items.map(function(i){return stageLabel(i.query_type);}),
+        datasets:[{data:items.map(function(i){return i.cost;}),backgroundColor:palette,borderWidth:0,hoverOffset:8}]},
+      options:{responsive:true,maintainAspectRatio:false,cutout:"64%",animation:{animateScale:true,duration:900},
+        plugins:{legend:{position:"right",labels:{boxWidth:10,boxHeight:10,padding:10,usePointStyle:true}},
+          tooltip:{callbacks:{label:function(c){return c.label+": "+fmtMoney(c.parsed);}}}}}});
+  }
+
+  // ── login ───────────────────────────────────────────────────────────────
+  function showLogin(msg){
+    $("#app").classList.add("hidden");$("#login").classList.remove("hidden");
+    if(msg){$("#loginErr").textContent=msg;$("#loginErr").classList.remove("hidden");}
+    setTimeout(function(){$("#keyInput").focus();},50);
+  }
+  function attemptLogin(k){
+    state.key=k;
+    return api("/api/operator/overview?days="+state.days).then(function(d){
+      sessionStorage.setItem(KEY_STORE,k);
+      $("#login").classList.add("hidden");$("#app").classList.remove("hidden");
+      renderOverview(d);loadTenants();
+    }).catch(function(e){
+      sessionStorage.removeItem(KEY_STORE);
+      showLogin(e && e.code===403?"Invalid or unconfigured operator key.":"Could not reach the server.");
+    });
+  }
+
+  // ── overview ─────────────────────────────────────────────────────────────
+  function kpiCard(label,val,fmt,sub,accent){
+    var c=el("div","card hover fade-up");
+    c.innerHTML='<div class="faint" style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em">'+esc(label)+'</div>'+
+      '<div class="v" style="font-size:30px;font-weight:800;margin:8px 0 2px;letter-spacing:-.02em;color:'+(accent||"var(--text)")+'">—</div>'+
+      '<div class="faint" style="font-size:12px">'+esc(sub||"")+'</div>';
+    setTimeout(function(){countUp($(".v",c),val,fmt);},60);
+    return c;
+  }
+  function renderOverview(d){
+    $("#loader").classList.add("hidden");
+    $("#view-tenant").classList.add("hidden");
+    $("#view-overview").classList.remove("hidden");
+    var t=d.totals;
+    var k=$("#kpis");k.innerHTML="";
+    k.appendChild(kpiCard("Total spend",t.cost,fmtMoney,"last "+d.days+" days","#7c83ff"));
+    k.appendChild(kpiCard("Tokens",t.tokens,fmtNum,"across all tenants"));
+    k.appendChild(kpiCard("Requests",t.requests,fmtNum,"LLM calls"));
+    k.appendChild(kpiCard("Active tenants",t.active_tenants,function(v){return String(Math.round(v));},
+      "of "+t.total_tenants+" registered","#34d399"));
+    var sum=d.series.reduce(function(a,p){return a+p.cost;},0);
+    $("#ovSeriesSum").textContent=fmtMoney(sum)+" total";
+    lineChart("chSeries",d.series);
+    doughnut("chType",d.by_type.length?d.by_type:[{query_type:"none",cost:0}]);
+  }
+
+  function quotaBar(used,limit){
+    var pct=limit>0?Math.min(100,used/limit*100):0;
+    var col=pct>=90?"var(--neg)":pct>=70?"var(--warn)":"var(--pos)";
+    var w=el("div");w.style.display="flex";w.style.alignItems="center";w.style.gap="8px";
+    var bar=el("div","qbar");var fill=el("span");fill.style.background=col;fill.style.width="0";
+    bar.appendChild(fill);w.appendChild(bar);
+    var lbl=el("span","faint mono");lbl.style.fontSize="11px";lbl.style.whiteSpace="nowrap";
+    lbl.textContent=fmtNum(used)+(limit>0?" / "+fmtNum(limit):"");
+    w.appendChild(lbl);
+    setTimeout(function(){fill.style.width=pct+"%";},120);
+    return w;
+  }
+
+  function renderTenantRows(){
+    var q=($("#tenantSearch").value||"").toLowerCase();
+    var list=state.tenants.filter(function(t){
+      if(!q)return true;
+      return (t.name||"").toLowerCase().indexOf(q)>=0||(t.email||"").toLowerCase().indexOf(q)>=0||(t.domain||"").toLowerCase().indexOf(q)>=0;
+    });
+    $("#tenantCount").textContent="("+list.length+")";
+    var tb=$("#tenantRows");tb.innerHTML="";
+    if(!list.length){tb.appendChild(el("tr",null,'<td colspan="7" class="muted" style="text-align:center;padding:30px">No tenants match.</td>'));return;}
+    list.forEach(function(t){
+      var tr=el("tr");
+      tr.appendChild(el("td",null,'<div style="font-weight:600">'+esc(t.name||t.client_id)+'</div>'+
+        '<div class="faint" style="font-size:12px">'+esc(t.domain||t.email||"")+'</div>'));
+      tr.appendChild(el("td",null,'<span class="pill plan">'+esc(t.plan||"—")+'</span>'));
+      tr.appendChild(el("td",null,'<span class="mono" style="font-weight:700">'+fmtMoney(t.cost)+'</span>')).style.textAlign="right";
+      tr.appendChild(el("td",null,'<span class="mono muted">'+fmtNum(t.tokens)+'</span>')).style.textAlign="right";
+      tr.appendChild(el("td",null,'<span class="mono muted">'+fmtNum(t.requests)+'</span>')).style.textAlign="right";
+      var q=el("td");q.appendChild(quotaBar(t.search_count,t.search_limit));tr.appendChild(q);
+      tr.appendChild(el("td",null,t.is_active?'<span class="pill ok">● active</span>':'<span class="pill off">● inactive</span>'));
+      tr.addEventListener("click",function(){openTenant(t.client_id);});
+      tb.appendChild(tr);
+    });
+  }
+  function loadTenants(){
+    api("/api/operator/tenants?days="+state.days).then(function(d){
+      state.tenants=d.tenants||[];renderTenantRows();
+    }).catch(function(){});
+  }
+
+  // ── tenant detail ─────────────────────────────────────────────────────────
+  function qualityCard(label,val,accent){
+    return '<div class="card hover" style="padding:14px"><div class="faint" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em">'+esc(label)+
+      '</div><div style="font-size:22px;font-weight:800;margin-top:5px;color:'+(accent||"var(--text)")+'">'+esc(val)+'</div></div>';
+  }
+  function openTenant(cid){
+    window.scrollTo({top:0,behavior:"smooth"});
+    $("#view-overview").classList.add("hidden");
+    $("#loader").classList.remove("hidden");
+    api("/api/operator/tenant/"+encodeURIComponent(cid)+"?days="+state.days).then(function(d){
+      $("#loader").classList.add("hidden");
+      $("#view-tenant").classList.remove("hidden");
+      var t=d.tenant,k=d.kpis,qy=d.quality;
+      $("#tName").textContent=t.name||t.client_id;
+      $("#tMeta").innerHTML=esc(t.email||"")+(t.domain?' · <span class="mono">'+esc(t.domain)+'</span>':"")+
+        (t.expires_at?' · expires '+esc((t.expires_at||"").slice(0,10)):"");
+      $("#tBadges").innerHTML='<span class="pill plan">'+esc(t.plan||"—")+'</span>'+
+        (t.is_active?'<span class="pill ok">● active</span>':'<span class="pill off">● inactive</span>');
+      // KPIs
+      var kk=$("#tKpis");kk.innerHTML="";
+      kk.appendChild(kpiCard("Spend ("+d.days+"d)",k.cost,fmtMoney,"","#7c83ff"));
+      kk.appendChild(kpiCard("Tokens",k.tokens,fmtNum,""));
+      kk.appendChild(kpiCard("Requests",k.requests,fmtNum,"LLM calls"));
+      kk.appendChild(kpiCard("Search quota (mo)",k.search_count,function(v){return fmtNum(v);},
+        t.search_limit>0?"of "+fmtNum(t.search_limit):"",k.search_count>=t.search_limit*0.9&&t.search_limit>0?"#fb7185":"#34d399"));
+      lineChart("tSeries",d.series);
+      doughnut("tType",d.by_type.length?d.by_type:[{query_type:"none",cost:0}]);
+      // models
+      var mx=d.by_model.reduce(function(a,m){return Math.max(a,m.cost);},0)||1;
+      var mh=d.by_model.length?d.by_model.map(function(m){
+        return '<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">'+
+          '<span>'+esc(m.provider||"")+' <span class="faint">/ '+esc(m.model||"")+'</span></span>'+
+          '<span class="mono" style="font-weight:700">'+fmtMoney(m.cost)+'</span></div>'+
+          '<div class="qbar"><span style="background:var(--grad);width:'+(m.cost/mx*100)+'%"></span></div></div>';
+      }).join(""):'<div class="muted" style="font-size:13px">No model usage in this window.</div>';
+      $("#tModels").innerHTML=mh;
+      // quality
+      var gr=qy.grounded_rate==null?"—":qy.grounded_rate+"%";
+      var rt=qy.avg_response_ms?(qy.avg_response_ms/1000).toFixed(1)+"s":"—";
+      $("#tQuality").innerHTML=
+        qualityCard("Conversations",fmtNum(qy.conversations))+
+        qualityCard("Assistant msgs",fmtNum(qy.messages))+
+        qualityCard("Grounded",gr,qy.grounded_rate!=null&&qy.grounded_rate<80?"#fbbf24":"#34d399")+
+        qualityCard("Avg response",rt)+
+        qualityCard("👍 Helpful",fmtNum(qy.thumbs_up),"#34d399")+
+        qualityCard("👎 Not helpful",fmtNum(qy.thumbs_down),qy.thumbs_down>0?"#fb7185":"var(--text)");
+      // disliked
+      $("#tDisliked").innerHTML=qy.top_disliked.length?qy.top_disliked.map(function(x){
+        return '<div style="padding:12px 0;border-bottom:1px solid var(--border)">'+
+          '<div style="font-weight:600;font-size:14px">'+esc(x.question||"(no question captured)")+'</div>'+
+          '<div class="muted" style="font-size:13px;margin-top:4px">'+esc(x.answer||"")+'</div>'+
+          '<div class="faint" style="font-size:11px;margin-top:4px">'+esc((x.at||"").slice(0,16).replace("T"," "))+'</div></div>';
+      }).join(""):'<div class="muted" style="font-size:13px">No thumbs-down feedback in range. 🎉</div>';
+    }).catch(function(e){
+      $("#loader").classList.add("hidden");
+      if(e&&e.code===403)showLogin("Session expired. Re-enter the operator key.");
+    });
+  }
+
+  // ── events ─────────────────────────────────────────────────────────────────
+  $("#loginBtn").addEventListener("click",function(){var k=$("#keyInput").value.trim();if(k)attemptLogin(k);});
+  $("#keyInput").addEventListener("keydown",function(e){if(e.key==="Enter"){var k=e.target.value.trim();if(k)attemptLogin(k);}});
+  $("#logoutBtn").addEventListener("click",function(){sessionStorage.removeItem(KEY_STORE);state.key="";state.tenants=[];showLogin();});
+  $("#backBtn").addEventListener("click",function(){
+    $("#view-tenant").classList.add("hidden");$("#view-overview").classList.remove("hidden");
+    window.scrollTo({top:0,behavior:"smooth"});
+  });
+  $("#refreshBtn").addEventListener("click",function(){reload();});
+  $("#tenantSearch").addEventListener("input",renderTenantRows);
+  Array.prototype.forEach.call(document.querySelectorAll("#daysSeg button"),function(b){
+    b.addEventListener("click",function(){
+      Array.prototype.forEach.call(document.querySelectorAll("#daysSeg button"),function(x){x.classList.remove("on");});
+      b.classList.add("on");state.days=+b.dataset.d;reload();
+    });
+  });
+  function reload(){
+    $("#view-tenant").classList.add("hidden");
+    $("#view-overview").classList.add("hidden");
+    $("#loader").classList.remove("hidden");
+    api("/api/operator/overview?days="+state.days).then(function(d){renderOverview(d);loadTenants();})
+      .catch(function(e){$("#loader").classList.add("hidden");if(e&&e.code===403)showLogin("Session expired.");});
+  }
+
+  // ── boot ─────────────────────────────────────────────────────────────────
+  if(state.key){$("#login").classList.add("hidden");$("#app").classList.remove("hidden");
+    attemptLogin(state.key);}
+  else{showLogin();}
+})();
+</script>
+</body>
+</html>

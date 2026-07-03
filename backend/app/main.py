@@ -10,6 +10,7 @@ from backend.app.routers import (
     ingest,
     magento,
     onboarding,
+    operator,
     search,
     sync,
     token_usage,
@@ -49,6 +50,10 @@ app.include_router(token_usage.router, prefix="/api")
 app.include_router(magento.router, prefix="/api")
 app.include_router(chatbot.router, prefix="/api")
 app.include_router(onboarding.router)
+# Operator analytics + cost console (Phase 4.4 + 4.5). Serves the HTML at
+# /operator (shell only, no data) and gated JSON at /api/operator/* behind
+# the X-Operator-Key header. No prefix — paths are absolute in the router.
+app.include_router(operator.router)
 
 # Magento chatbot backend — now pure retrieval.
 # All routing / agent dispatch happens on the Magento side; this backend only
