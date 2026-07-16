@@ -480,6 +480,13 @@ def format_product(
         # Increased from 600 → 2000 chars so product descriptions are not silently truncated.
         parts.append(f"Description: {long_desc}")
 
+    # Merchant-authored per-product guidance. Backed by a hidden product
+    # attribute on the Magento side (aiqa_merchant_info) — authoritative notes
+    # the store wants the AI to use when answering about this specific product.
+    merchant_info = html_to_structured_text(product.get("merchant_info") or "")
+    if merchant_info:
+        parts.append(f"Merchant note: {merchant_info}")
+
     # ── Product type + configurable children ─────────────────────────────────
     meta = product.get("metadata") if isinstance(product.get("metadata"), dict) else {}
     type_id = str(
@@ -600,6 +607,10 @@ def format_product(
     # per attribute value. Set AFTER update() so a merchant attribute can't
     # collide with / clobber it via **attr_map.
     payload["attribute_facets"] = sorted(set(facet_tokens))
+
+    # Authoritative merchant guidance (see the embedding block above). Set after
+    # update() so a merchant attribute of the same name can't clobber it.
+    payload["merchant_info"] = merchant_info[:4000]
 
     embedded_text = _final_clean("\n".join(p for p in parts if p))
     return embedded_text, payload
