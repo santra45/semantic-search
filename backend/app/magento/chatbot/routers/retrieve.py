@@ -2129,6 +2129,12 @@ def _format_product_source_compact(s: dict, title: str) -> str:
         currency = s.get("currency") or ""
         parts.append(f"Price: {price} {currency}".strip())
 
+    # Merchant-authored guidance still comes through even in compact mode —
+    # it's authoritative store notes, capped tighter than the full renderer.
+    merchant_info = s.get("merchant_info")
+    if merchant_info:
+        parts.append(f"Merchant note (authoritative): {str(merchant_info)[:600]}")
+
     # Short description, capped tight. Prefer the explicit short_description
     # field, then summary, then the first 200 chars of full description.
     short = (
