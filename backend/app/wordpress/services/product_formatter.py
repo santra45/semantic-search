@@ -329,6 +329,68 @@ def _resolve_tags(value: Any) -> str:
     return ""
 
 
+# ── Custom fields ────────────────────────────────────────────────────────────
+#
+# Merchant-defined product fields — Advanced Custom Fields on most WooCommerce
+# stores. Fabric composition, tog rating, wattage, care instructions: the
+# specifics shoppers ask about, which live neither in the description nor in a
+# WooCommerce attribute.
+#
+# They are NOT folded into `attributes`, even though that would be less code and
+# would reach the prompt for free. Attributes feed two things custom fields have
+# no business in: `attribute_facets`, which drives exact-match filtering, and the
+# attribute vocabulary the query parser learns from. Both want short enumerable
+# option values — "blue", "cotton", "XL". A paragraph of care instructions in
+# that vocabulary degrades query parsing for every search the tenant runs, and
+# facets keyed on a sentence match nothing by definition.
+#
+# Caps mirror the plugin's own. The plugin has already applied them, so this is
+# not defence against a merchant — it is defence against a hand-rolled POST to
+# a public endpoint, where an uncapped field would land a multi-megabyte string
+# in a Qdrant payload that is read on every answer.
+
+_MAX_CUSTOM_FIELDS = 40
+_MAX_CUSTOM_FIELD_CHARS = 1200
+_MAX_CUSTOM_FIELD_LABEL_CHARS = 120
+
+
+def _resolve_custom_fields(value: Any) -> list[Dict[str, str]]:
+    """Normalise the plugin's `custom_fields` into `[{label, value}, ...]`.
+
+    Values go through the same HTML reader as descriptions: a wysiwyg field
+    holds real markup, and a spec table in one is exactly the shape that reader
+    turns into "Material: Rattan" rather than two adjacent words.
+    """
+    if isinstance(value, dict):
+        # Tolerated for anyone posting to this endpoint by hand.
+        value = [{"label": k, "value": v} for k, v in value.items()]
+    if not isinstance(value, list):
+        return []
+
+    out: list[Dict[str, str]] = []
+    for item in value[:_MAX_CUSTOM_FIELDS]:
+        if not isinstance(item, dict):
+            continue
+
+        label = str(item.get("label") or item.get("key") or "").strip()
+        raw = item.get("value")
+        if isinstance(raw, bool):
+            raw = "Yes" if raw else "No"
+        elif isinstance(raw, (list, tuple)):
+            raw = ", ".join(str(v).strip() for v in raw if str(v).strip())
+
+        text = html_to_structured_text(str(raw)) if raw not in (None, "") else ""
+        if not label or not text:
+            continue
+
+        out.append({
+            "label": label[:_MAX_CUSTOM_FIELD_LABEL_CHARS],
+            "value": text[:_MAX_CUSTOM_FIELD_CHARS],
+        })
+
+    return out
+
+
 def _resolve_image(value: Any) -> str:
     if isinstance(value, list) and value:
         first = value[0]
@@ -497,6 +559,13 @@ def format_product(
     if merchant_info:
         parts.append(f"Merchant note: {merchant_info}")
 
+    # Custom fields are embedded under the merchant's OWN label — "Tog rating"
+    # rather than `tog_rating` — because the label is the wording their shoppers
+    # read on the product page, and therefore the wording they ask questions in.
+    custom_fields = _resolve_custom_fields(product.get("custom_fields"))
+    for field in custom_fields:
+        parts.append(f"{field['label']}: {field['value']}")
+
     # WooCommerce product types: simple | variable | grouped | external.
     # Kept verbatim rather than mapped onto Magento's vocabulary — the value
     # is rendered into the prompt, and telling a Woo merchant's assistant the
@@ -599,6 +668,7 @@ def format_product(
     # **attr_map. Unlikely, but the failure would be invisible.
     payload["attribute_facets"] = sorted(set(facet_tokens))
     payload["merchant_info"] = merchant_info[:4000]
+    payload["custom_fields"] = custom_fields
 
     # Format marker.
     #

@@ -116,7 +116,7 @@ _KNOWN_PRODUCT_FIELDS = frozenset({
     "score", "product_id", "page_id", "post_id", "value", "label", "key",
     "identifier", "status", "meta_description", "updated_at",
     "brand", "gender", "dimensions",
-    "merchant_info",
+    "merchant_info", "custom_fields",
 })
 
 
@@ -145,6 +145,41 @@ def _extract_attribute_lines(source: dict) -> list[str]:
             continue
         label = key.replace("_", " ").strip().title()
         lines.append(f"  - {label}: {text}")
+    return lines
+
+
+def _extract_custom_field_lines(source: dict) -> list[str]:
+    """Render the merchant's own product fields — ACF and equivalents.
+
+    Rendered separately from the attribute block rather than merged into it,
+    for one reason that matters: `_extract_attribute_lines` drops any value
+    over 200 characters, and custom fields are where the LONG merchant-authored
+    content lives — care instructions, warranty terms, fabric composition,
+    assembly notes. Those are precisely the questions the widget exists to
+    answer, and routing them through the attribute path would silently discard
+    the useful half of them while keeping the one-word ones.
+
+    The label is the merchant's own, straight from their field group, so the
+    prompt reads in the store's vocabulary rather than in database keys.
+    """
+    raw = source.get("custom_fields")
+    if not isinstance(raw, list):
+        return []
+
+    lines: list[str] = []
+    for field in raw[:40]:
+        if not isinstance(field, dict):
+            continue
+        label = str(field.get("label") or field.get("key") or "").strip()
+        value = str(field.get("value") or "").strip()
+        if not label or not value:
+            continue
+        # A wysiwyg field arrives as paragraphs and bullet lines. Indenting the
+        # continuation keeps the whole value attached to its label — otherwise
+        # everything after the first line reads as unattributed prose sitting
+        # at the same level as the next field's name.
+        body = value[:1200].replace("\n", "\n    ")
+        lines.append(f"  - {label}: {body}")
     return lines
 
 
@@ -184,6 +219,10 @@ def format_product_source(source: dict, title: str) -> str:
             "Merchant guidance (authoritative notes from the store about this "
             f"product — prioritise these when answering): {str(merchant_info)[:4000]}"
         )
+
+    custom_field_lines = _extract_custom_field_lines(source)
+    if custom_field_lines:
+        parts.append("Product details:\n" + "\n".join(custom_field_lines))
 
     attribute_lines = _extract_attribute_lines(source)
     if attribute_lines:
