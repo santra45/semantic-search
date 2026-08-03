@@ -9,7 +9,13 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from backend.app.services.embedder import embed_document
-from backend.app.services.qdrant_service import upsert_product, delete_product, get_client_product_count, product_exists
+from backend.app.services.qdrant_service import (
+    upsert_product,
+    delete_product,
+    get_client_product_count,
+    product_exists,
+    retrieve_content_by_entity_ids,
+)
 from backend.app.services.cache_service import invalidate_client_results
 from backend.app.services.license_service import increment_ingest_count, validate_license_key, get_client_license
 from backend.app.services.database import get_db
@@ -23,6 +29,40 @@ def verify_signature(body: bytes, signature: str, secret: str) -> bool:
     mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256)
     expected = base64.b64encode(mac.digest()).decode("utf-8")
     return hmac.compare_digest(expected, signature)
+
+def _is_managed_by_product_qa(client_id: str, domain: str, product_id: str) -> bool:
+    """Is this product's point owned by the AI Product Q&A plugin?
+
+    Both WooCommerce plugins resolve the same per-tenant collection from the
+    same licence, and a product's point id is derived from
+    (client_id, content_type, product_id) — so they write to the SAME record.
+    This webhook carries the thin search payload (name, price, permalink,
+    categories); AI Product Q&A carries the full product including attributes,
+    variations and the merchant's own notes.
+
+    Overwriting the second with the first is a silent downgrade: search keeps
+    working, and "what sizes does this come in" starts answering "I don't have
+    that information" with nothing logged anywhere to explain it. So when the
+    marker is present, this webhook stands down.
+
+    Fails OPEN. If the lookup errors, indexing something is better than
+    indexing nothing — a store running only this plugin must never stop
+    syncing because a Qdrant read hiccuped.
+    """
+    try:
+        hits = retrieve_content_by_entity_ids(
+            client_id=client_id,
+            domain=domain,
+            entity_ids=[product_id],
+            content_types=["product"],
+            limit=1,
+        )
+    except Exception as exc:
+        print(f"⚠️  ownership check failed for {product_id}: {exc} — proceeding")
+        return False
+
+    return bool(hits) and str(hits[0].get("managed_by") or "") == "aipqa"
+
 
 def process_upsert(product: dict, action: str, client_id: str, db: Session, license_data: dict = None, llm_api_key_encrypted: str = None) -> dict:
     """
@@ -47,6 +87,13 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session, lice
     current_count = get_client_product_count(client_id, license_data["domain"])
 
     exists = product_exists(client_id, license_data["domain"], product_id)
+
+    # Stand down if AI Product Q&A owns this point — see the helper above.
+    # Checked before the embed so a deferred store isn't paying for embeddings
+    # it then throws away.
+    if exists and _is_managed_by_product_qa(client_id, license_data["domain"], product_id):
+        print(f"⏭️  Webhook [{action}]: {product_id} is managed by AI Product Q&A — not overwriting")
+        return {"status": "skipped", "reason": "managed_by_product_qa", "product_id": product_id}
 
     # Only block NEW products
     if not exists and current_count >= license_data["product_limit"]:

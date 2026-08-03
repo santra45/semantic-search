@@ -1,0 +1,639 @@
+"""WooCommerce content formatter — (embedding_text, qdrant_payload) pairs.
+
+Two content types, which is all this module syncs: `product` and `faq`.
+
+THE PAYLOAD CONTRACT IS NOT LOCAL. The shared Qdrant helpers in
+`backend.app.services.qdrant_service` build their filters against specific
+payload keys — `sku`, `price`, `stock_status`, `store_code`, `content_type`,
+`attribute_facets`, `category_ids`. Rename or drop one of those here and
+filtering silently returns the wrong subset rather than erroring. The key
+names below are therefore fixed by that contract, even where a more natural
+WooCommerce name exists (a WC "variation" is stored under `children`).
+
+Slugging goes through the canonical `backend.app.utils.slug` for the same
+reason: sync-time payload keys must match runtime filter keys exactly. That
+one function is shared with every other platform on purpose — a WordPress-local
+copy that drifted by one character would break attribute filtering with no
+error anywhere.
+"""
+
+from __future__ import annotations
+
+import html as html_mod
+import re
+from typing import Any, Dict, Iterable, Optional, Tuple
+
+from backend.app.utils.slug import slug
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+    _HAS_BS4 = True
+except Exception:  # pragma: no cover
+    _HAS_BS4 = False
+
+
+# Stamped onto every product this module writes, and read by the legacy
+# WooCommerce webhook handler so it can decline to overwrite a rich point with
+# a thin one. See the `managed_by` block in format_product below.
+MANAGED_BY = "aipqa"
+
+
+# ── HTML + shortcode cleaning ────────────────────────────────────────────────
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
+_NEWLINES_RE = re.compile(r"\n{3,}")
+
+# WordPress shortcodes — `[product_page id="99"]`, `[contact-form-7 ...]`,
+# `[/vc_column]`. The WordPress analogue of Magento's `{{block ...}}`
+# directives, and the same hazard: the plugin renders what it can via
+# do_shortcode() before sending, but a shortcode from a deactivated plugin
+# doesn't render, it just sits there as literal text. Embedding
+# "[vc_row][vc_column width=1/2]" teaches the vector nothing and pollutes
+# every answer that quotes the description.
+#
+# Deliberately narrow: requires a letter/underscore/slash start so ordinary
+# bracketed prose ("[see fig. 2]", "[sic]") survives, and refuses to span
+# newlines so an unclosed bracket can't eat the rest of a description.
+_SHORTCODE_RE = re.compile(r"\[/?[a-zA-Z_][^\]\n]*\]")
+
+
+def _final_clean(text: str) -> str:
+    """Guarantee no HTML tags, raw entities, or shortcodes survive."""
+    if not text:
+        return ""
+    text = html_mod.unescape(text)
+    text = _TAG_RE.sub(" ", text)
+    text = _SHORTCODE_RE.sub(" ", text)
+    text = _WHITESPACE_RE.sub(" ", text)
+    text = _NEWLINES_RE.sub("\n\n", text)
+    return text.strip()
+
+
+def html_to_structured_text(html: str) -> str:
+    """Strip HTML while preserving the structure that carries meaning.
+
+    Product descriptions in WooCommerce are overwhelmingly spec tables and
+    bullet lists — flattening them with a plain tag-strip turns
+    "<tr><td>Material</td><td>Rattan</td></tr>" into "Material Rattan", which
+    reads as two unrelated words to the embedder. Rendering it as
+    "Material: Rattan" keeps the pairing intact, and that pairing is what
+    answers "what's it made of".
+    """
+    if not html:
+        return ""
+
+    html = _SHORTCODE_RE.sub(" ", html)
+
+    if not _HAS_BS4:
+        return _final_clean(html)
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    parts: list[str] = []
+    for p in soup.find_all("p"):
+        text = p.get_text(" ", strip=True)
+        if text:
+            parts.append(text)
+    for group in soup.find_all(["ul", "ol"]):
+        for li in group.find_all("li"):
+            text = li.get_text(" ", strip=True)
+            if text:
+                parts.append(f"- {text}")
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in row.find_all(["th", "td"])]
+            if len(cells) == 2:
+                parts.append(f"{cells[0]}: {cells[1]}")
+            elif cells:
+                parts.append(" | ".join(cells))
+
+    if not parts:
+        parts.append(soup.get_text(" ", strip=True))
+    return _final_clean("\n".join(parts))
+
+
+# ── Shortcode expansion (apparel sizes, child ages) ──────────────────────────
+#
+# "M" on its own is a near-useless embedding token — it collides with every
+# other single letter in vector space. Expanding it to "M medium" gives the
+# embedder a real word to anchor on, so "do you have this in medium?" matches.
+
+_COMMON_EXPANSIONS = {
+    "XS": "XS extra small", "S": "S small", "M": "M medium", "L": "L large",
+    "XL": "XL extra large", "XXL": "XXL double extra large",
+    "XXXL": "XXXL triple extra large", "3XL": "3XL triple extra large",
+    "4XL": "4XL quadruple extra large",
+    "0-6M": "age 0 to 6 months infant", "6-12M": "age 6 to 12 months infant",
+    "1-2Y": "age 1 to 2 years toddler", "2-3Y": "age 2 to 3 years toddler",
+    "3-4Y": "age 3 to 4 years", "4-5Y": "age 4 to 5 years",
+    "5-6Y": "age 5 to 6 years", "6-7Y": "age 6 to 7 years",
+    "7-8Y": "age 7 to 8 years", "8-9Y": "age 8 to 9 years",
+    "9-10Y": "age 9 to 10 years",
+}
+
+
+def _expand(value: str) -> str:
+    return _COMMON_EXPANSIONS.get((value or "").strip(), (value or "").strip())
+
+
+def _expand_options(options: Iterable[str]) -> str:
+    return ", ".join(_expand(o) for o in options if str(o or "").strip())
+
+
+def _price_bucket(price: float) -> str:
+    """Coarse affordability band, embedded as words so "something cheap"
+    has something to match against."""
+    if price <= 0:
+        return ""
+    if price < 500:
+        return "very cheap budget"
+    if price < 2000:
+        return "budget affordable"
+    if price < 10000:
+        return "mid range"
+    if price < 50000:
+        return "premium"
+    return "luxury high end"
+
+
+# ── Gender detection ─────────────────────────────────────────────────────────
+
+_GENDER_PATTERNS = [
+    ("women", re.compile(r"\b(women|womens|women[' ]?s|ladies|lady|female)\b", re.I)),
+    ("men",   re.compile(r"\b(men|mens|men[' ]?s|male|gentlemen)\b", re.I)),
+    ("girls", re.compile(r"\b(girls?|girls[' ]?)\b", re.I)),
+    ("boys",  re.compile(r"\b(boys?|boys[' ]?)\b", re.I)),
+    ("kids",  re.compile(r"\b(kids?|children|child|infant|baby|babies|toddler)\b", re.I)),
+    ("unisex", re.compile(r"\bunisex\b", re.I)),
+]
+
+
+def _infer_gender(category_paths: list[str], existing_gender: str = "") -> str:
+    """Read gender off the full category breadcrumbs when the merchant hasn't
+    set it explicitly. Full paths, not leaf names — a product filed under
+    "Clothing > Women > Hoodies" is women's even though the leaf says Hoodies.
+    """
+    if existing_gender:
+        return existing_gender
+    blob = " ".join(category_paths or [])
+    if not blob.strip():
+        return ""
+    for label, pattern in _GENDER_PATTERNS:
+        if pattern.search(blob):
+            return label
+    return ""
+
+
+# ── Attributes ───────────────────────────────────────────────────────────────
+
+def _iter_attributes(attributes: Any) -> list[tuple[str, str, list[str]]]:
+    """Normalise WooCommerce attributes into (display_name, code, options).
+
+    The plugin sends the list shape — `[{name, code, options: [...]}, ...]` —
+    built from WC_Product::get_attributes(). The flat-dict branch is a
+    tolerance for anyone posting to this endpoint by hand.
+
+    `code` is the stable key (pa_colour), `name` the merchant's label
+    (Colour). Keying the payload by code matters: two global attributes can
+    share a display label, and keying by label would silently merge them.
+    """
+    out: list[tuple[str, str, list[str]]] = []
+
+    if isinstance(attributes, list):
+        for attr in attributes:
+            if not isinstance(attr, dict):
+                continue
+            name = (attr.get("name") or attr.get("code") or "").strip()
+            code = (attr.get("code") or attr.get("taxonomy") or name).strip()
+            opts = attr.get("options") or attr.get("value")
+            if isinstance(opts, str):
+                opts = [o.strip() for o in opts.split(",") if o.strip()]
+            if isinstance(opts, (int, float)):
+                opts = [str(opts)]
+            if not name or not opts:
+                continue
+            out.append((name, code, [str(o) for o in opts if str(o).strip()]))
+
+    elif isinstance(attributes, dict):
+        for code, val in attributes.items():
+            if val in (None, "", []):
+                continue
+            if isinstance(val, list):
+                opts = [str(v) for v in val if str(v).strip()]
+            elif isinstance(val, str):
+                opts = [v.strip() for v in val.split(",") if v.strip()]
+            else:
+                opts = [str(val)]
+            if code and opts:
+                out.append((code, code, opts))
+
+    return out
+
+
+def _resolve_categories(
+    product: Dict[str, Any],
+) -> tuple[str, list[tuple[str, str, str]], list[str]]:
+    """Parse product_cat data into (joined_paths, triples, path_strings).
+
+    Preferred shape from the plugin is `[{id, name, path}, ...]` where `path`
+    is the full ancestor breadcrumb. The looser shapes are accepted because
+    they cost three lines and save a support ticket when someone posts to this
+    endpoint from a script.
+    """
+    raw = product.get("categories")
+
+    triples: list[tuple[str, str, str]] = []   # (id, leaf_name, full_path)
+    path_strings: list[str] = []
+
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                cid = str(item.get("id") or "").strip()
+                leaf_name = str(item.get("name") or "").strip()
+                full_path = str(item.get("path") or "").strip()
+                if not full_path and leaf_name:
+                    full_path = leaf_name
+                if cid:
+                    triples.append((cid, leaf_name, full_path))
+                if full_path:
+                    path_strings.append(full_path)
+            elif item not in (None, ""):
+                token = str(item).strip()
+                if token.isdigit():
+                    triples.append((token, "", ""))
+                else:
+                    path_strings.append(token)
+
+    elif isinstance(raw, str) and raw.strip():
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token.isdigit():
+                triples.append((token, "", ""))
+            else:
+                path_strings.append(token)
+
+    return " | ".join(p for p in path_strings if p), triples, path_strings
+
+
+def _resolve_tags(value: Any) -> str:
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, dict):
+                name = item.get("name") or ""
+                if name:
+                    out.append(str(name))
+            elif item:
+                out.append(str(item))
+        return ", ".join(out)
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _resolve_image(value: Any) -> str:
+    if isinstance(value, list) and value:
+        first = value[0]
+        return first.get("src") if isinstance(first, dict) else str(first)
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+# ── Variations ───────────────────────────────────────────────────────────────
+#
+# WooCommerce calls them variations; the payload key is `children` because
+# that's what the shared retrieval formatter reads. Renaming it here would
+# make every variable product look like a simple one at answer time.
+
+def _pull_children(product: Dict[str, Any]) -> list[dict]:
+    for key in ("children", "variations", "variants"):
+        val = product.get(key)
+        if isinstance(val, list) and val:
+            return val
+    return []
+
+
+def _aggregate_variant_attrs(children: list[dict]) -> dict[str, list[str]]:
+    """{attribute_code: [distinct values]} across all variations.
+
+    This is what answers "what sizes does this come in" — the parent product
+    carries no size at all in WooCommerce, only its variations do.
+    """
+    agg: dict[str, set[str]] = {}
+    skip = {"sku", "name", "price", "regular_price", "stock", "stock_status", "image", "image_url"}
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        attributes = child.get("attributes")
+        if isinstance(attributes, dict):
+            for code, value in attributes.items():
+                if not code or code in skip or value in (None, "", []):
+                    continue
+                agg.setdefault(code, set()).add(str(value))
+        else:
+            for code, value in child.items():
+                if code in skip or value in (None, "", []):
+                    continue
+                if not isinstance(value, (str, int, float, bool)):
+                    continue
+                agg.setdefault(code, set()).add(str(value))
+    return {k: sorted(v) for k, v in agg.items()}
+
+
+def _clean_children_for_payload(children: list[dict]) -> list[dict]:
+    """Trim variations to what the answer prompt actually renders. A 60-variant
+    product would otherwise carry a payload larger than its own description."""
+    cleaned: list[dict] = []
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        attributes = child.get("attributes")
+        if isinstance(attributes, dict):
+            attrs = {
+                str(k): str(v)
+                for k, v in attributes.items()
+                if v not in (None, "", []) and isinstance(v, (str, int, float, bool))
+            }
+        else:
+            attrs = {}
+        cleaned.append({
+            "sku": str(child.get("sku") or ""),
+            "name": str(child.get("name") or ""),
+            "price": _to_float(child.get("price")),
+            "regular_price": _to_float(child.get("regular_price") or child.get("price")),
+            "stock_status": str(child.get("stock_status") or "instock"),
+            "attributes": attrs,
+        })
+    return cleaned
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value) if value not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ── Product ──────────────────────────────────────────────────────────────────
+
+def format_product(
+    product: Dict[str, Any],
+    *,
+    attribute_vocab_sink: Optional[Dict[str, set[str]]] = None,
+    category_vocab_sink: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Return (embedding_text, qdrant_payload) for one WooCommerce product.
+
+    The two outputs serve different readers and are shaped differently on
+    purpose. `embedding_text` is prose for the embedder — expanded sizes,
+    price bands, category breadcrumbs, everything that helps a fuzzy question
+    find this product. `payload` is structured data for the answer prompt and
+    the filters — exact values, no expansion.
+    """
+    parts: list[str] = []
+    payload: Dict[str, Any] = {}
+    facet_tokens: list[str] = []
+
+    sku = str(product.get("sku") or "").strip()
+    if sku:
+        parts.append(f"SKU: {sku}")
+    name = str(product.get("name") or product.get("title") or "").strip()
+    if name:
+        parts.append(f"Product: {name}")
+    brand = str(product.get("brand") or "").strip()
+    if brand:
+        parts.append(f"Brand: {brand}")
+
+    cats_str, cat_triples, path_strings = _resolve_categories(product)
+    if cats_str:
+        parts.append(f"Category: {cats_str}")
+
+    gender = _infer_gender(path_strings, str(product.get("gender") or "").strip())
+    if gender:
+        parts.append(f"Gender: {gender}")
+
+    tags_str = _resolve_tags(product.get("tags"))
+    if tags_str:
+        parts.append(f"Tags: {tags_str}")
+
+    # attr_map is keyed by attribute code and merged into the payload flat, so
+    # `pa_colour` becomes a top-level payload field. That flatness is what
+    # `_extract_attribute_lines` on the read side walks to build the
+    # "Attributes:" block in the prompt.
+    attr_map: Dict[str, str] = {}
+    for attr_name, attr_code, options in _iter_attributes(product.get("attributes") or []):
+        key = slug(attr_code)
+        parts.append(f"{attr_name}: {_expand_options(options)}")
+        attr_map[key] = ", ".join(options)
+
+        for raw_value in options:
+            value_key = slug(raw_value)
+            if key and value_key:
+                facet_tokens.append(f"{key}:{value_key}")
+                if attribute_vocab_sink is not None and value_key != "none":
+                    attribute_vocab_sink.setdefault(key, set()).add(value_key)
+
+    for cid, leaf_name, full_path in cat_triples:
+        if not cid or category_vocab_sink is None:
+            continue
+        display_name = leaf_name or (full_path.split(">")[-1].strip() if full_path else "")
+        if display_name:
+            category_vocab_sink[cid] = {
+                "id": cid,
+                "name": slug(display_name),
+                "path": full_path,
+            }
+
+    short = html_to_structured_text(product.get("short_description") or product.get("excerpt") or "")
+    if short:
+        parts.append(f"Summary: {short}")
+    long_desc = html_to_structured_text(product.get("description") or product.get("content") or "")
+    if long_desc:
+        parts.append(f"Description: {long_desc}")
+
+    # Merchant-authored notes for this specific product, from the plugin's
+    # hidden post meta. Authoritative — the answer prompt is told to weight it
+    # above its own inference from the description.
+    merchant_info = html_to_structured_text(product.get("merchant_info") or "")
+    if merchant_info:
+        parts.append(f"Merchant note: {merchant_info}")
+
+    # WooCommerce product types: simple | variable | grouped | external.
+    # Kept verbatim rather than mapped onto Magento's vocabulary — the value
+    # is rendered into the prompt, and telling a Woo merchant's assistant the
+    # product is "configurable" would be a word from the wrong platform.
+    type_id = str(product.get("type_id") or product.get("product_type") or "simple").strip().lower()
+    children = _pull_children(product)
+    variant_attrs = _aggregate_variant_attrs(children) if children else {}
+    has_variants = bool(children)
+    is_configurable = type_id == "variable" or has_variants
+
+    if type_id:
+        parts.append(f"Product type: {type_id}")
+
+    if variant_attrs:
+        summary_chunks: list[str] = []
+        child_skus: list[str] = []
+        for attr_code, values in variant_attrs.items():
+            key = slug(attr_code)
+            if not key:
+                continue
+            readable = ", ".join(v for v in values if v)
+            summary_chunks.append(f"{attr_code.replace('_', ' ').title()}: {readable}")
+            # Only fill a gap — never overwrite a parent-level attribute with
+            # the aggregate of its variations.
+            if readable and key not in attr_map:
+                attr_map[key] = readable
+            for raw_value in values:
+                value_key = slug(raw_value)
+                if value_key:
+                    facet_tokens.append(f"{key}:{value_key}")
+                    if attribute_vocab_sink is not None and value_key != "none":
+                        attribute_vocab_sink.setdefault(key, set()).add(value_key)
+
+        for ch in children:
+            if isinstance(ch, dict) and ch.get("sku"):
+                child_skus.append(str(ch["sku"]))
+
+        if summary_chunks:
+            parts.append("Available variants: " + " | ".join(summary_chunks))
+        if child_skus:
+            parts.append("Variant SKUs: " + ", ".join(child_skus[:60]))
+
+    price_val = _to_float(product.get("price"))
+    if price_val > 0:
+        currency = product.get("currency") or ""
+        symbol = html_mod.unescape(product.get("currency_symbol") or "")
+        price_str = str(int(price_val)) if price_val.is_integer() else str(price_val)
+        parts.append(f"Price: {symbol}{price_str} {currency}. Budget level: {_price_bucket(price_val)}")
+
+    # Weight is a readable spec, never a facet — it's continuous, and exact-match
+    # faceting on "1.5" would be useless.
+    weight_val = _to_float(product.get("weight"))
+    weight_unit = str(product.get("weight_unit") or "kg").strip() if weight_val > 0 else ""
+    if weight_val > 0:
+        weight_str = str(int(weight_val)) if weight_val.is_integer() else str(weight_val)
+        parts.append(f"Weight: {weight_str} {weight_unit}")
+
+    dimensions = str(product.get("dimensions") or "").strip()
+    if dimensions:
+        parts.append(f"Dimensions: {dimensions}")
+
+    payload.update(
+        {
+            "sku": sku,
+            "brand": brand,
+            "gender": gender,
+            "name": name,
+            "permalink": product.get("permalink") or "",
+            "price": price_val,
+            "currency": product.get("currency") or "",
+            "regular_price": _to_float(product.get("regular_price")) or price_val,
+            "sale_price": _to_float(product.get("sale_price")),
+            "on_sale": bool(product.get("on_sale", False)),
+            "weight": weight_val if weight_val > 0 else None,
+            "weight_unit": weight_unit or None,
+            "dimensions": dimensions,
+            "categories": cats_str,
+            "category_paths": path_strings,
+            "category_ids": [cid for cid, _, _ in cat_triples],
+            "tags": tags_str,
+            "image_url": _resolve_image(product.get("images") or product.get("image_url") or ""),
+            "stock_status": product.get("stock_status") or "instock",
+            "average_rating": _to_float(product.get("average_rating")),
+            "type_id": type_id,
+            "is_configurable": is_configurable,
+            "has_variants": has_variants,
+            "variant_attributes": variant_attrs,
+            "short_description": short[:600],
+            "description": long_desc[:2000],
+            "children": _clean_children_for_payload(children),
+            "child_skus": ",".join(
+                str(c.get("sku")) for c in children if isinstance(c, dict) and c.get("sku")
+            ),
+            **attr_map,
+        }
+    )
+
+    # Set AFTER the update() so a merchant attribute literally named
+    # "attribute_facets" or "merchant_info" can't clobber either one via
+    # **attr_map. Unlikely, but the failure would be invisible.
+    payload["attribute_facets"] = sorted(set(facet_tokens))
+    payload["merchant_info"] = merchant_info[:4000]
+
+    # Ownership marker.
+    #
+    # A WooCommerce store may also run the legacy search plugin, whose
+    # WooCommerce webhooks post the same product straight to /api/webhook/* on
+    # every save. Same licence, same collection, same point id — but a much
+    # thinner payload (no attributes, no variations, no description). Whichever
+    # write lands second wins, so without a marker a shopper's "what sizes does
+    # this come in" starts failing at random with nothing logged anywhere.
+    #
+    # The webhook handler reads this field and declines to overwrite a point
+    # that carries it. See routers/webhooks.py::_is_managed_by_product_qa.
+    payload["managed_by"] = MANAGED_BY
+
+    return _final_clean("\n".join(p for p in parts if p)), payload
+
+
+# ── FAQ ──────────────────────────────────────────────────────────────────────
+
+def format_faq_chunkable(faq: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    """(header, body, base_payload) for one merchant FAQ entry.
+
+    The header is repeated onto every chunk's embedding by the sync router, so
+    a chunk from the middle of a long returns policy still knows it's about
+    returns. `content` is deliberately absent from the payload — the router
+    sets it per chunk.
+    """
+    title = str(faq.get("title") or "").strip()
+    content = html_to_structured_text(faq.get("content") or "")
+
+    header_text = _final_clean(f"FAQ: {title}") if title else ""
+
+    return header_text, content, {
+        "title": title,
+        "summary": content[:300],
+        "status": "active",
+    }
+
+
+def format_faq(faq: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Single-point variant, for the non-chunked fallback path."""
+    header, body, payload = format_faq_chunkable(faq)
+    payload["content"] = body
+    text = f"{header}\nContent: {body}" if header else body
+    return _final_clean(text), payload
+
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+
+SUPPORTED_TYPES = {"product", "faq"}
+
+
+def format_item(
+    content_type: str,
+    item: Dict[str, Any],
+    *,
+    attribute_vocab_sink: Optional[Dict[str, set[str]]] = None,
+    category_vocab_sink: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Route to the right formatter. Only the two types this module syncs are
+    supported — the router rejects anything else before reaching here, so an
+    unknown type arriving is a bug rather than a merchant misconfiguration."""
+    if content_type == "product":
+        return format_product(
+            item,
+            attribute_vocab_sink=attribute_vocab_sink,
+            category_vocab_sink=category_vocab_sink,
+        )
+    if content_type == "faq":
+        return format_faq(item)
+    raise ValueError(f"Unsupported content_type for WordPress sync: {content_type!r}")

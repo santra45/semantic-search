@@ -24,6 +24,10 @@ from backend.app.magento.chatbot.routers import (
     classify as magento_chatbot_classify,
     agent as magento_chatbot_agent,
 )
+from backend.app.wordpress.productqa.routers import (
+    retrieve as wordpress_productqa_retrieve,
+    sync as wordpress_productqa_sync,
+)
 
 app = FastAPI(
     title="Semantic Search API",
@@ -66,6 +70,15 @@ app.include_router(magento_chatbot_classify.router, prefix="/api")
 # Phase 3.1 — tool-calling intent router. Sits alongside /classify;
 # Magento side picks which to call based on aichatbot/llm/tool_calling_mode.
 app.include_router(magento_chatbot_agent.router, prefix="/api")
+
+# WooCommerce per-product Q&A — the `ai-product-qa-woo` plugin.
+# Kept in its own package rather than folded into the Magento routers above:
+# the platforms disagree on the product lookup key (WooCommerce products often
+# have no SKU, so lookups go by post ID) and the answer prompt should be
+# tunable for one storefront without moving the other. Shared infrastructure
+# (Qdrant, embeddings, licensing, token accounting) is still shared.
+app.include_router(wordpress_productqa_retrieve.router, prefix="/api")
+app.include_router(wordpress_productqa_sync.router, prefix="/api")
 
 @app.get("/")
 def root():
