@@ -228,6 +228,15 @@ MODEL_PRICING = {
     # ── Groq ──────────────────────────────────────────────────────────────────
     "llama-3.3-70b-versatile":   {"input": 0.00000059,   "output": 0.00000079},
     "llama-3.1-8b-instant":      {"input": 0.00000005,   "output": 0.00000008},
+    # Llama 4 is listed under both spellings on purpose. Groq's own model ids
+    # carry the `meta-llama/` publisher prefix; the Magento dropdown offers the
+    # bare form. Pricing keys off whatever string the caller sends, so both are
+    # here — otherwise correcting the dropdown would silently zero the cost
+    # again.
+    "llama-4-scout-17b-16e-instruct":               {"input": 0.00000011, "output": 0.00000034},
+    "llama-4-maverick-17b-128e-instruct":           {"input": 0.0000002,  "output": 0.0000006},
+    "meta-llama/llama-4-scout-17b-16e-instruct":    {"input": 0.00000011, "output": 0.00000034},
+    "meta-llama/llama-4-maverick-17b-128e-instruct": {"input": 0.0000002, "output": 0.0000006},
 }
 
 # Models already reported as unpriced. Without this every request on an unknown
