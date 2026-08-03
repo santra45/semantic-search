@@ -10,6 +10,7 @@ import tiktoken
 
 from google import genai
 from openai import OpenAI
+from groq import Groq
 import anthropic
 from backend.app.services.token_usage_service import track_usage
 from backend.app.utils.llm_logger import log_llm_interaction
@@ -134,7 +135,7 @@ def estimate_tokens(text: str) -> int:
 # ---------------------------
 def get_token_usage(provider, response, prompt, response_text):
     try:
-        if provider == "openai":
+        if provider in ("openai", "groq"):
             usage = response.usage
             return {
                 "input": usage.prompt_tokens,
@@ -193,12 +194,20 @@ def get_token_usage(provider, response, prompt, response_text):
 # ---------------------------
 # Optional: Cost calculation
 # ---------------------------
+#
+# USD per token. A model missing from here costs zero everywhere it is used —
+# every usage row, every dashboard total — with no error, so any model a
+# merchant can select needs an entry. `price_usage()` logs the gaps.
 MODEL_PRICING = {
     # ── Gemini ────────────────────────────────────────────────────────────────
     "gemini-3.1-pro-preview":    {"input": 0.000002,     "output": 0.000012},
     "gemini-2.5-pro":            {"input": 0.00000125,   "output": 0.00001},
     "gemini-2.5-flash":          {"input": 0.0000003,    "output": 0.0000025},
     "gemini-2.5-flash-lite":     {"input": 0.0000001,    "output": 0.0000004},
+    # 2.0 Flash Lite is CHAT_LLM_MODEL's default, so it prices every request
+    # from an integration left on "use the service default".
+    "gemini-2.0-flash":          {"input": 0.0000001,    "output": 0.0000004},
+    "gemini-2.0-flash-lite":     {"input": 0.000000075,  "output": 0.0000003},
     "gemma-3-27b-it":            {"input": 0.00000008,   "output": 0.00000016},
     "gemma-4-31b-it":            {"input": 0.00000013,   "output": 0.00000038},
 
@@ -207,22 +216,52 @@ MODEL_PRICING = {
     "gpt-5.4-mini":              {"input": 0.00000075,   "output": 0.0000045},
     "gpt-5.4-nano":              {"input": 0.0000002,    "output": 0.00000125},
     "gpt-5.2":                   {"input": 0.00000175,   "output": 0.000014},
+    # build_llm's fallback when a caller picks OpenAI without naming a model.
+    "gpt-4o-mini":               {"input": 0.00000015,   "output": 0.0000006},
 
     # ── Anthropic ─────────────────────────────────────────────────────────────
     "claude-opus-4-6":           {"input": 0.000005,     "output": 0.000025},
     "claude-sonnet-4-6":         {"input": 0.000003,     "output": 0.000015},
     "claude-haiku-4-5-20251001": {"input": 0.000001,     "output": 0.000005},
     "claude-3-5-sonnet-20241022":{"input": 0.000003,     "output": 0.000015},
+
+    # ── Groq ──────────────────────────────────────────────────────────────────
+    "llama-3.3-70b-versatile":   {"input": 0.00000059,   "output": 0.00000079},
+    "llama-3.1-8b-instant":      {"input": 0.00000005,   "output": 0.00000008},
 }
 
-def estimate_cost(model: str, usage: Dict) -> float:
+# Models already reported as unpriced. Without this every request on an unknown
+# model writes a log line, which turns a configuration gap into log spam and
+# gets the warning filtered out — the opposite of the point.
+_UNPRICED_MODELS_SEEN: set = set()
+
+
+def price_usage(model: str, input_tokens: int, output_tokens: int) -> Tuple[float, float]:
+    """Split cost for one call, as (input_cost, output_cost).
+
+    Returns zeros for a model that isn't in the table — the alternative is
+    failing a request over a missing price — but says so once per model, so
+    "the dashboard shows $0.0000" is traceable to its cause instead of looking
+    like the tracking is broken.
+    """
     pricing = MODEL_PRICING.get(model)
     if not pricing:
-        return 0.0
+        if model not in _UNPRICED_MODELS_SEEN:
+            _UNPRICED_MODELS_SEEN.add(model)
+            logger.warning(
+                "No MODEL_PRICING entry for %r — usage for this model will be "
+                "recorded with zero cost. Add it to MODEL_PRICING.", model
+            )
+        return 0.0, 0.0
     return (
-        usage["input"] * pricing["input"] +
-        usage["output"] * pricing["output"]
+        input_tokens * pricing["input"],
+        output_tokens * pricing["output"],
     )
+
+
+def estimate_cost(model: str, usage: Dict) -> float:
+    input_cost, output_cost = price_usage(model, usage["input"], usage["output"])
+    return input_cost + output_cost
 
 
 # ---------------------------
@@ -367,6 +406,8 @@ def llm_rerank_content(
         model = llm_model or "gpt-4o-mini"
     elif provider == "anthropic":
         model = llm_model or "claude-3-5-haiku-20241022"
+    elif provider == "groq":
+        model = llm_model or "llama-3.3-70b-versatile"
     else:
         model = "gemini-1.5-flash"
 
@@ -545,6 +586,18 @@ def llm_rerank_content(
                 messages=[{"role": "user", "content": prompt}],
             )
             response_text = response.content[0].text.strip()
+
+        # ---------------------------
+        # GROQ
+        # ---------------------------
+        elif provider == "groq":
+            client = Groq(api_key=api_key, http_client=make_http_client())
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            response_text = response.choices[0].message.content.strip()
 
         else:
             return content[:limit]

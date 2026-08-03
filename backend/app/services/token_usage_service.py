@@ -41,6 +41,11 @@ QUERY_TYPES = {
     # Separate query type so admin dashboard can see decomposer cost
     # broken out from classifier and answer-generation buckets.
     'chat_query_decompose': 'chat_query_decompose',
+    # Single-shot grounded answer for the WooCommerce product Q&A widget.
+    # Kept apart from 'chat_answer' because the two have completely different
+    # cost shapes — one product's payload versus a multi-turn conversation
+    # with retrieved context — and averaging them together hides both.
+    'wp_product_qa': 'wp_product_qa',
 }
 
 class TokenUsageTracker:
@@ -83,6 +88,10 @@ class TokenUsageTracker:
             request_id: The unique request ID for this record
         """
         
+        # An allowlist, not a hint: a caller passing an unregistered type gets
+        # nothing written. Add the type to QUERY_TYPES above when you add a new
+        # LLM call site, or its usage is silently invisible — which is exactly
+        # how the WooCommerce Q&A endpoint went unbilled.
         if query_type not in QUERY_TYPES.values():
             raise ValueError(f"Invalid query_type: {query_type}. Must be one of: {list(QUERY_TYPES.values())}")
         
@@ -213,9 +222,15 @@ class TokenUsageTracker:
                     'last_request': row.last_request
                 })
             
-            # Calculate totals across all types
+            # Calculate totals across all types. Input and output are kept
+            # apart as well as summed: they price differently on every provider
+            # (output is 3-10x input), so a single token count can't be turned
+            # back into a cost, and any surface showing "tokens used" wants the
+            # split.
             total_stats = {
                 'total_requests': sum(row['request_count'] for row in stats['usage_by_type']),
+                'total_input_tokens': sum(row['total_input_tokens'] or 0 for row in stats['usage_by_type']),
+                'total_output_tokens': sum(row['total_output_tokens'] or 0 for row in stats['usage_by_type']),
                 'total_tokens': sum(row['total_tokens'] for row in stats['usage_by_type']),
                 'total_cost': sum(row['total_cost'] for row in stats['usage_by_type'])
             }

@@ -260,7 +260,7 @@ def retrieve_answer(
     api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
     client_id = license_data["client_id"]
 
-    from backend.app.magento.chatbot.agents.llm_factory import build_llm
+    from backend.app.magento.chatbot.agents.llm_factory import build_llm, resolve_provider_model
 
     # Low temperature: this answers questions of fact about a product the
     # merchant is legally responsible for describing accurately.
@@ -278,11 +278,17 @@ def retrieve_answer(
         contact=req.contact,
     )
 
-    provider_name = (req.llm_provider or "google").lower()
-    model_name = req.llm_model or "gemini-2.0-flash-lite"
+    # Ask the factory what it built rather than re-deriving it. Most merchants
+    # leave the model on "use the service default", and a locally-guessed
+    # fallback here would file all of their usage under a model that was never
+    # called — priced at zero, since that guess need not be in the pricing
+    # table.
+    provider_name, model_name = resolve_provider_model(req.llm_provider, req.llm_model)
 
     input_tokens = 0
     output_tokens = 0
+    input_cost = 0.0
+    output_cost = 0.0
     answer = ""
 
     with log_llm_call(
@@ -304,10 +310,8 @@ def retrieve_answer(
         output_tokens = int(usage.get("output_tokens", 0) or 0)
         answer = _extract_text(response.content).strip()
 
-        from backend.app.services.llm_rerank_service import MODEL_PRICING
-        pricing = MODEL_PRICING.get(model_name, {})
-        input_cost = input_tokens * pricing.get("input", 0.0)
-        output_cost = output_tokens * pricing.get("output", 0.0)
+        from backend.app.services.llm_rerank_service import price_usage
+        input_cost, output_cost = price_usage(model_name, input_tokens, output_tokens)
 
         log_ctx.record(
             response_text=answer,
@@ -318,7 +322,10 @@ def retrieve_answer(
         )
 
     # Usage accounting must never be the reason an answer fails to reach the
-    # shopper — the LLM call is already paid for by this point.
+    # shopper — the LLM call is already paid for by this point. Swallowed, but
+    # not silently: a bare `except: pass` here is what hid `wp_product_qa`
+    # being rejected as an unregistered query_type, and every answer went
+    # unrecorded for as long as nobody thought to check.
     try:
         TokenUsageTracker(db).create_usage_record(
             client_id=client_id,
@@ -332,8 +339,11 @@ def retrieve_answer(
             request_text_length=len(prompt),
             response_text_length=len(answer),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "wp retrieve/answer usage not recorded for client %s (%s/%s): %s",
+            client_id, provider_name, model_name, exc,
+        )
 
     return {
         "answer": scrub_pii(answer),

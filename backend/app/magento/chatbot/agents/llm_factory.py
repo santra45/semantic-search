@@ -23,7 +23,38 @@ def _normalize_provider(provider: Optional[str]) -> str:
         return "openai"
     if p in ("anthropic", "claude"):
         return "anthropic"
+    if p in ("groq", "llama"):
+        return "groq"
     return "google"
+
+
+# Per-provider fallback when the caller names a provider but no model. Kept as
+# data so resolve_provider_model() and build_llm() cannot disagree about what
+# "the default" is — they used to be separate literals at each call site, and
+# usage rows ended up attributed to a model that was never invoked.
+_DEFAULT_MODELS = {
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-sonnet-4-6",
+    "groq": "llama-3.3-70b-versatile",
+}
+
+
+def resolve_provider_model(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> tuple[str, str]:
+    """The provider and model `build_llm` would actually construct.
+
+    Call sites need this for usage accounting and cost lookup. Recording the
+    request's raw `llm_model` instead means every request that leaves the model
+    on "service default" is filed under whatever literal that call site happened
+    to guess — priced at zero if that name isn't in the pricing table, and
+    misattributed if the deployment sets CHAT_LLM_MODEL to something else.
+    """
+    p = _normalize_provider(provider)
+    if p == "google":
+        return p, model or DEFAULT_LLM_MODEL or "gemini-2.0-flash-lite"
+    return p, model or _DEFAULT_MODELS[p]
 
 
 def build_llm(
@@ -36,13 +67,13 @@ def build_llm(
     """Return a LangChain chat model. Imports are deferred so the backend boots without
     LangChain when no chat request has been served yet (helpful for minimal deployments
     that disable the chatbot)."""
-    p = _normalize_provider(provider)
+    p, resolved_model = resolve_provider_model(provider, model)
 
     if p == "openai":
         from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(
-            model=model or "gpt-4o-mini",
+            model=resolved_model,
             api_key=api_key,
             temperature=temperature,
         )
@@ -51,14 +82,23 @@ def build_llm(
         from langchain_anthropic import ChatAnthropic
 
         return ChatAnthropic(
-            model=model or "claude-sonnet-4-6",
+            model=resolved_model,
             api_key=api_key,
+            temperature=temperature,
+        )
+
+    if p == "groq":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=resolved_model,
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
             temperature=temperature,
         )
 
     from langchain_google_genai import ChatGoogleGenerativeAI
 
-    resolved_model = model or DEFAULT_LLM_MODEL or "gemini-2.0-flash-lite"
     kwargs = {
         "model": resolved_model,
         "google_api_key": api_key or GEMINI_API_KEY,

@@ -115,13 +115,19 @@ def get_my_usage_summary(
         start_date=start_date,
         end_date=end_date,
     )
+    totals = stats.get("totals", {})
     return {
         "success": True,
         "data": {
             "client_id": client["client_id"],
-            "total_requests": stats.get("totals", {}).get("total_requests", 0),
-            "total_tokens": stats.get("totals", {}).get("total_tokens", 0),
-            "total_cost": stats.get("totals", {}).get("total_cost", 0.0),
+            "total_requests": totals.get("total_requests", 0),
+            # Split as well as combined — the integrations' usage panels bill
+            # input and output separately, and deriving one from the other is
+            # not possible from a single figure.
+            "total_input_tokens": totals.get("total_input_tokens", 0),
+            "total_output_tokens": totals.get("total_output_tokens", 0),
+            "total_tokens": totals.get("total_tokens", 0),
+            "total_cost": totals.get("total_cost", 0.0),
             "period": stats.get("period", {}),
         },
     }
