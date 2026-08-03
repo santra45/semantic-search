@@ -21,6 +21,7 @@ from backend.app.services.license_service import increment_ingest_count, validat
 from backend.app.services.database import get_db
 from backend.app.services.product_service import build_product_text, extract_payload  # ← import
 from backend.app.services.llm_key_service import decrypt_key
+from backend.app.wordpress.services.product_formatter import LEGACY_MANAGED_BY, MANAGED_BY
 
 router    = APIRouter()
 
@@ -30,24 +31,30 @@ def verify_signature(body: bytes, signature: str, secret: str) -> bool:
     expected = base64.b64encode(mac.digest()).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
-def _is_managed_by_product_qa(client_id: str, domain: str, product_id: str) -> bool:
-    """Is this product's point owned by the AI Product Q&A plugin?
+def _has_full_woo_payload(client_id: str, domain: str, product_id: str) -> bool:
+    """Was this product's point written by the full WooCommerce formatter?
 
-    Both WooCommerce plugins resolve the same per-tenant collection from the
+    Every WooCommerce writer resolves the same per-tenant collection from the
     same licence, and a product's point id is derived from
-    (client_id, content_type, product_id) — so they write to the SAME record.
-    This webhook carries the thin search payload (name, price, permalink,
-    categories); AI Product Q&A carries the full product including attributes,
-    variations and the merchant's own notes.
+    (client_id, content_type, product_id) — so they all write to the SAME
+    record. Both plugins' PHP syncs now produce identical bytes, so between
+    those two the write order stopped mattering.
 
-    Overwriting the second with the first is a silent downgrade: search keeps
-    working, and "what sizes does this come in" starts answering "I don't have
-    that information" with nothing logged anywhere to explain it. So when the
-    marker is present, this webhook stands down.
+    This webhook is the exception, and it cannot be brought into line. It runs
+    off WooCommerce's REST product object, which carries no variation detail,
+    no merchant notes, and attribute display labels with no taxonomy code — so
+    the attributes it does carry key the payload differently. There is no way
+    to write this path that produces the same point.
+
+    Overwriting the full record with this one is a silent downgrade: search
+    keeps working, and "what sizes does this come in" starts answering "I don't
+    have that information" with nothing logged anywhere to explain it. So when
+    the marker is present, this webhook stands down and lets the plugin's own
+    realtime sync — which posts the full payload — do the update instead.
 
     Fails OPEN. If the lookup errors, indexing something is better than
-    indexing nothing — a store running only this plugin must never stop
-    syncing because a Qdrant read hiccuped.
+    indexing nothing: a store must never stop syncing because a Qdrant read
+    hiccuped.
     """
     try:
         hits = retrieve_content_by_entity_ids(
@@ -58,10 +65,12 @@ def _is_managed_by_product_qa(client_id: str, domain: str, product_id: str) -> b
             limit=1,
         )
     except Exception as exc:
-        print(f"⚠️  ownership check failed for {product_id}: {exc} — proceeding")
+        print(f"⚠️  payload check failed for {product_id}: {exc} — proceeding")
         return False
 
-    return bool(hits) and str(hits[0].get("managed_by") or "") == "aipqa"
+    # Both values accepted: points written before the two formatters were
+    # merged carry the old marker, and they are just as full as the new ones.
+    return bool(hits) and str(hits[0].get("managed_by") or "") in (MANAGED_BY, LEGACY_MANAGED_BY)
 
 
 def process_upsert(product: dict, action: str, client_id: str, db: Session, license_data: dict = None, llm_api_key_encrypted: str = None) -> dict:
@@ -88,12 +97,12 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session, lice
 
     exists = product_exists(client_id, license_data["domain"], product_id)
 
-    # Stand down if AI Product Q&A owns this point — see the helper above.
-    # Checked before the embed so a deferred store isn't paying for embeddings
-    # it then throws away.
-    if exists and _is_managed_by_product_qa(client_id, license_data["domain"], product_id):
-        print(f"⏭️  Webhook [{action}]: {product_id} is managed by AI Product Q&A — not overwriting")
-        return {"status": "skipped", "reason": "managed_by_product_qa", "product_id": product_id}
+    # Stand down if the point already holds the full WooCommerce payload — see
+    # the helper above. Checked before the embed so a store that stands down
+    # isn't paying for embeddings it then throws away.
+    if exists and _has_full_woo_payload(client_id, license_data["domain"], product_id):
+        print(f"⏭️  Webhook [{action}]: {product_id} holds the full payload — not overwriting")
+        return {"status": "skipped", "reason": "full_payload_present", "product_id": product_id}
 
     # Only block NEW products
     if not exists and current_count >= license_data["product_limit"]:

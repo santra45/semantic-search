@@ -53,8 +53,14 @@ from backend.app.magento.chatbot.services.text_chunker import chunk_text
 from backend.app.magento.chatbot.services import vocab_service
 
 from backend.app.wordpress.productqa.services.common import authorize_request, decrypt_llm_key
-from backend.app.wordpress.productqa.services.product_formatter import (
+
+# The product formatter lives one level up, under app/wordpress/services/,
+# because it is shared with the search plugin's sync endpoint — both write to
+# the same Qdrant point for the same product, so both must produce the same
+# bytes. See that module's header.
+from backend.app.wordpress.services.product_formatter import (
     SUPPORTED_TYPES,
+    build_product_point,
     format_faq_chunkable,
     format_item,
 )
@@ -224,18 +230,20 @@ def sync_batch(
             if item.content_type in CHUNKABLE_CONTENT_TYPES:
                 _process_chunkable_item(item, store_code, embedding_api_key, license_data)
             else:
-                text_for_embed, payload = format_item(
-                    item.content_type,
-                    item.payload,
-                    attribute_vocab_sink=(
-                        attribute_vocab_sink if item.content_type == "product" else None
-                    ),
-                    category_vocab_sink=(
-                        category_vocab_sink if item.content_type == "product" else None
-                    ),
-                )
-                payload["embedded_text"] = text_for_embed
-                payload["store_code"] = store_code
+                if item.content_type == "product":
+                    # Shared with routers/sync.py — the search plugin's endpoint
+                    # assembles the identical point through the same call, which
+                    # is what makes it safe for either plugin to write last.
+                    text_for_embed, payload = build_product_point(
+                        item.payload,
+                        store_code=store_code,
+                        attribute_vocab_sink=attribute_vocab_sink,
+                        category_vocab_sink=category_vocab_sink,
+                    )
+                else:
+                    text_for_embed, payload = format_item(item.content_type, item.payload)
+                    payload["embedded_text"] = text_for_embed
+                    payload["store_code"] = store_code
 
                 vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
                 try:

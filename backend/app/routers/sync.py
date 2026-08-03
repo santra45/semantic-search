@@ -1,26 +1,59 @@
 from fastapi import APIRouter, HTTPException, Depends, Request, Header, Query
-from pydantic import BaseModel, Field
-from typing import List, Optional
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, List, Optional
 from sqlalchemy.orm import Session
+import logging
+from collections import defaultdict
 from backend.app.services.embedder import embed_document
-from backend.app.services.qdrant_service import upsert_product, upsert_page, upsert_post, get_client_product_count
+from backend.app.services.sparse_embedder import embed_sparse_document
+from backend.app.services.qdrant_service import upsert_content_item, upsert_page, upsert_post, get_client_product_count
 from backend.app.services.license_service import validate_license_key, increment_ingest_count, extract_license_key_from_authorization
 from backend.app.services.database import get_db
 from backend.app.services.cache_service import invalidate_client_results
-from backend.app.services.product_service import build_product_text, extract_payload, build_page_text, extract_page_payload, build_post_text, extract_post_payload
+from backend.app.services.product_service import build_page_text, extract_page_payload, build_post_text, extract_post_payload
 from backend.app.services.domain_auth_service import DomainAuthorizer
 from backend.app.services.llm_key_service import decrypt_key
+
+# Products go through the SHARED WooCommerce formatter, not the local
+# product_service helpers. Both WooCommerce plugins write to the same Qdrant
+# point for the same product, so both endpoints have to produce the same bytes
+# — see that module's header for what used to break.
+from backend.app.wordpress.services.product_formatter import (
+    DEFAULT_STORE_CODE,
+    build_product_point,
+)
+from backend.app.magento.chatbot.services import vocab_service
 import time
 from urllib.parse import urlparse
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 class SyncProduct(BaseModel):
+    """One product as the plugin sends it.
+
+    Loose on purpose. The declared fields are the ones older plugin builds sent
+    and are kept so those installs keep validating; everything the current
+    formatter adds — attributes with taxonomy codes, variations under
+    `children`, dimensions, merchant notes — rides in as extras.
+
+    `extra="allow"` rather than a full field list because the shape is decided
+    by the PHP formatter, and a strict schema here would mean a backend deploy
+    every time that formatter learns a new field. Worse, the failure mode of
+    getting it wrong is silent: Pydantic's default drops unknown keys, so a
+    product would sync "successfully" with its attributes quietly discarded.
+
+    `categories` and `tags` are typed loosely for the same reason: they used to
+    be strings and are now lists of dicts, and a store mid-upgrade sends both.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
     product_id:        str
     name:              str
-    categories:        str = ""
-    tags:              str = ""
+    categories:        Any = ""
+    tags:              Any = ""
     description:       str = ""
     short_description: str = ""
     price:             float = 0
@@ -33,7 +66,7 @@ class SyncProduct(BaseModel):
     image_url:         str = ""
     stock_status:      str = "instock"
     average_rating:    float = 0
-    attributes:        list = Field(default_factory=list)
+    attributes:        Any = Field(default_factory=list)
 
 
 class SyncPage(BaseModel):
@@ -122,19 +155,68 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
 
     print(f"Syncing batch {req.batch_number}/{req.total_batches} with {len(req.products)} products, {len(req.pages)} pages, {len(req.posts)} posts")
 
+    # Vocabulary the products in this batch contribute. Collected across the
+    # whole batch and merged once at the end — a per-product merge would be one
+    # database round trip per product for data that only matters in aggregate.
+    attribute_vocab_sink: dict[str, set[str]] = defaultdict(set)
+    category_vocab_sink: dict[str, dict[str, str]] = {}
+
     # Sync products
     for product in req.products:
         try:
             p = product.model_dump()
-            text    = build_product_text(p)
-            vector  = embed_document(text, embedding_api_key, client_id)
-            payload = extract_payload(p)
-            payload["embedded_text"] = text
-            upsert_product(client_id, domain, product.product_id, vector, payload)
+            text, payload = build_product_point(
+                p,
+                store_code=DEFAULT_STORE_CODE,
+                attribute_vocab_sink=attribute_vocab_sink,
+                category_vocab_sink=category_vocab_sink,
+            )
+            vector = embed_document(text, embedding_api_key, client_id)
+
+            # The sparse half of hybrid retrieval. Best-effort: a point stored
+            # dense-only is still findable, it just contributes nothing to the
+            # BM25 ranking. Failing the whole product over it would be worse.
+            #
+            # Not optional in the sense of "nice to have", though — a Qdrant
+            # upsert replaces the point's vectors wholesale, so a dense-only
+            # write here would strip the sparse vector off a point the other
+            # plugin had written with one. Both endpoints populate both slots.
+            try:
+                sparse_vector = embed_sparse_document(text)
+            except Exception as exc:
+                logger.warning(
+                    "sparse embed failed for product %s: %s — proceeding dense-only",
+                    product.product_id, exc,
+                )
+                sparse_vector = None
+
+            upsert_content_item(
+                client_id=client_id,
+                domain=domain,
+                content_type="product",
+                entity_id=product.product_id,
+                vector=vector,
+                payload=payload,
+                store_code=DEFAULT_STORE_CODE,
+                sparse_vector=sparse_vector,
+            )
             success_ids.append(product.product_id)
         except Exception as e:
             print(f"❌ Sync failed for product {product.product_id}: {e}")
             failed_ids.append(product.product_id)
+
+    # Best-effort: vocabulary improves future query routing, but losing it must
+    # not fail a batch that actually indexed.
+    if attribute_vocab_sink:
+        try:
+            vocab_service.merge_attributes(db, client_id, DEFAULT_STORE_CODE, attribute_vocab_sink)
+        except Exception as exc:
+            logger.warning("attribute vocab merge failed: %s", exc)
+    if category_vocab_sink:
+        try:
+            vocab_service.merge_categories(db, client_id, DEFAULT_STORE_CODE, category_vocab_sink)
+        except Exception as exc:
+            logger.warning("category vocab merge failed: %s", exc)
 
     # Sync pages
     for page in req.pages:

@@ -2,6 +2,25 @@
 
 Two content types, which is all this module syncs: `product` and `faq`.
 
+ONE FORMATTER, TWO CALLERS. Both WooCommerce plugins run their products
+through this module:
+
+  * `semantic-search-woo`  → POST /api/sync/batch                    (routers/sync.py)
+  * `ai-product-qa-woo`    → POST /api/wordpress/productqa/sync/batch
+
+They index the same catalogue into the same per-tenant collection, and a
+product's point id is derived from (client_id, product_id) — so for any given
+product the two write to the SAME record and whichever runs last wins. That
+was a silent downgrade while the two formatters differed: the search payload
+carried no attributes, variations or merchant notes, so a shopper's "what
+sizes does this come in" began failing hours after a scheduled sync with
+nothing logged anywhere.
+
+Identical bytes make the race harmless. Use `build_product_point` from both
+callers rather than reassembling the payload at each one — the two extra keys
+it sets (`embedded_text`, `store_code`) are part of what has to match, and
+they are the kind of thing that drifts when it is written out twice.
+
 THE PAYLOAD CONTRACT IS NOT LOCAL. The shared Qdrant helpers in
 `backend.app.services.qdrant_service` build their filters against specific
 payload keys — `sku`, `price`, `stock_status`, `store_code`, `content_type`,
@@ -32,10 +51,24 @@ except Exception:  # pragma: no cover
     _HAS_BS4 = False
 
 
-# Stamped onto every product this module writes, and read by the legacy
-# WooCommerce webhook handler so it can decline to overwrite a rich point with
-# a thin one. See the `managed_by` block in format_product below.
-MANAGED_BY = "aipqa"
+# Stamped onto every product this module writes, and read by the WooCommerce
+# webhook handler so it can decline to overwrite a full point with a partial
+# one. See the `managed_by` block in format_product below.
+#
+# The value names the FORMAT, not the plugin. Both WooCommerce plugins write
+# it, because both now produce the full payload — a marker that named one of
+# them would have to differ between the two, and the payloads have to match.
+MANAGED_BY = "woo_full"
+
+# Points written by the product Q&A plugin before the two formatters were
+# merged carry this instead. Readers accept both; nothing writes it any more.
+LEGACY_MANAGED_BY = "aipqa"
+
+# Store code every WooCommerce point is written under. WordPress has no
+# store-view concept, and `default` is the value build_point_id() collapses to
+# the legacy single-store id — so this is not an arbitrary string, it is what
+# keeps existing points addressable.
+DEFAULT_STORE_CODE = "default"
 
 
 # ── HTML + shortcode cleaning ────────────────────────────────────────────────
@@ -567,20 +600,51 @@ def format_product(
     payload["attribute_facets"] = sorted(set(facet_tokens))
     payload["merchant_info"] = merchant_info[:4000]
 
-    # Ownership marker.
+    # Format marker.
     #
-    # A WooCommerce store may also run the legacy search plugin, whose
-    # WooCommerce webhooks post the same product straight to /api/webhook/* on
-    # every save. Same licence, same collection, same point id — but a much
-    # thinner payload (no attributes, no variations, no description). Whichever
-    # write lands second wins, so without a marker a shopper's "what sizes does
-    # this come in" starts failing at random with nothing logged anywhere.
+    # Both plugins' PHP syncs now produce this payload, so between them the
+    # write order no longer matters. What remains is the third writer: the
+    # search plugin's WooCommerce webhooks, which post straight to
+    # /api/webhook/* on every product save without passing through either
+    # plugin's PHP. Same licence, same collection, same point id — but WooCommerce's
+    # REST product object carries no variation detail, no merchant notes and no
+    # attribute taxonomy codes, so that path CANNOT produce these bytes however
+    # it is written.
     #
     # The webhook handler reads this field and declines to overwrite a point
-    # that carries it. See routers/webhooks.py::_is_managed_by_product_qa.
+    # that carries it. See routers/webhooks.py::_has_full_woo_payload.
     payload["managed_by"] = MANAGED_BY
 
     return _final_clean("\n".join(p for p in parts if p)), payload
+
+
+def build_product_point(
+    product: Dict[str, Any],
+    *,
+    store_code: str = DEFAULT_STORE_CODE,
+    attribute_vocab_sink: Optional[Dict[str, set[str]]] = None,
+    category_vocab_sink: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """(embedding_text, payload) exactly as it is stored, for both sync routers.
+
+    Thin, and that is the point. `format_product` produces the content; the two
+    keys added here are the rest of what a stored point contains, and they are
+    added in one place so the two callers cannot drift on them.
+
+    `store_code` is written onto the payload explicitly rather than left to
+    `upsert_content_item` to default, because that helper only fills it in when
+    the caller passes one — so a caller that omitted it would store a point
+    with no store_code at all, and a payload diff against the other caller's
+    point would show a missing key for no reason a reader could see.
+    """
+    text, payload = format_product(
+        product,
+        attribute_vocab_sink=attribute_vocab_sink,
+        category_vocab_sink=category_vocab_sink,
+    )
+    payload["embedded_text"] = text
+    payload["store_code"] = store_code or DEFAULT_STORE_CODE
+    return text, payload
 
 
 # ── FAQ ──────────────────────────────────────────────────────────────────────
