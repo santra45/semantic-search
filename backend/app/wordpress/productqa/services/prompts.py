@@ -161,13 +161,21 @@ def _extract_custom_field_lines(source: dict) -> list[str]:
 
     The label is the merchant's own, straight from their field group, so the
     prompt reads in the store's vocabulary rather than in database keys.
+
+    Values are rendered WHOLE. There was a 1,200-character cap here, and it did
+    the one thing this block exists to prevent: cut a care-instructions field
+    off mid-sentence, leaving the model to answer confidently from half of it.
+    A truncated source is worse than a long one — the model cannot tell that
+    what it is reading stops early, so it answers as though it read everything.
+    The plugin's settings screen is the place to leave a field out; a silent
+    cut in the middle of a sentence is not.
     """
     raw = source.get("custom_fields")
     if not isinstance(raw, list):
         return []
 
     lines: list[str] = []
-    for field in raw[:40]:
+    for field in raw:
         if not isinstance(field, dict):
             continue
         label = str(field.get("label") or field.get("key") or "").strip()
@@ -178,7 +186,7 @@ def _extract_custom_field_lines(source: dict) -> list[str]:
         # continuation keeps the whole value attached to its label — otherwise
         # everything after the first line reads as unattributed prose sitting
         # at the same level as the next field's name.
-        body = value[:1200].replace("\n", "\n    ")
+        body = value.replace("\n", "\n    ")
         lines.append(f"  - {label}: {body}")
     return lines
 
