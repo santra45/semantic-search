@@ -344,34 +344,18 @@ def _resolve_tags(value: Any) -> str:
 # that vocabulary degrades query parsing for every search the tenant runs, and
 # facets keyed on a sentence match nothing by definition.
 #
-# Stored values are NOT truncated. A 1,200-char cap here cut real merchant
-# content — care instructions, warranty terms — off mid-sentence, and half a
-# sentence is worse than none: the model reads it as complete and answers from
-# it confidently. What survives is a ceiling far above any real field, because
-# this is a public endpoint and a hand-rolled POST could otherwise park a
-# multi-megabyte string in a payload that is read on every answer. Real content
-# never reaches it; a runaway one still can't take the collection down.
-_MAX_CUSTOM_FIELDS = 500
-_MAX_CUSTOM_FIELD_CHARS = 200_000
-_MAX_CUSTOM_FIELD_LABEL_CHARS = 120
-
-# The embedding budget is a different number for a different reason, and it is
-# the one real limit in this file.
+# Nothing here is truncated — not the value, not the label, not the count. A
+# 1,200-char cap cut real merchant content off mid-sentence, and half a warranty
+# clause is worse than none: the model can't tell it stopped early, so it answers
+# from the fragment as confidently as it would from the whole thing.
 #
-# `searchable_text` goes to gemini-embedding-001, which accepts 2048 tokens and
-# is handed the string untruncated (embedder.py `_embed`). Past that the call
-# fails, and a failed embed means the product does not get indexed at all — so
-# an uncapped field here doesn't produce a long record, it produces a MISSING
-# one. Roughly 4 chars per token, and custom fields are one contributor among
-# name, description, attributes and variations, so they get a slice rather than
-# the lot.
-#
-# This costs nothing in answer quality: the answer prompt reads the stored
-# `custom_fields` above, not this string. Embedding text only has to make the
-# product findable — the first paragraph of a care guide does that as well as
-# all six do, and the full text is still there to answer from once found.
-_EMBED_CUSTOM_FIELD_CHARS = 500
-_EMBED_CUSTOM_FIELDS_TOTAL_CHARS = 2500
+# The embedding string isn't bounded here either, and never was — `description`
+# and `merchant_info` go into it whole, so a wordy product reaches
+# gemini-embedding-001's 2048-token ceiling with no custom fields at all
+# (measured: ~1,900 tokens from description alone). Custom fields are one
+# contributor among several, so a bound on them was never the thing standing
+# between this and the ceiling. If one is wanted, it belongs on the assembled
+# string in `format_product`, not on any single contributor to it.
 
 
 def _resolve_custom_fields(value: Any) -> list[Dict[str, str]]:
@@ -388,7 +372,7 @@ def _resolve_custom_fields(value: Any) -> list[Dict[str, str]]:
         return []
 
     out: list[Dict[str, str]] = []
-    for item in value[:_MAX_CUSTOM_FIELDS]:
+    for item in value:
         if not isinstance(item, dict):
             continue
 
@@ -404,37 +388,23 @@ def _resolve_custom_fields(value: Any) -> list[Dict[str, str]]:
             continue
 
         out.append({
-            "label": label[:_MAX_CUSTOM_FIELD_LABEL_CHARS],
-            "value": text[:_MAX_CUSTOM_FIELD_CHARS],
+            "label": label,
+            "value": text,
         })
 
     return out
 
 
 def _custom_field_embed_lines(fields: list[Dict[str, str]]) -> list[str]:
-    """The custom-field slice of `searchable_text`, bounded for the embedder.
+    """The custom-field slice of `searchable_text`, sent whole.
 
-    Cut on a word boundary rather than mid-word: a trailing fragment like
-    "instruc" is a token the model has never seen in this context and is pure
-    noise in the vector. No ellipsis either — this string is read by a model,
-    not a person, and "…" would just be another meaningless token.
+    Values go in under the merchant's own label and at full length; see the
+    note above for why no bound lives at this layer.
     """
     lines: list[str] = []
-    budget = _EMBED_CUSTOM_FIELDS_TOTAL_CHARS
 
     for field in fields:
-        if budget <= 0:
-            break
-
-        value = field["value"]
-        limit = min(_EMBED_CUSTOM_FIELD_CHARS, budget)
-        if len(value) > limit:
-            value = value[:limit].rsplit(" ", 1)[0]
-            if not value:
-                continue
-
-        lines.append(f"{field['label']}: {value}")
-        budget -= len(value)
+        lines.append(f"{field['label']}: {field['value']}")
 
     return lines
 
@@ -610,9 +580,6 @@ def format_product(
     # Custom fields are embedded under the merchant's OWN label — "Tog rating"
     # rather than `tog_rating` — because the label is the wording their shoppers
     # read on the product page, and therefore the wording they ask questions in.
-    #
-    # Only a bounded slice reaches the embedder; `custom_fields` keeps the whole
-    # value for the answer prompt. See _EMBED_CUSTOM_FIELDS_TOTAL_CHARS.
     custom_fields = _resolve_custom_fields(product.get("custom_fields"))
     parts.extend(_custom_field_embed_lines(custom_fields))
 
