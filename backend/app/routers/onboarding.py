@@ -43,7 +43,7 @@ def extract_domain(url: str) -> str:
 @router.get("/onboarding", response_class=HTMLResponse)
 async def onboarding_page(request: Request):
     """Serve the main onboarding page."""
-    return templates.TemplateResponse("onboarding.html", {"request": request})
+    return templates.TemplateResponse(request, "onboarding.html")
 
 @router.post("/api/onboarding/signup")
 async def signup_client(
