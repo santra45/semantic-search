@@ -35,9 +35,18 @@ DELIBERATELY NOT DONE: UNIT CONVERSION
     makes it visible (one key carrying two units) and a single conversion
     can be added with evidence rather than guessed at up front.
 
+MODEL CHOICE
+    2.5 Flash Lite, not Google's newer 3.5 Flash Lite. Extraction is
+    output-heavy — a spec list is far longer than the record that produced
+    it — and 3.5 Flash Lite bills output at $2.50/M against 2.5's $0.40,
+    so it costs roughly 5x more to index the same catalog. Qualification
+    was re-checked on 2.5 before switching: delivery and suction hoses
+    still separate correctly, and both real conflicts on F00201A1J are
+    still found.
+
 See prototypes/spec_extractor/ for the validation run this is derived from:
 851 specs over two live catalogs, zero fabrications, zero qualification
-errors, ~$0.00025 per product.
+errors.
 """
 
 from __future__ import annotations
@@ -55,7 +64,7 @@ logger = logging.getLogger(__name__)
 # silently change how their catalog is indexed, and this reads the entire
 # catalog once, so the cheapest capable model is the right one regardless of
 # what the conversational side is set to.
-DEFAULT_MODEL = os.getenv("SPEC_EXTRACTION_MODEL", "gemini-3.5-flash-lite")
+DEFAULT_MODEL = os.getenv("SPEC_EXTRACTION_MODEL", "gemini-2.5-flash-lite")
 DEFAULT_PROVIDER = os.getenv("SPEC_EXTRACTION_PROVIDER", "google")
 
 # ── Prompt ───────────────────────────────────────────────────────────────
