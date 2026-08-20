@@ -1019,7 +1019,7 @@ def retrieve_answer(
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
     provider_name = (req.llm_provider or "google").lower()
-    model_name    = req.llm_model or "gemini-2.0-flash-lite"
+    model_name    = req.llm_model or "gemini-2.5-flash-lite"
 
     messages = [HumanMessage(content=prompt)]
     input_tokens = 0
@@ -1104,7 +1104,7 @@ def retrieve_answer(
             client_id=client_id,
             query_type="chat_answer",
             llm_provider=req.llm_provider or "google",
-            llm_model=req.llm_model or "gemini-2.0-flash-lite",
+            llm_model=req.llm_model or "gemini-2.5-flash-lite",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             input_cost=float(input_cost),
@@ -1214,7 +1214,7 @@ def retrieve_answer_stream(
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
     provider_name = (req.llm_provider or "google").lower()
-    model_name    = req.llm_model or "gemini-2.0-flash-lite"
+    model_name    = req.llm_model or "gemini-2.5-flash-lite"
 
     def event_stream():
         # Accumulate as we go so we can compute total cost + write the

@@ -17,7 +17,7 @@ MAX_CHAT_HISTORY_MESSAGES = int(os.getenv("MAX_CHAT_HISTORY_MESSAGES", "8"))
 
 # Agent LLM defaults. Per-request overrides (from the Magento module) take precedence.
 DEFAULT_LLM_PROVIDER = os.getenv("CHAT_LLM_PROVIDER", "google")
-DEFAULT_LLM_MODEL = os.getenv("CHAT_LLM_MODEL", "gemini-2.0-flash-lite")
+DEFAULT_LLM_MODEL = os.getenv("CHAT_LLM_MODEL", "gemini-2.5-flash-lite")
 
 INTENT_ROUTER_ENABLED = os.getenv("INTENT_ROUTER_ENABLED", "true").lower() == "true"
 

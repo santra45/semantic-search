@@ -204,10 +204,16 @@ MODEL_PRICING = {
     "gemini-2.5-pro":            {"input": 0.00000125,   "output": 0.00001},
     "gemini-2.5-flash":          {"input": 0.0000003,    "output": 0.0000025},
     "gemini-2.5-flash-lite":     {"input": 0.0000001,    "output": 0.0000004},
-    # 2.0 Flash Lite is CHAT_LLM_MODEL's default, so it prices every request
-    # from an integration left on "use the service default".
+    # 3.5 family — Google's named successors to the retired 2.0 line.
+    # Note the output rates: 3.5 Flash Lite is ~6x 2.5 Flash Lite per output
+    # token, which is why it is NOT the service default despite being newer.
+    "gemini-3.5-flash":          {"input": 0.0000015,    "output": 0.000009},
+    "gemini-3.5-flash-lite":     {"input": 0.0000003,    "output": 0.0000025},
+    # Retired by Google (404 on call) and no longer selectable anywhere.
+    # Kept ONLY so historical usage rows written against them still price.
     "gemini-2.0-flash":          {"input": 0.0000001,    "output": 0.0000004},
     "gemini-2.0-flash-lite":     {"input": 0.000000075,  "output": 0.0000003},
+    "gemini-1.5-flash":          {"input": 0.000000075,  "output": 0.0000003},
     "gemma-3-27b-it":            {"input": 0.00000008,   "output": 0.00000016},
     "gemma-4-31b-it":            {"input": 0.00000013,   "output": 0.00000038},
 
@@ -410,7 +416,7 @@ def llm_rerank_content(
     provider = llm_provider or "gemini"
 
     if provider == "gemini":
-        model = llm_model or "gemini-1.5-flash"
+        model = llm_model or "gemini-2.5-flash-lite"
     elif provider == "openai":
         model = llm_model or "gpt-4o-mini"
     elif provider == "anthropic":
@@ -418,7 +424,7 @@ def llm_rerank_content(
     elif provider == "groq":
         model = llm_model or "llama-3.3-70b-versatile"
     else:
-        model = "gemini-1.5-flash"
+        model = "gemini-2.5-flash-lite"
 
     api_key = llm_api_key
 

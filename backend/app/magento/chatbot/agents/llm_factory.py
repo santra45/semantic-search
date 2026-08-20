@@ -53,7 +53,7 @@ def resolve_provider_model(
     """
     p = _normalize_provider(provider)
     if p == "google":
-        return p, model or DEFAULT_LLM_MODEL or "gemini-2.0-flash-lite"
+        return p, model or DEFAULT_LLM_MODEL or "gemini-2.5-flash-lite"
     return p, model or _DEFAULT_MODELS[p]
 
 
