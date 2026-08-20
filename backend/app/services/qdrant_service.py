@@ -15,6 +15,8 @@ from qdrant_client.models import (
     MatchAny,
     MatchValue,
     NamedSparseVector,
+    Nested,
+    NestedCondition,
     PayloadField,
     PayloadSchemaType,
     PointStruct,
@@ -380,6 +382,7 @@ def _build_content_filter(
     category_id: Optional[str] = None,
     brand: Optional[str] = None,
     brand_attribute_codes: Optional[list[str]] = None,
+    spec_filters: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[Filter]:
     """Compose the Qdrant `Filter` applied BEFORE vector search runs.
 
@@ -506,6 +509,51 @@ def _build_content_filter(
             # Nested should-only filter = OR across the brand attribute facets.
             must_conditions.append(Filter(should=should))
 
+    # ── Extracted specifications (Phase 2) ───────────────────────────────
+    # Each predicate becomes ONE NestedCondition over the `specs` array.
+    # Nesting is what makes this correct: it requires a SINGLE element to
+    # satisfy every inner condition together, so "flow_rate" and ">= 10"
+    # cannot be answered by two different specs on the same product — a
+    # flat filter would happily match a product whose flow_rate is 8 and
+    # whose hose length is 20.
+    #
+    # Values are matched only WITHIN the same unit token. There is no
+    # conversion layer, so a catalogue mixing gpm and lpm for one spec
+    # loses some recall rather than comparing 38 against 10 as though
+    # they were the same quantity. See spec_extractor's module docstring.
+    #
+    # A product listing both 8 and 9 GPM carries both as separate
+    # elements, so it spans 8-9: >= 10 excludes it on both, >= 8.5 admits
+    # it as a maybe. Recall cannot break because the wrong field was
+    # guessed authoritative.
+    for pred in spec_filters or []:
+        if not isinstance(pred, dict):
+            continue
+        key = _slug(str(pred.get("key") or ""))
+        if not key:
+            continue
+
+        inner = [FieldCondition(key="key", match=MatchValue(value=key))]
+
+        unit = str(pred.get("unit") or "").strip().lower()
+        if unit:
+            inner.append(FieldCondition(key="unit", match=MatchValue(value=unit)))
+
+        gte, lte = pred.get("gte"), pred.get("lte")
+        if gte is not None or lte is not None:
+            inner.append(FieldCondition(key="num", range=Range(gte=gte, lte=lte)))
+
+        text = str(pred.get("text") or "").strip().lower()
+        if text:
+            inner.append(FieldCondition(key="text", match=MatchValue(value=text)))
+
+        # Key alone is a valid predicate: "which products state a flow rate
+        # at all", which the relaxation ladder uses when nothing meets the
+        # numeric bound and it needs the nearest alternatives instead.
+        must_conditions.append(
+            NestedCondition(nested=Nested(key="specs", filter=Filter(must=inner)))
+        )
+
     return Filter(must=must_conditions) if must_conditions else None
 
 
@@ -617,6 +665,7 @@ def search_content(
     category_id: Optional[str] = None,
     brand: Optional[str] = None,
     brand_attribute_codes: Optional[list[str]] = None,
+    spec_filters: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Vector search over the per-tenant collection.
 
@@ -664,6 +713,7 @@ def search_content(
         category_id=category_id,
         brand=brand,
         brand_attribute_codes=brand_attribute_codes,
+        spec_filters=spec_filters,
     )
 
     # Over-fetch when dedup is on so the post-filter pass has enough
@@ -904,7 +954,10 @@ def search_products(
     category_id: Optional[str] = None,
     brand: Optional[str] = None,
     brand_attribute_codes: Optional[list[str]] = None,
+    spec_filters: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
+    # Phase 2: spec_filters carries extracted-specification predicates
+    # (flow_rate >= 10 gpm) as nested conditions over the `specs` array.
     # Phase 2.2: hybrid + sparse args passed through to search_content
     # so the products endpoint participates in BM25 + dense fusion when
     # the admin toggle is on.
@@ -940,6 +993,7 @@ def search_products(
         category_id=category_id,
         brand=brand,
         brand_attribute_codes=brand_attribute_codes,
+        spec_filters=spec_filters,
     )
 
 

@@ -39,6 +39,7 @@ from backend.app.magento.chatbot.routers.common import (
     decrypt_llm_key,
     maybe_persist_magento_creds,
 )
+from backend.app.magento.chatbot.services import vocab_service
 
 logger = logging.getLogger(__name__)
 
@@ -994,6 +995,17 @@ def retrieve_answer(
         make_retrieval_tools,
         MAX_ACTIVE_RETRIEVAL_ITERATIONS,
     )
+    # The spec tool's description is generated from this, so the model is
+    # told which specifications THIS store can be filtered by instead of
+    # guessing key names. Soft-fails to none: the tool then says so rather
+    # than inviting queries that cannot match.
+    spec_vocabulary = {}
+    if req.active_retrieval:
+        try:
+            spec_vocabulary = vocab_service.get_specs(db, client_id, req.store_code or "default")
+        except Exception as exc:
+            logger.warning("spec vocabulary lookup failed: %s - spec tool disabled", exc)
+
     if req.active_retrieval:
         tools, tool_map = make_retrieval_tools(
             client_id=client_id,
@@ -1002,6 +1014,7 @@ def retrieve_answer(
             store_code=req.store_code,
             hybrid=req.hybrid,
             source_formatter=_format_source_for_prompt,
+            spec_vocabulary=spec_vocabulary,
         )
     else:
         tools, tool_map = [], {}
@@ -1187,6 +1200,17 @@ def retrieve_answer_stream(
         make_retrieval_tools,
         MAX_ACTIVE_RETRIEVAL_ITERATIONS,
     )
+    # The spec tool's description is generated from this, so the model is
+    # told which specifications THIS store can be filtered by instead of
+    # guessing key names. Soft-fails to none: the tool then says so rather
+    # than inviting queries that cannot match.
+    spec_vocabulary = {}
+    if req.active_retrieval:
+        try:
+            spec_vocabulary = vocab_service.get_specs(db, client_id, req.store_code or "default")
+        except Exception as exc:
+            logger.warning("spec vocabulary lookup failed: %s - spec tool disabled", exc)
+
     if req.active_retrieval:
         tools, tool_map = make_retrieval_tools(
             client_id=client_id,
@@ -1195,6 +1219,7 @@ def retrieve_answer_stream(
             store_code=req.store_code,
             hybrid=req.hybrid,
             source_formatter=_format_source_for_prompt,
+            spec_vocabulary=spec_vocabulary,
         )
     else:
         tools, tool_map = [], {}
@@ -1901,7 +1926,8 @@ def _build_answer_prompt(
     active_retrieval_rule = ""
     if active_retrieval and purpose == "answer":
         active_retrieval_rule = (
-            " - **Active Retrieval Tools.** If the initial sources provided are insufficient, incomplete, or lack critical facts needed to answer the question, do NOT refuse or say you don't know yet. Instead, use the active retrieval tools (`retrieve_more_content` or `retrieve_more_products`) to query for more information. Only give up if, after executing your tool-calling step(s), the information remains unavailable.\n"
+            " - **Active Retrieval Tools.** If the initial sources provided are insufficient, incomplete, or lack critical facts needed to answer the question, do NOT refuse or say you don't know yet. Fetch more instead. Use `retrieve_more_content` for policy or help content, and `retrieve_more_products` to find products by description. Only give up if, after executing your tool-calling step(s), the information remains unavailable.\n"
+            " - **Asked for a number this product does not meet?** When the customer names a specification and a value the product in front of them does not reach -- a flow rate, a capacity, a length, a rating -- use `find_products_by_spec`. Ordinary product search matches wording, not magnitude, so it will happily return an 8 GPM pump to someone asking for 10; only this tool actually compares the number. Its description lists the specifications this store can be searched by. If it reports a RELAXED SEARCH, the products it returned do NOT meet what was asked for, and your reply must say so before mentioning them.\n"
         )
 
     return (
@@ -2297,6 +2323,17 @@ def _format_product_source(s: dict, title: str) -> str:
     if attribute_lines:
         parts.append("Attributes:\n" + "\n".join(attribute_lines))
 
+    # Extracted specifications, rendered so DISAGREEMENT IS VISIBLE.
+    # The product that started this work lists 9 GPM in its spec summary
+    # and 8 GPM in its description. Previously the model saw only prose and
+    # had to notice two numbers buried paragraphs apart, which it did not --
+    # it took the last one it read and stated it as fact. Grouping the values
+    # under one key and marking the disagreement makes the conflict something
+    # the model is TOLD about rather than something it has to spot.
+    spec_lines = _extract_spec_lines(s)
+    if spec_lines:
+        parts.append("Specifications (as listed):\n" + "\n".join(spec_lines))
+
     # The critical bit: variant attributes + children so the LLM can
     # answer "what sizes does this come in".
     variant_attrs = s.get("variant_attributes") or {}
@@ -2375,6 +2412,52 @@ _KNOWN_PRODUCT_FIELDS = frozenset({
     "brand", "gender",   # already surfaced explicitly
     "merchant_info",     # surfaced explicitly as authoritative guidance
 })
+
+
+def _extract_spec_lines(s: dict) -> list[str]:
+    """Render a product's extracted specs, grouping values under one key.
+
+    Every value the extractor found is kept, so a spec stated twice appears
+    twice with the field each came from. When those values disagree the line
+    is marked -- that mark is the whole point, and it is what lets the answer
+    say "listed at 9 GPM, though the description says 8" instead of silently
+    choosing one and sounding certain about it.
+    """
+    specs = s.get("specs")
+    if not isinstance(specs, list) or not specs:
+        return []
+
+    conflicts = {str(k) for k in (s.get("spec_conflicts") or [])}
+    grouped: dict[str, list[dict]] = {}
+    for spec in specs:
+        if isinstance(spec, dict) and spec.get("key"):
+            grouped.setdefault(str(spec["key"]), []).append(spec)
+
+    lines: list[str] = []
+    for key, group in sorted(grouped.items()):
+        label = str(group[0].get("label") or key.replace("_", " ").title())
+        rendered, seen = [], set()
+        for spec in group:
+            num, text = spec.get("num"), spec.get("text")
+            if isinstance(num, (int, float)):
+                value = f"{num:g} {spec.get('unit') or ''}".strip()
+            else:
+                value = str(text or "")
+            if not value:
+                continue
+            src = str(spec.get("field") or "")
+            token = f"{value} [{src}]" if src else value
+            if token.lower() not in seen:
+                seen.add(token.lower())
+                rendered.append(token)
+        if not rendered:
+            continue
+        mark = (
+            "   <-- THESE DISAGREE; say so rather than choosing one"
+            if key in conflicts else ""
+        )
+        lines.append(f"  - {label}: {' / '.join(rendered)}{mark}")
+    return lines
 
 
 def _extract_attribute_lines(s: dict) -> list[str]:

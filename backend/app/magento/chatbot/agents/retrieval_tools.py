@@ -53,6 +53,54 @@ _CONTENT_LIMIT_MAX     = 8
 _PRODUCT_LIMIT_DEFAULT = 5
 _PRODUCT_LIMIT_MAX     = 10
 
+# How many candidates the relaxation pass pulls before ranking them by
+# distance from what the customer asked for. Wider than the answer size
+# because the nearest value is frequently not the nearest vector match.
+_RELAX_POOL = 30
+
+
+def _bare(text: str) -> str:
+    """Key reduced to alphanumerics, for tolerant matching."""
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+
+def _decimals(value: float) -> int:
+    """How many decimal places a value was written to."""
+    text = f"{value:g}"
+    return len(text.split(".")[1]) if "." in text else 0
+
+
+def _rank_by_distance(
+    hits: list[dict[str, Any]],
+    key: str,
+    unit: str,
+    target: float,
+) -> list[tuple[dict[str, Any], float]]:
+    """Order candidates by how close their value sits to the one asked for.
+
+    A product carrying several values for the key (its description and its
+    spec summary disagreeing) is judged on whichever is closest -- the most
+    generous reading, which is the right one when we are already telling the
+    customer these are near misses rather than matches.
+    """
+    ranked: list[tuple[dict[str, Any], float]] = []
+    for hit in hits:
+        best: Optional[float] = None
+        for spec in hit.get("specs") or []:
+            if not isinstance(spec, dict) or spec.get("key") != key:
+                continue
+            if unit and (spec.get("unit") or "") != unit:
+                continue
+            num = spec.get("num")
+            if not isinstance(num, (int, float)):
+                continue
+            if best is None or abs(num - target) < abs(best - target):
+                best = float(num)
+        if best is not None:
+            ranked.append((hit, best))
+    ranked.sort(key=lambda pair: abs(pair[1] - target))
+    return ranked
+
 
 def make_retrieval_tools(
     *,
@@ -62,6 +110,7 @@ def make_retrieval_tools(
     store_code: Optional[str] = None,
     hybrid: bool = False,
     source_formatter: Callable[[dict[str, Any]], str],
+    spec_vocabulary: Optional[dict[str, Any]] = None,
 ):
     """Build a fresh pair of active-retrieval tools for ONE /retrieve/answer call.
 
@@ -229,6 +278,174 @@ def make_retrieval_tools(
         except Exception as exc:
             return f"Error performing product search: {exc}"
 
-    tools = [retrieve_more_content, retrieve_more_products]
+
+    @tool
+    def find_products_by_spec(
+        spec_key: str,
+        operator: str = ">=",
+        value: Optional[float] = None,
+        value_max: Optional[float] = None,
+        unit: Optional[str] = None,
+        query_hint: str = "",
+        limit: int = _PRODUCT_LIMIT_DEFAULT,
+    ) -> str:
+        """Find products by a MEASURED specification value.
+
+        Use this whenever the customer asks for a specification the product
+        in front of them does not meet -- "what if I wanted 10 GPM?", "do you
+        have anything lighter than 20 lbs?", "something rated above 100 psi".
+        This searches by the NUMBER, which ordinary product search cannot do.
+
+        Args:
+            spec_key: Which specification, from the list of available keys
+                below. Must be one of them.
+            operator: ">=", "<=", "=", "between", or "any" (any product that
+                states this specification at all).
+            value: The number the customer asked for.
+            value_max: Upper bound, for "between" only.
+            unit: The unit as listed for that key below. Values are compared
+                only within the same unit, so passing the wrong one finds
+                nothing.
+            query_hint: A short phrase describing the kind of product, e.g.
+                "DEF dispenser". Keeps results in the right family instead of
+                returning anything in the catalogue that meets the number.
+            limit: How many products to return. Default 5, max 10.
+        """
+        try:
+            limit = max(1, min(int(limit), _PRODUCT_LIMIT_MAX))
+            key = (spec_key or "").strip().lower().replace(" ", "_")
+            if not key:
+                return "No spec_key provided."
+
+            known = spec_vocabulary or {}
+            if known and key not in known:
+                # The model routinely drops or adds a separator -- 'flowrate'
+                # for 'flow_rate'. Comparing on alphanumerics alone resolves
+                # that silently instead of returning an error the customer
+                # would experience as the assistant simply not knowing.
+                stripped = _bare(key)
+                exact = [k for k in known if _bare(k) == stripped]
+                if len(exact) == 1:
+                    key = exact[0]
+                else:
+                    near = [k for k in known
+                            if stripped and (stripped in _bare(k) or _bare(k) in stripped)]
+                    suggestion = f" Did you mean: {', '.join(near[:5])}?" if near else ""
+                    return (
+                        f"This store does not record a specification called '{key}'."
+                        f"{suggestion} Available: {', '.join(sorted(known)[:25])}"
+                    )
+
+            resolved_unit = (unit or "").strip().lower()
+            if not resolved_unit and key in known:
+                resolved_unit = str((known.get(key) or {}).get("unit") or "")
+
+            op = (operator or ">=").strip().lower()
+            pred: dict[str, Any] = {"key": key, "unit": resolved_unit or None}
+            if op == ">=" and value is not None:
+                pred["gte"] = float(value)
+            elif op == "<=" and value is not None:
+                pred["lte"] = float(value)
+            elif op == "between" and value is not None and value_max is not None:
+                pred["gte"], pred["lte"] = float(value), float(value_max)
+            elif op == "=" and value is not None:
+                # Exact float equality would miss 9.0 against a stored 9.
+                # Half a unit of the written precision is the same tolerance
+                # the extractor uses to decide two values agree.
+                tol = 0.5 * (10.0 ** -_decimals(float(value)))
+                pred["gte"], pred["lte"] = float(value) - tol, float(value) + tol
+
+            text = (query_hint or "").strip() or key.replace("_", " ")
+            q_vec = embed_query(text, api_key, client_id)
+            sparse_vec = _maybe_sparse(text)
+
+            hits = qdrant_search_products(
+                client_id=client_id,
+                domain=domain,
+                query_vector=q_vec,
+                limit=limit,
+                content_types=["product"],
+                store_code=store_code,
+                hybrid=hybrid and sparse_vec is not None,
+                sparse_query_vector=sparse_vec,
+                with_vectors=False,
+                spec_filters=[pred],
+            )
+            if hits:
+                return "\n\n".join(source_formatter(h) for h in hits)
+
+            # ── Relaxation ───────────────────────────────────────────────
+            # Nothing meets the bound. Rather than report a dead end, drop
+            # the numeric condition, keep the key, and rank what the store
+            # DOES carry by distance from what was asked for.
+            #
+            # The banner is the mechanism, not a suggestion: it states the
+            # requirement was not met, so the answer cannot present these as
+            # though they satisfied it. Leaving that to the model's judgement
+            # is exactly how "answering around a gap" happens.
+            if value is None:
+                return "No products found with that specification."
+
+            pool = qdrant_search_products(
+                client_id=client_id,
+                domain=domain,
+                query_vector=q_vec,
+                limit=_RELAX_POOL,
+                content_types=["product"],
+                store_code=store_code,
+                hybrid=hybrid and sparse_vec is not None,
+                sparse_query_vector=sparse_vec,
+                with_vectors=False,
+                spec_filters=[{"key": key, "unit": resolved_unit or None}],
+            )
+            nearest = _rank_by_distance(pool, key, resolved_unit, float(value))
+            if not nearest:
+                return (
+                    f"NOT AVAILABLE: no product in this store states a {key.replace('_', ' ')} "
+                    f"at all. Say plainly that this specification is not listed, and offer to "
+                    f"put the customer in touch rather than substituting a different figure."
+                )
+
+            unit_label = f" {resolved_unit}" if resolved_unit else ""
+            shown = [h for h, _ in nearest[:limit]]
+            actual = ", ".join(f"{v:g}{unit_label}" for _, v in nearest[:limit])
+            banner = (
+                f"RELAXED SEARCH -- NOTHING MEETS {key.replace('_', ' ')} "
+                f"{op} {value:g}{unit_label}. The products below are the CLOSEST this store "
+                f"carries ({actual}), not matches. Your reply MUST say the exact requirement "
+                f"could not be met before presenting them."
+            )
+            return banner + "\n\n" + "\n\n".join(source_formatter(h) for h in shown)
+
+        except Exception as exc:
+            return f"Error performing specification search: {exc}"
+
+    tools = [retrieve_more_content, retrieve_more_products, find_products_by_spec]
+    # The LLM only knows which specifications it may filter on because the
+    # description tells it, and that list is built per request from what this
+    # store actually has. No hardcoded spec vocabulary anywhere -- a pump
+    # catalogue advertises flow_rate, a furniture one seat_height, same code.
+    if spec_vocabulary:
+        lines = []
+        for k, meta in list(spec_vocabulary.items())[:60]:
+            meta = meta if isinstance(meta, dict) else {}
+            unit = str(meta.get("unit") or "").strip()
+            count = int(meta.get("count") or 0)
+            lines.append(f"  {k}{f' ({unit})' if unit else ''}"
+                         f"{f' - {count} products' if count else ''}")
+        find_products_by_spec.description = (
+            find_products_by_spec.description.rstrip()
+            + "\n\nSpecifications available in THIS store:\n"
+            + "\n".join(lines)
+        )
+    else:
+        # Nothing extracted yet (no sync since the feature shipped). Say so
+        # rather than leaving the model to guess key names that cannot match.
+        find_products_by_spec.description = (
+            find_products_by_spec.description.rstrip()
+            + "\n\nNOTE: this store has no extracted specifications yet, so this "
+              "tool will find nothing. Use retrieve_more_products instead."
+        )
+
     tool_map = {t.name: t for t in tools}
     return tools, tool_map
