@@ -263,9 +263,34 @@ def format_product_source(source: dict, title: str) -> str:
         if child_lines:
             parts.append("Variations:\n" + "\n".join(child_lines))
 
-    desc = source.get("description") or source.get("short_description") or source.get("summary") or ""
-    if desc:
-        parts.append(f"Description: {str(desc)[:1500]}")
+    # `short_description` and `description` are DIFFERENT merchant fields and
+    # they routinely disagree: the spec block a merchant keeps current in the
+    # short description sits next to older marketing copy in the long one. This
+    # was an `or` chain, so any product with a description at all never showed
+    # the model its short description — and the model answered confidently from
+    # the half it received, with no way to know the other half existed. Both
+    # are rendered now, labelled, and the model can see them disagree.
+    #
+    # The prefix check is defensive rather than load-bearing here: a WooCommerce
+    # product carries a real short description, but `short` falls back to the
+    # post excerpt, and an auto-generated excerpt is just the opening of the
+    # content — which would print the same prose twice.
+    overview = str(source.get("short_description") or source.get("summary") or "").strip()
+    detail = str(source.get("description") or "").strip()
+
+    if overview and detail:
+        head = " ".join(overview.split())[:120]
+        if head and " ".join(detail.split()).startswith(head):
+            overview = ""
+
+    if overview:
+        parts.append(f"Overview: {overview[:800]}")
+    if detail:
+        # Matches the payload's own 2000-char store (product_formatter.py) so
+        # the prompt stops re-truncating what was already truncated. Spec
+        # tables live at the BOTTOM of a description — precisely what the
+        # tighter 1500 cut removed, silently, with the model unable to tell.
+        parts.append(f"Description: {detail[:2000]}")
 
     return "\n".join(parts)
 

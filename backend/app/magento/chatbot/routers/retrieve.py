@@ -2319,9 +2319,33 @@ def _format_product_source(s: dict, title: str) -> str:
         if child_lines:
             parts.append("Child SKUs:\n" + "\n".join(child_lines))
 
-    desc = (s.get("description") or s.get("short_description") or s.get("summary") or "")
-    if desc:
-        parts.append(f"Description: {str(desc)[:1500]}")
+    # `short_description` and `description` are DIFFERENT merchant fields and
+    # they routinely disagree: the spec block a merchant keeps current in the
+    # short description sits next to older marketing copy in the long one. This
+    # was an `or` chain, so any product with a description at all never showed
+    # the model its short description — and the model answered confidently from
+    # the half it received, with no way to know the other half existed. Both
+    # are rendered now, labelled, and the model can see them disagree.
+    #
+    # `summary` stays a fallback only. The Magento provider builds it as a
+    # truncation of `description` when a product has no short description, so
+    # it is dropped again below when it proves to be that same prose.
+    overview = str(s.get("short_description") or s.get("summary") or "").strip()
+    detail = str(s.get("description") or "").strip()
+
+    if overview and detail:
+        head = " ".join(overview.split())[:120]
+        if head and " ".join(detail.split()).startswith(head):
+            overview = ""
+
+    if overview:
+        parts.append(f"Overview: {overview[:800]}")
+    if detail:
+        # Matches the payload's own 2000-char store (product_formatter.py) so
+        # the prompt stops re-truncating what was already truncated. Spec
+        # tables live at the BOTTOM of a description — precisely what the
+        # tighter 1500 cut removed, silently, with the model unable to tell.
+        parts.append(f"Description: {detail[:2000]}")
 
     return "\n".join(parts)
 
