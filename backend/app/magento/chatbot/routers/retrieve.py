@@ -994,6 +994,11 @@ def retrieve_answer(
         make_retrieval_tools,
         MAX_ACTIVE_RETRIEVAL_ITERATIONS,
     )
+    # Products the tools actually matched, kept as structured records so the
+    # storefront can render real cards instead of parsing them back out of the
+    # model's prose.
+    found_products: list[dict[str, Any]] = []
+
     if req.active_retrieval:
         tools, tool_map = make_retrieval_tools(
             client_id=client_id,
@@ -1002,6 +1007,7 @@ def retrieve_answer(
             store_code=req.store_code,
             hybrid=req.hybrid,
             source_formatter=_format_source_for_prompt,
+            product_sink=found_products,
         )
     else:
         tools, tool_map = [], {}
@@ -1118,6 +1124,7 @@ def retrieve_answer(
     return {
         "answer": _scrub_pii(final_answer),
         "grounded": True,
+        "products": _cards_from(found_products),
         "usage": {
             "input":    input_tokens,
             "output":   output_tokens,
@@ -1187,6 +1194,11 @@ def retrieve_answer_stream(
         make_retrieval_tools,
         MAX_ACTIVE_RETRIEVAL_ITERATIONS,
     )
+    # Products the tools actually matched, kept as structured records so the
+    # storefront can render real cards instead of parsing them back out of the
+    # model's prose.
+    found_products: list[dict[str, Any]] = []
+
     if req.active_retrieval:
         tools, tool_map = make_retrieval_tools(
             client_id=client_id,
@@ -1195,6 +1207,7 @@ def retrieve_answer_stream(
             store_code=req.store_code,
             hybrid=req.hybrid,
             source_formatter=_format_source_for_prompt,
+            product_sink=found_products,
         )
     else:
         tools, tool_map = [], {}
@@ -1902,7 +1915,8 @@ def _build_answer_prompt(
     if active_retrieval and purpose == "answer":
         active_retrieval_rule = (
             " - **Active Retrieval Tools.** If the initial sources provided are insufficient, incomplete, or lack critical facts needed to answer the question, do NOT refuse or say you don't know yet. Fetch more instead. Use `retrieve_more_content` for policy or help content, and `retrieve_more_products` to find products by description. Only give up if, after executing your tool-calling step(s), the information remains unavailable.\n"
-            " - **Asked for a number this product does not meet?** When the customer names a specification and a value the product in front of them does not reach -- a flow rate, a capacity, a length, a rating -- use `find_products_by_spec`. Ordinary product search matches wording, not magnitude, so it will happily return an 8 GPM pump to someone asking for 10; only this tool actually compares the number. Its description lists the specifications this store can be searched by. If it reports a RELAXED SEARCH, the products it returned do NOT meet what was asked for, and your reply must say so before mentioning them.\n"
+            " - **Customer named a figure this product does not have?** A flow rate, a size, a rating, a capacity -- use `find_products_listing` with the value exactly as they said it. It matches the merchant's own written specifications, which ordinary product search cannot: search matches wording, so asking it for 10 GPM returns whatever reads like a pump.\n"
+            " - **Never convert a unit.** Report figures exactly as the store wrote them. If the customer asks in GPM and the store lists l/min, do NOT do the arithmetic -- a converted number is one the merchant never published and cannot stand behind. When `find_products_listing` reports NOT LISTED, say plainly that the exact figure is not listed, tell them which units this store does use, and invite them to ask again that way. Never offer a different number as though it answered them.\n"
         )
 
     return (
@@ -1966,6 +1980,49 @@ def _build_answer_prompt(
         + history_block
         + f"\n\nSources:\n{sources_blob}"
     )
+
+
+# Fields a product card needs, and nothing else. Deliberately narrow: this
+# crosses the wire to a storefront, so descriptions, embedded text and the
+# rest of the payload stay behind.
+_CARD_FIELDS = (
+    "sku", "name", "price", "regular_price", "currency", "currency_symbol", "image_url",
+    "permalink", "stock_status", "type_id", "variant_attributes",
+)
+
+
+def _cards_from(found: list[dict[str, Any]], limit: int = 6) -> list[dict[str, Any]]:
+    """Project matched products into renderable cards, first occurrence wins.
+
+    Deduped by SKU because a customer can ask twice in one turn and the tool
+    may match the same product each time.
+    """
+    seen: set[str] = set()
+    cards: list[dict[str, Any]] = []
+    for payload in found:
+        sku = str(payload.get("sku") or payload.get("entity_id") or "").strip()
+        if not sku or sku in seen:
+            continue
+        seen.add(sku)
+        card = {k: payload.get(k) for k in _CARD_FIELDS if payload.get(k) not in (None, "")}
+        card["sku"] = sku
+        # Children carry the child SKUs a variant picker needs to resolve a
+        # selection; trimmed to the attributes and stock the widget reads.
+        children = payload.get("children")
+        if isinstance(children, list) and children:
+            card["children"] = [
+                {
+                    "sku": str(c.get("sku") or ""),
+                    "attributes": c.get("attributes") or {},
+                    "stock_status": c.get("stock_status") or "instock",
+                }
+                for c in children[:30]
+                if isinstance(c, dict) and c.get("sku")
+            ]
+        cards.append(card)
+        if len(cards) >= limit:
+            break
+    return cards
 
 
 def _format_source_for_prompt(s: dict, compact_products: bool = False) -> str:

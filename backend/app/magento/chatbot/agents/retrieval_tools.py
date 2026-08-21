@@ -26,6 +26,8 @@ Tool/file separation rationale:
 
 from __future__ import annotations
 
+import re
+import time
 from typing import Any, Callable, Optional
 
 from langchain_core.tools import tool
@@ -35,6 +37,7 @@ from langchain_core.tools import tool
 # request that hits make_retrieval_tools().
 from backend.app.services.embedder import embed_query
 from backend.app.services.qdrant_service import (
+    scroll_content as qdrant_scroll,
     search_content as qdrant_search_content,
     search_products as qdrant_search_products,
 )
@@ -56,50 +59,86 @@ _PRODUCT_LIMIT_MAX     = 10
 # How many candidates the relaxation pass pulls before ranking them by
 # distance from what the customer asked for. Wider than the answer size
 # because the nearest value is frequently not the nearest vector match.
-_RELAX_POOL = 30
+# The whole point of this approach is that the answer is already in the
+# merchant's own words, sitting in the payload. Matching happens over that
+# text directly -- nothing is extracted at sync time, nothing is stored, and
+# there is no schema to drift out of step with the catalogue.
+#
+# The text is cached per collection because a customer asking three questions
+# in a row should not re-scroll the catalogue three times. Short TTL so an
+# edited product shows up quickly.
+_TEXT_CACHE: dict[tuple[str, str, str], tuple[float, list[tuple[dict, str]]]] = {}
+_TEXT_TTL_SECONDS = 300
+_TEXT_FIELDS = ("name", "short_description", "description", "merchant_info")
+_MAX_TEXT_CHARS = 8000
+# What the matcher reads plus what a rendered product needs. Excludes
+# `embedded_text`, which is most of the payload and only duplicates the
+# description fields already listed here.
+_WANTED_FIELDS = [
+    "sku", "entity_id", "name", "short_description", "description",
+    "merchant_info", "price", "regular_price", "currency", "image_url",
+    "permalink", "stock_status", "type_id", "brand", "categories",
+    "variant_attributes", "average_rating", "content_type", "children",
+]
+
+# Whitespace is not meaningful inside a specification. The same catalogue
+# writes "90 l/min" and "90l/min", and matching strictly finds barely half of
+# them -- measured on a live 722-product store: 6 hits strict, 12 loose.
+_SQUASH = re.compile(r"\s+")
 
 
-def _bare(text: str) -> str:
-    """Key reduced to alphanumerics, for tolerant matching."""
-    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+def _squash(text: str) -> str:
+    """Lowercase and strip ALL whitespace, so spacing cannot hide a match."""
+    return _SQUASH.sub("", (text or "").lower())
 
 
-def _decimals(value: float) -> int:
-    """How many decimal places a value was written to."""
-    text = f"{value:g}"
-    return len(text.split(".")[1]) if "." in text else 0
+def _product_text(client_id: str, domain: str, store_code: Optional[str]):
+    """Every product's own words, as (payload, squashed-text) pairs."""
+    key = (client_id, domain, store_code or "")
+    hit = _TEXT_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _TEXT_TTL_SECONDS:
+        return hit[1]
+
+    rows: list[tuple[dict, str]] = []
+    for payload in qdrant_scroll(
+        client_id=client_id,
+        domain=domain,
+        content_type="product",
+        store_code=store_code,
+        payload_fields=_WANTED_FIELDS,
+    ):
+        blob = " ".join(str(payload.get(f) or "") for f in _TEXT_FIELDS)[:_MAX_TEXT_CHARS]
+        if blob.strip():
+            rows.append((payload, _squash(blob)))
+
+    _TEXT_CACHE[key] = (time.time(), rows)
+    return rows
 
 
-def _rank_by_distance(
-    hits: list[dict[str, Any]],
-    key: str,
-    unit: str,
-    target: float,
-) -> list[tuple[dict[str, Any], float]]:
-    """Order candidates by how close their value sits to the one asked for.
+# A number followed by a short word -- "50 l/min", "150 micron", "24 v". Used
+# ONLY to tell a customer what forms the store writes its measurements in when
+# their term finds nothing. Nothing is stored and nothing is converted; this
+# reports the merchant's own wording back.
+_MEASURE_FORM = re.compile(r"\d+(?:[.,]\d+)?\s*([a-z][a-z/.\-]{0,7})\b", re.I)
+_FORM_STOPWORDS = {
+    "x", "and", "or", "the", "a", "of", "in", "to", "for", "with", "per",
+    "pack", "piece", "pieces", "year", "years", "day", "days", "month",
+    "months", "off", "is", "no", "up", "each", "set", "pc", "pcs",
+}
 
-    A product carrying several values for the key (its description and its
-    spec summary disagreeing) is judged on whichever is closest -- the most
-    generous reading, which is the right one when we are already telling the
-    customer these are near misses rather than matches.
-    """
-    ranked: list[tuple[dict[str, Any], float]] = []
-    for hit in hits:
-        best: Optional[float] = None
-        for spec in hit.get("specs") or []:
-            if not isinstance(spec, dict) or spec.get("key") != key:
+
+def _measurement_forms(rows, limit: int = 8) -> list[str]:
+    """The unit spellings this store actually uses, most common first."""
+    counts: dict[str, int] = {}
+    for payload, _ in rows:
+        blob = " ".join(str(payload.get(f) or "") for f in _TEXT_FIELDS)
+        for match in _MEASURE_FORM.finditer(blob):
+            token = match.group(1).lower().strip(".-")
+            if len(token) < 1 or token in _FORM_STOPWORDS or token.isdigit():
                 continue
-            if unit and (spec.get("unit") or "") != unit:
-                continue
-            num = spec.get("num")
-            if not isinstance(num, (int, float)):
-                continue
-            if best is None or abs(num - target) < abs(best - target):
-                best = float(num)
-        if best is not None:
-            ranked.append((hit, best))
-    ranked.sort(key=lambda pair: abs(pair[1] - target))
-    return ranked
+            counts[token] = counts.get(token, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    return [tok for tok, n in ranked[:limit] if n >= 5]
 
 
 def make_retrieval_tools(
@@ -110,6 +149,7 @@ def make_retrieval_tools(
     store_code: Optional[str] = None,
     hybrid: bool = False,
     source_formatter: Callable[[dict[str, Any]], str],
+    product_sink: Optional[list[dict[str, Any]]] = None,
 ):
     """Build a fresh pair of active-retrieval tools for ONE /retrieve/answer call.
 
@@ -279,131 +319,95 @@ def make_retrieval_tools(
 
 
     @tool
-    def find_products_by_spec(
-        spec_key: str,
-        operator: str = ">=",
-        value: Optional[float] = None,
-        value_max: Optional[float] = None,
-        unit: Optional[str] = None,
-        query_hint: str = "",
+    def find_products_listing(
+        search_term: str,
+        also_try: Optional[list[str]] = None,
         limit: int = _PRODUCT_LIMIT_DEFAULT,
     ) -> str:
-        """Find products by a MEASURED specification value.
+        """Find products whose listed details literally contain a value the
+        customer named -- "10 GPM", "50 l/min", "2 inch", "150 micron", "24V".
 
-        Use this whenever the customer asks for a specification the product
-        in front of them does not meet -- "what if I wanted 10 GPM?", "do you
-        have anything lighter than 20 lbs?", "something rated above 100 psi".
-        This searches by the NUMBER, which ordinary product search cannot do.
+        Use this the moment a customer asks for a specific figure the product
+        in front of them does not have. Ordinary product search matches
+        wording, so asking it for "10 GPM" returns whatever *reads* like a
+        pump; this matches the merchant's own written specification instead.
+
+        Report the store's figures exactly as the merchant wrote them. Do NOT
+        convert between units -- if the store lists l/min, answer in l/min.
+        Converting invents a number the merchant never published.
 
         Args:
-            spec_key: Which specification, from the list of available keys
-                below. Must be one of them.
-            operator: ">=", "<=", "=", "between", or "any" (any product that
-                states this specification at all).
-            value: The number the customer asked for.
-            value_max: Upper bound, for "between" only.
-            unit: The unit as listed for that key below. Values are compared
-                only within the same unit, so passing the wrong one finds
-                nothing.
-            query_hint: A short phrase describing the kind of product, e.g.
-                "DEF dispenser". Keeps results in the right family instead of
-                returning anything in the catalogue that meets the number.
+            search_term: The value as the customer expressed it, e.g. "10 GPM".
+                Whitespace does not matter; case does not matter.
+            also_try: Other ways the SAME value might be written in the
+                catalogue -- ["10gpm", "10 g.p.m"]. Spelling variants only.
+                Never a converted figure in another unit.
             limit: How many products to return. Default 5, max 10.
         """
         try:
             limit = max(1, min(int(limit), _PRODUCT_LIMIT_MAX))
-            key = (spec_key or "").strip().lower().replace(" ", "_")
-            if not key:
-                return "No spec_key provided."
+            terms = [search_term] + list(also_try or [])
+            needles = [(t, _squash(t)) for t in terms if t and _squash(t)]
+            if not needles:
+                return "No search term provided."
 
-            resolved_unit = (unit or "").strip().lower()
+            rows = _product_text(client_id, domain, store_code)
+            if not rows:
+                return "This store has no product data to search."
 
-            op = (operator or ">=").strip().lower()
-            pred: dict[str, Any] = {"key": key, "unit": resolved_unit or None}
-            if op == ">=" and value is not None:
-                pred["gte"] = float(value)
-            elif op == "<=" and value is not None:
-                pred["lte"] = float(value)
-            elif op == "between" and value is not None and value_max is not None:
-                pred["gte"], pred["lte"] = float(value), float(value_max)
-            elif op == "=" and value is not None:
-                # Exact float equality would miss 9.0 against a stored 9.
-                # Half a unit of the written precision is the same tolerance
-                # the extractor uses to decide two values agree.
-                tol = 0.5 * (10.0 ** -_decimals(float(value)))
-                pred["gte"], pred["lte"] = float(value) - tol, float(value) + tol
+            seen, matched = set(), []
+            for payload, blob in rows:
+                for original, needle in needles:
+                    if needle in blob:
+                        sku = str(payload.get("sku") or payload.get("entity_id") or id(payload))
+                        if sku not in seen:
+                            seen.add(sku)
+                            matched.append((payload, original))
+                        break
 
-            text = (query_hint or "").strip() or key.replace("_", " ")
-            q_vec = embed_query(text, api_key, client_id)
-            sparse_vec = _maybe_sparse(text)
+            # Hand the matched products to the caller as DATA, not just as
+            # text for the model to paraphrase. The widget renders them as
+            # cards from these payloads, so the price on screen is the price
+            # in the catalogue -- the model never gets the chance to retype
+            # it, and therefore never gets the chance to retype it wrongly.
+            if product_sink is not None:
+                for payload, _ in matched[:limit]:
+                    product_sink.append(payload)
 
-            hits = qdrant_search_products(
-                client_id=client_id,
-                domain=domain,
-                query_vector=q_vec,
-                limit=limit,
-                content_types=["product"],
-                store_code=store_code,
-                hybrid=hybrid and sparse_vec is not None,
-                sparse_query_vector=sparse_vec,
-                with_vectors=False,
-                spec_filters=[pred],
-            )
-            if hits:
-                return "\n\n".join(source_formatter(h) for h in hits)
-
-            # ── Relaxation ───────────────────────────────────────────────
-            # Nothing meets the bound. Rather than report a dead end, drop
-            # the numeric condition, keep the key, and rank what the store
-            # DOES carry by distance from what was asked for.
-            #
-            # The banner is the mechanism, not a suggestion: it states the
-            # requirement was not met, so the answer cannot present these as
-            # though they satisfied it. Leaving that to the model's judgement
-            # is exactly how "answering around a gap" happens.
-            if value is None:
-                return "No products found with that specification."
-
-            pool = qdrant_search_products(
-                client_id=client_id,
-                domain=domain,
-                query_vector=q_vec,
-                limit=_RELAX_POOL,
-                content_types=["product"],
-                store_code=store_code,
-                hybrid=hybrid and sparse_vec is not None,
-                sparse_query_vector=sparse_vec,
-                with_vectors=False,
-                spec_filters=[{"key": key, "unit": resolved_unit or None}],
-            )
-            nearest = _rank_by_distance(pool, key, resolved_unit, float(value))
-            if not nearest:
-                return (
-                    f"NOT AVAILABLE: no product in this store states a {key.replace('_', ' ')} "
-                    f"at all. Say plainly that this specification is not listed, and offer to "
-                    f"put the customer in touch rather than substituting a different figure."
+            if matched:
+                head = (
+                    f"{len(matched)} product(s) list \"{search_term}\". "
+                    f"Quote these figures exactly as written -- do not convert them."
                 )
+                body = "\n\n".join(source_formatter(p) for p, _ in matched[:limit])
+                if len(matched) > limit:
+                    head += f" Showing {limit} of {len(matched)}."
+                return head + "\n\n" + body
 
-            unit_label = f" {resolved_unit}" if resolved_unit else ""
-            shown = [h for h, _ in nearest[:limit]]
-            actual = ", ".join(f"{v:g}{unit_label}" for _, v in nearest[:limit])
-            banner = (
-                f"RELAXED SEARCH -- NOTHING MEETS {key.replace('_', ' ')} "
-                f"{op} {value:g}{unit_label}. The products below are the CLOSEST this store "
-                f"carries ({actual}), not matches. Your reply MUST say the exact requirement "
-                f"could not be met before presenting them."
+            # Nothing matched. A bare "not found" is a poor answer when the
+            # store plainly does publish this kind of figure -- just in its own
+            # units. Telling the customer which forms the merchant uses is
+            # still only reporting what the merchant wrote; it converts
+            # nothing and invents nothing.
+            forms = _measurement_forms(rows)
+            if forms:
+                return (
+                    f"NOT LISTED: no product states \"{search_term}\". This store writes its "
+                    f"measurements as: {', '.join(forms)}. Tell the customer plainly that this "
+                    f"exact figure is not listed, mention which of those units the store uses "
+                    f"for what they asked about, and invite them to ask again that way. Do NOT "
+                    f"convert their figure yourself and do NOT present a different number as "
+                    f"though it answered them."
+                )
+            return (
+                f"NOT LISTED: no product states \"{search_term}\", and this store does not "
+                f"publish figures of that kind. Say so plainly and offer to put the customer "
+                f"in touch with the store."
             )
-            return banner + "\n\n" + "\n\n".join(source_formatter(h) for h in shown)
 
         except Exception as exc:
-            return f"Error performing specification search: {exc}"
+            return f"Error searching product listings: {exc}"
 
-    # find_products_by_spec is deliberately NOT registered. Nothing writes
-    # specifications to the payload any more -- the LLM extraction that fed
-    # it was removed -- so binding it would give the model a third option
-    # that can only ever return nothing, at the cost of its choice between
-    # the two that work. The body stays as the basis for the unit-first
-    # rework, which will restore it to this list.
-    tools = [retrieve_more_content, retrieve_more_products]
+    tools = [retrieve_more_content, retrieve_more_products, find_products_listing]
     tool_map = {t.name: t for t in tools}
     return tools, tool_map

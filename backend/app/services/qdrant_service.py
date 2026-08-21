@@ -15,8 +15,6 @@ from qdrant_client.models import (
     MatchAny,
     MatchValue,
     NamedSparseVector,
-    Nested,
-    NestedCondition,
     PayloadField,
     PayloadSchemaType,
     PointStruct,
@@ -364,7 +362,6 @@ def _build_content_filter(
     category_id: Optional[str] = None,
     brand: Optional[str] = None,
     brand_attribute_codes: Optional[list[str]] = None,
-    spec_filters: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[Filter]:
     """Compose the Qdrant `Filter` applied BEFORE vector search runs.
 
@@ -491,51 +488,6 @@ def _build_content_filter(
             # Nested should-only filter = OR across the brand attribute facets.
             must_conditions.append(Filter(should=should))
 
-    # ── Extracted specifications (Phase 2) ───────────────────────────────
-    # Each predicate becomes ONE NestedCondition over the `specs` array.
-    # Nesting is what makes this correct: it requires a SINGLE element to
-    # satisfy every inner condition together, so "flow_rate" and ">= 10"
-    # cannot be answered by two different specs on the same product — a
-    # flat filter would happily match a product whose flow_rate is 8 and
-    # whose hose length is 20.
-    #
-    # Values are matched only WITHIN the same unit token. There is no
-    # conversion layer, so a catalogue mixing gpm and lpm for one spec
-    # loses some recall rather than comparing 38 against 10 as though
-    # they were the same quantity.
-    #
-    # A product listing both 8 and 9 GPM carries both as separate
-    # elements, so it spans 8-9: >= 10 excludes it on both, >= 8.5 admits
-    # it as a maybe. Recall cannot break because the wrong field was
-    # guessed authoritative.
-    for pred in spec_filters or []:
-        if not isinstance(pred, dict):
-            continue
-        key = _slug(str(pred.get("key") or ""))
-        if not key:
-            continue
-
-        inner = [FieldCondition(key="key", match=MatchValue(value=key))]
-
-        unit = str(pred.get("unit") or "").strip().lower()
-        if unit:
-            inner.append(FieldCondition(key="unit", match=MatchValue(value=unit)))
-
-        gte, lte = pred.get("gte"), pred.get("lte")
-        if gte is not None or lte is not None:
-            inner.append(FieldCondition(key="num", range=Range(gte=gte, lte=lte)))
-
-        text = str(pred.get("text") or "").strip().lower()
-        if text:
-            inner.append(FieldCondition(key="text", match=MatchValue(value=text)))
-
-        # Key alone is a valid predicate: "which products state a flow rate
-        # at all", which the relaxation ladder uses when nothing meets the
-        # numeric bound and it needs the nearest alternatives instead.
-        must_conditions.append(
-            NestedCondition(nested=Nested(key="specs", filter=Filter(must=inner)))
-        )
-
     return Filter(must=must_conditions) if must_conditions else None
 
 
@@ -647,7 +599,6 @@ def search_content(
     category_id: Optional[str] = None,
     brand: Optional[str] = None,
     brand_attribute_codes: Optional[list[str]] = None,
-    spec_filters: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Vector search over the per-tenant collection.
 
@@ -695,7 +646,6 @@ def search_content(
         category_id=category_id,
         brand=brand,
         brand_attribute_codes=brand_attribute_codes,
-        spec_filters=spec_filters,
     )
 
     # Over-fetch when dedup is on so the post-filter pass has enough
@@ -918,6 +868,55 @@ def _dedupe_by_parent(hits: list[dict[str, Any]], limit: int, max_per_parent: in
     return out
 
 
+def scroll_content(
+    client_id: str,
+    domain: str,
+    content_type: str = "product",
+    store_code: Optional[str] = None,
+    payload_fields: Optional[list[str]] = None,
+    max_points: int = 20000,
+) -> list[dict[str, Any]]:
+    """Every payload of one content type, without a vector query.
+
+    Vector search answers "what is this about"; this answers "give me
+    everything", which is what a literal match over the merchant's own wording
+    needs. Returns raw payloads rather than _format_hit shapes so the caller
+    sees exactly the fields the merchant supplied.
+
+    Pagination is INTERNAL on purpose. ensure_collection_exists issues its own
+    round trips (collection list, payload indexes, quantization), and calling
+    it once per page turned a 722-product scroll into ~35 seconds against a
+    tunnelled Qdrant. Resolved once, the same scroll is a couple of round
+    trips. Pages are requested at the API maximum for the same reason.
+
+    `payload_fields` trims the response to what the caller actually reads --
+    worth passing, since `embedded_text` alone is most of a product payload
+    and simply duplicates text already present in the other fields.
+    """
+    collection_name = ensure_collection_exists(client_id, domain)
+
+    must = [FieldCondition(key="content_type", match=MatchValue(value=content_type))]
+    if store_code:
+        must.append(FieldCondition(key="store_code", match=MatchValue(value=store_code)))
+    scroll_filter = Filter(must=must)
+
+    out: list[dict[str, Any]] = []
+    offset = None
+    while len(out) < max_points:
+        points, offset = qdrant.scroll(
+            collection_name=collection_name,
+            scroll_filter=scroll_filter,
+            limit=512,
+            offset=offset,
+            with_payload=payload_fields if payload_fields else True,
+            with_vectors=False,
+        )
+        out.extend(dict(p.payload or {}) for p in points)
+        if offset is None or not points:
+            break
+    return out
+
+
 def search_products(
     client_id: str,
     domain: str,
@@ -936,10 +935,7 @@ def search_products(
     category_id: Optional[str] = None,
     brand: Optional[str] = None,
     brand_attribute_codes: Optional[list[str]] = None,
-    spec_filters: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
-    # Phase 2: spec_filters carries extracted-specification predicates
-    # (flow_rate >= 10 gpm) as nested conditions over the `specs` array.
     # Phase 2.2: hybrid + sparse args passed through to search_content
     # so the products endpoint participates in BM25 + dense fusion when
     # the admin toggle is on.
@@ -975,7 +971,6 @@ def search_products(
         category_id=category_id,
         brand=brand,
         brand_attribute_codes=brand_attribute_codes,
-        spec_filters=spec_filters,
     )
 
 
