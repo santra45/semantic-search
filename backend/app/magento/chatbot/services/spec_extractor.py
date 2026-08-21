@@ -99,7 +99,20 @@ Keys already in use in this store — REUSE one whenever it means the same thing
 {keys}
 """
 
+# `title` is load-bearing, not decoration. LangChain implements structured
+# output by declaring a tool whose FUNCTION NAME is derived from this field.
+# Without it the name it generates is empty, and Gemini rejects the whole
+# request:
+#
+#   400 tools[0].function_declarations[0].name: Invalid function name.
+#   Must start with a letter or an underscore...
+#
+# which fails extraction for EVERY product. Some library versions invent a
+# fallback name and some do not, so this cannot be left to the library --
+# it worked in development and failed on the server for exactly that reason.
 _SCHEMA: dict[str, Any] = {
+    "title": "extract_product_specifications",
+    "description": "Specifications stated in the product record.",
     "type": "object",
     "properties": {
         "specs": {
