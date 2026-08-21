@@ -1033,6 +1033,7 @@ def retrieve_answer(
     iterations = 0
     final_answer = ""
     last_resp = None
+    tools_called: list[str] = []
 
     llm_to_use = llm.bind_tools(tools) if req.active_retrieval and tools else llm
 
@@ -1063,6 +1064,7 @@ def retrieve_answer(
                     t_name = tool_call["name"]
                     t_args = tool_call["args"]
                     t_id = tool_call["id"]
+                    tools_called.append(t_name)
 
                     if t_name in tool_map:
                         try:
@@ -1121,10 +1123,24 @@ def retrieve_answer(
     except Exception:
         pass
 
+    cards = _cards_from(found_products)
+    # One line per answer, so "why were there no product cards?" is a log
+    # lookup rather than an inference from the wording of the reply. Answering
+    # that question by reading prose is how the first round of this went.
+    logger.info(
+        "retrieve/answer active_retrieval=%s tool_rounds=%d tools_called=%s "
+        "products=%d sources=%d",
+        req.active_retrieval,
+        iterations,
+        ",".join(tools_called) or "none",
+        len(cards),
+        len(req.sources or []),
+    )
+
     return {
         "answer": _scrub_pii(final_answer),
         "grounded": True,
-        "products": _cards_from(found_products),
+        "products": cards,
         "usage": {
             "input":    input_tokens,
             "output":   output_tokens,
@@ -1244,6 +1260,7 @@ def retrieve_answer_stream(
             llm_to_use = llm.bind_tools(tools)
             iterations = 0
             last_resp = None
+            tools_called: list[str] = []
 
             # Tool-call loop runs NON-streaming — each round is a
             # structured tool_calls response, not natural-language
@@ -1266,6 +1283,7 @@ def retrieve_answer_stream(
                 if hasattr(resp, "tool_calls") and resp.tool_calls:
                     messages.append(resp)
                     for tool_call in resp.tool_calls:
+                        tools_called.append(tool_call["name"])
                         t_name = tool_call["name"]
                         t_args = tool_call["args"]
                         t_id = tool_call["id"]
@@ -1915,7 +1933,8 @@ def _build_answer_prompt(
     if active_retrieval and purpose == "answer":
         active_retrieval_rule = (
             " - **Active Retrieval Tools.** If the initial sources provided are insufficient, incomplete, or lack critical facts needed to answer the question, do NOT refuse or say you don't know yet. Fetch more instead. Use `retrieve_more_content` for policy or help content, and `retrieve_more_products` to find products by description. Only give up if, after executing your tool-calling step(s), the information remains unavailable.\n"
-            " - **Customer named a figure this product does not have?** A flow rate, a size, a rating, a capacity -- use `find_products_listing` with the value exactly as they said it. It matches the merchant's own written specifications, which ordinary product search cannot: search matches wording, so asking it for 10 GPM returns whatever reads like a pump.\n"
+            " - **Never name a product you have not looked up.** The moment you are about to mention ANY product other than the one the customer is looking at, call `find_products_listing` first and name only what it returns. Product descriptions routinely mention sibling models -- a pump's own copy may name the bigger version in the range -- and repeating that from the description gives the customer a name they cannot click, cannot price and cannot buy. Looking it up puts a real product card in front of them instead. This applies even when you already know the answer from the sources: knowing something is not the same as being able to show it.\n"
+            " - **Customer named a figure this product does not have?** A flow rate, a size, a rating, a capacity -- use `find_products_listing` with the value exactly as they said it. If they name no number at all -- 'something with a different flow rate', 'a bigger one' -- search the unit or the product family instead ('GPM', 'Panther') and offer what comes back. It matches the merchant's own written specifications, which ordinary product search cannot: search matches wording, so asking it for 10 GPM returns whatever reads like a pump.\n"
             " - **Never convert a unit.** Report figures exactly as the store wrote them. If the customer asks in GPM and the store lists l/min, do NOT do the arithmetic -- a converted number is one the merchant never published and cannot stand behind. When `find_products_listing` reports NOT LISTED, say plainly that the exact figure is not listed, tell them which units this store does use, and invite them to ask again that way. Never offer a different number as though it answered them.\n"
         )
 

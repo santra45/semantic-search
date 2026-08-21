@@ -93,7 +93,13 @@ def _squash(text: str) -> str:
 
 
 def _product_text(client_id: str, domain: str, store_code: Optional[str]):
-    """Every product's own words, as (payload, squashed-text) pairs."""
+    """Every product's own words, as (payload, all-text, name-only) triples.
+
+    The name is kept separately so a product that IS the thing searched for
+    can outrank one that merely mentions it. Descriptions compare against
+    rivals constantly -- a Cube 70's copy name-checks the Panther -- and
+    without that split the comparison outranks the product.
+    """
     key = (client_id, domain, store_code or "")
     hit = _TEXT_CACHE.get(key)
     if hit and (time.time() - hit[0]) < _TEXT_TTL_SECONDS:
@@ -109,7 +115,7 @@ def _product_text(client_id: str, domain: str, store_code: Optional[str]):
     ):
         blob = " ".join(str(payload.get(f) or "") for f in _TEXT_FIELDS)[:_MAX_TEXT_CHARS]
         if blob.strip():
-            rows.append((payload, _squash(blob)))
+            rows.append((payload, _squash(blob), _squash(str(payload.get("name") or ""))))
 
     _TEXT_CACHE[key] = (time.time(), rows)
     return rows
@@ -355,15 +361,20 @@ def make_retrieval_tools(
             if not rows:
                 return "This store has no product data to search."
 
-            seen, matched = set(), []
-            for payload, blob in rows:
+            seen, by_name, by_body = set(), [], []
+            for payload, blob, name_blob in rows:
                 for original, needle in needles:
-                    if needle in blob:
-                        sku = str(payload.get("sku") or payload.get("entity_id") or id(payload))
-                        if sku not in seen:
-                            seen.add(sku)
-                            matched.append((payload, original))
-                        break
+                    if needle not in blob:
+                        continue
+                    sku = str(payload.get("sku") or payload.get("entity_id") or id(payload))
+                    if sku not in seen:
+                        seen.add(sku)
+                        # A hit in the NAME means this product is the thing
+                        # asked for. A hit in the body may only mean its copy
+                        # mentions it -- often to compare against it.
+                        (by_name if needle in name_blob else by_body).append((payload, original))
+                    break
+            matched = by_name + by_body
 
             # Hand the matched products to the caller as DATA, not just as
             # text for the model to paraphrase. The widget renders them as
