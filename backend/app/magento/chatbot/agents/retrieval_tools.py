@@ -267,11 +267,15 @@ def make_retrieval_tools(
         max_price: Optional[float] = None,
         attribute_filters: Optional[dict[str, str]] = None,
     ) -> str:
-        """Search the store's product catalogue for additional products
-        matching the query. Use this when the customer's question would
-        benefit from concrete product evidence that wasn't in the
-        initial sources — e.g. they asked "what do you have in red?"
-        but the initial sources are all CMS pages.
+        """Search the store's product catalogue by MEANING, for open-ended
+        browsing -- "what do you have in red?", "something for cold
+        weather", "a quieter model".
+
+        NOT for a specific figure. Embeddings compare meaning, not
+        magnitude, so "10 GPM" and "8 GPM" look almost identical to this
+        and it will return either. When the customer names a value --
+        a flow rate, a size, a rating -- use `find_products_listing`,
+        which matches the merchant's written specification instead.
 
         Args:
             query: Refined product search phrase.
@@ -319,6 +323,10 @@ def make_retrieval_tools(
             )
             if not hits:
                 return "No additional products found for that query."
+            # Same sink as the literal-match tool. A product found by meaning
+            # is no less buyable than one found by wording.
+            if product_sink is not None:
+                product_sink.extend(hits)
             return "\n\n".join(source_formatter(h) for h in hits)
         except Exception as exc:
             return f"Error performing product search: {exc}"
