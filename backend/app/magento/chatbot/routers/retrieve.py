@@ -1128,13 +1128,21 @@ def retrieve_answer(
     # lookup rather than an inference from the wording of the reply. Answering
     # that question by reading prose is how the first round of this went.
     logger.info(
-        "retrieve/answer active_retrieval=%s tool_rounds=%d tools_called=%s "
-        "products=%d sources=%d",
+        "retrieve/answer active_retrieval=%s tools_bound=%s tool_rounds=%d "
+        "tools_called=%s products=%d sources=%d history=%d instruction=%r",
         req.active_retrieval,
+        ",".join(t.name for t in tools) or "none",
         iterations,
         ",".join(tools_called) or "none",
         len(cards),
         len(req.sources or []),
+        len(req.conversation_history or []),
+        # The module's per-product instruction lands LAST in the prompt, so it
+        # wins on recency over every rule above it. A stale deployment sending
+        # the old "do not suggest other products" wording would silently veto
+        # the tools -- indistinguishable, from the outside, from a model that
+        # simply chose not to search.
+        (req.instruction or "")[:160],
     )
 
     return {
