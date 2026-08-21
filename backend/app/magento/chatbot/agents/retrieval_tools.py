@@ -110,7 +110,6 @@ def make_retrieval_tools(
     store_code: Optional[str] = None,
     hybrid: bool = False,
     source_formatter: Callable[[dict[str, Any]], str],
-    spec_vocabulary: Optional[dict[str, Any]] = None,
 ):
     """Build a fresh pair of active-retrieval tools for ONE /retrieve/answer call.
 
@@ -317,28 +316,7 @@ def make_retrieval_tools(
             if not key:
                 return "No spec_key provided."
 
-            known = spec_vocabulary or {}
-            if known and key not in known:
-                # The model routinely drops or adds a separator -- 'flowrate'
-                # for 'flow_rate'. Comparing on alphanumerics alone resolves
-                # that silently instead of returning an error the customer
-                # would experience as the assistant simply not knowing.
-                stripped = _bare(key)
-                exact = [k for k in known if _bare(k) == stripped]
-                if len(exact) == 1:
-                    key = exact[0]
-                else:
-                    near = [k for k in known
-                            if stripped and (stripped in _bare(k) or _bare(k) in stripped)]
-                    suggestion = f" Did you mean: {', '.join(near[:5])}?" if near else ""
-                    return (
-                        f"This store does not record a specification called '{key}'."
-                        f"{suggestion} Available: {', '.join(sorted(known)[:25])}"
-                    )
-
             resolved_unit = (unit or "").strip().lower()
-            if not resolved_unit and key in known:
-                resolved_unit = str((known.get(key) or {}).get("unit") or "")
 
             op = (operator or ">=").strip().lower()
             pred: dict[str, Any] = {"key": key, "unit": resolved_unit or None}
@@ -420,32 +398,12 @@ def make_retrieval_tools(
         except Exception as exc:
             return f"Error performing specification search: {exc}"
 
-    tools = [retrieve_more_content, retrieve_more_products, find_products_by_spec]
-    # The LLM only knows which specifications it may filter on because the
-    # description tells it, and that list is built per request from what this
-    # store actually has. No hardcoded spec vocabulary anywhere -- a pump
-    # catalogue advertises flow_rate, a furniture one seat_height, same code.
-    if spec_vocabulary:
-        lines = []
-        for k, meta in list(spec_vocabulary.items())[:60]:
-            meta = meta if isinstance(meta, dict) else {}
-            unit = str(meta.get("unit") or "").strip()
-            count = int(meta.get("count") or 0)
-            lines.append(f"  {k}{f' ({unit})' if unit else ''}"
-                         f"{f' - {count} products' if count else ''}")
-        find_products_by_spec.description = (
-            find_products_by_spec.description.rstrip()
-            + "\n\nSpecifications available in THIS store:\n"
-            + "\n".join(lines)
-        )
-    else:
-        # Nothing extracted yet (no sync since the feature shipped). Say so
-        # rather than leaving the model to guess key names that cannot match.
-        find_products_by_spec.description = (
-            find_products_by_spec.description.rstrip()
-            + "\n\nNOTE: this store has no extracted specifications yet, so this "
-              "tool will find nothing. Use retrieve_more_products instead."
-        )
-
+    # find_products_by_spec is deliberately NOT registered. Nothing writes
+    # specifications to the payload any more -- the LLM extraction that fed
+    # it was removed -- so binding it would give the model a third option
+    # that can only ever return nothing, at the cost of its choice between
+    # the two that work. The body stays as the basis for the unit-first
+    # rework, which will restore it to this list.
+    tools = [retrieve_more_content, retrieve_more_products]
     tool_map = {t.name: t for t in tools}
     return tools, tool_map

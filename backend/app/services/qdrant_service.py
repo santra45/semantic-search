@@ -212,24 +212,6 @@ _INDEXED_PAYLOAD_FIELDS: dict[str, PayloadSchemaType] = {
     "client_id":    PayloadSchemaType.KEYWORD,
     "entity_id":    PayloadSchemaType.KEYWORD,
     "chunk_index":  PayloadSchemaType.INTEGER,
-    # ── Extracted specifications ──────────────────────────────────────────
-    # `specs` is a list of objects, one per value found, so a product whose
-    # description and spec summary disagree carries BOTH. Indexing the
-    # sub-fields lets a NestedCondition require that a SINGLE element match
-    # key + range together — without nesting, "flow_rate" and ">= 10" could
-    # be satisfied by two different specs on the same product.
-    #
-    # Storing every value rather than one resolved number is deliberate:
-    # a product listing 8 and 9 GPM spans 8-9, so a query for >= 10 excludes
-    # it on both and a query for >= 8.5 includes it as a maybe. Recall can
-    # never break because the wrong field was guessed as authoritative.
-    "specs[].key":  PayloadSchemaType.KEYWORD,
-    "specs[].num":  PayloadSchemaType.FLOAT,
-    "specs[].unit": PayloadSchemaType.KEYWORD,
-    "specs[].text": PayloadSchemaType.KEYWORD,
-    # Flat list of the keys a product carries — answers "which products have
-    # a flow rate at all" without descending into the nested objects.
-    "spec_keys":    PayloadSchemaType.KEYWORD,
 }
 
 
@@ -520,7 +502,7 @@ def _build_content_filter(
     # Values are matched only WITHIN the same unit token. There is no
     # conversion layer, so a catalogue mixing gpm and lpm for one spec
     # loses some recall rather than comparing 38 against 10 as though
-    # they were the same quantity. See spec_extractor's module docstring.
+    # they were the same quantity.
     #
     # A product listing both 8 and 9 GPM carries both as separate
     # elements, so it spans 8-9: >= 10 excludes it on both, >= 8.5 admits

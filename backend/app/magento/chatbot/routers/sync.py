@@ -17,8 +17,6 @@ import hashlib
 import json
 import logging
 from collections import defaultdict
-import os
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -51,7 +49,7 @@ from backend.app.magento.chatbot.routers.common import (
     decrypt_llm_key,
     maybe_persist_magento_creds,
 )
-from backend.app.magento.chatbot.services import spec_extractor, vocab_service
+from backend.app.magento.chatbot.services import vocab_service
 from backend.app.magento.chatbot.services.product_formatter import (
     format_category_chunkable,
     format_cms_block_chunkable,
@@ -60,14 +58,6 @@ from backend.app.magento.chatbot.services.product_formatter import (
     format_item,
 )
 from backend.app.magento.chatbot.services.text_chunker import chunk_text
-
-
-# ── Specification extraction (Phase 1) ───────────────────────────────────
-# Reads specs out of product prose at sync time so they become filterable
-# numbers rather than characters in a sentence. Additive and fail-open: with
-# this off, or on any error, sync behaves exactly as it did before.
-SPEC_EXTRACTION_ENABLED = os.getenv("SPEC_EXTRACTION_ENABLED", "true").lower() == "true"
-SPEC_EXTRACTION_WORKERS = int(os.getenv("SPEC_EXTRACTION_WORKERS", "6"))
 
 # How big each chunk's *body* gets, and how much context is carried across
 # adjacent chunk boundaries. 500 chars (~80-100 words) lets a single chunk
@@ -166,12 +156,6 @@ class SyncBatchRequest(BaseModel):
     batch_number: int = 1
     total_batches: int = 1
     store_code: str = "default"
-    # Optional model override for specification extraction. Omitted by the
-    # module today, in which case the extractor's own default applies —
-    # deliberately NOT the shared chat default, so a merchant switching their
-    # answer model cannot silently change how their catalog is indexed.
-    llm_provider: Optional[str] = None
-    llm_model: Optional[str] = None
 
 
 class SyncDeleteItem(BaseModel):
@@ -270,66 +254,6 @@ def _process_chunkable_item(
     )
 
 
-def _extract_specs_for_batch(
-    items: list[SyncItem],
-    *,
-    api_key: str,
-    vocabulary: dict[str, Any],
-    llm_model: Optional[str] = None,
-    llm_provider: Optional[str] = None,
-) -> dict[str, dict[str, Any]]:
-    """Run specification extraction over every product in the batch at once.
-
-    Concurrency matters here: extraction is one model call per product, and
-    a 20-product batch run serially would add ~20x a single call's latency
-    to a sync that is otherwise CPU-bound. The pool is small because the
-    embedding calls in the main loop are competing for the same rate limit.
-
-    A failure never propagates. Extraction is additive — a product that
-    fails still syncs, still embeds, and is still findable semantically. It
-    simply cannot be filtered by spec until a later sync picks it up, which
-    is a smaller loss than failing the batch.
-    """
-    products = [
-        it for it in items
-        if it.content_type == "product" and isinstance(it.payload, dict)
-    ]
-    if not products:
-        return {}
-
-    out: dict[str, dict[str, Any]] = {}
-
-    def _one(item: SyncItem) -> tuple[str, dict[str, Any]]:
-        return item.entity_id, spec_extractor.extract(
-            item.payload,
-            api_key=api_key,
-            vocabulary=vocabulary,
-            provider=llm_provider,
-            model=llm_model,
-        )
-
-    try:
-        with ThreadPoolExecutor(max_workers=SPEC_EXTRACTION_WORKERS) as pool:
-            for entity_id, result in pool.map(_one, products):
-                if result and result.get("specs"):
-                    out[entity_id] = result
-    except Exception as exc:                                   # noqa: BLE001
-        logger.warning("spec extraction batch failed: %s — syncing without specs", exc)
-        return {}
-
-    if out:
-        tin = sum(r["usage"]["input"] for r in out.values())
-        tout = sum(r["usage"]["output"] for r in out.values())
-        logger.info(
-            "spec extraction: %d/%d products, %d specs, %d conflicts, %d tokens",
-            len(out), len(products),
-            sum(len(r["specs"]) for r in out.values()),
-            sum(len(r["spec_conflicts"]) for r in out.values()),
-            tin + tout,
-        )
-    return out
-
-
 @router.post("/magento/chatbot/agent/sync/batch")
 def sync_batch(
     req: SyncBatchRequest,
@@ -380,31 +304,6 @@ def sync_batch(
 
     attribute_vocab_sink: dict[str, set[str]] = defaultdict(set)
     category_vocab_sink: dict[str, dict[str, str]] = {}
-    spec_vocab_sink: dict[str, dict[str, Any]] = {}
-
-    # Specification extraction runs BEFORE the main loop, concurrently, so a
-    # batch of 20 products costs roughly one model call in wall-clock rather
-    # than twenty. Results are keyed by entity_id and attached to the payload
-    # inside the loop, which keeps the loop's shape (dedup, chunking, error
-    # handling) untouched.
-    #
-    # The store's existing vocabulary is loaded once and passed into every
-    # call so the extractor reuses established key names instead of coining a
-    # new spelling per product — see vocab_service.merge_specs.
-    specs_by_entity: dict[str, dict[str, Any]] = {}
-    if SPEC_EXTRACTION_ENABLED and embedding_api_key:
-        try:
-            known_specs = vocab_service.get_specs(
-                db, license_data["client_id"], req.store_code
-            )
-        except Exception:
-            known_specs = {}
-        specs_by_entity = _extract_specs_for_batch(
-            req.items,
-            api_key=embedding_api_key,
-            vocabulary=known_specs,
-            llm_model=req.llm_model,
-        )
 
     success_ids: list[str] = []
     failed_ids: list[str] = []
@@ -481,19 +380,6 @@ def sync_batch(
                 payload["embedded_text"] = text_for_embed
                 payload["store_code"]    = store_code
 
-                # Attach the specifications extracted for this product above.
-                # Written to the payload only — NOT folded into embedded_text,
-                # because the prose these came from is already in the vector.
-                # Phase 1 is about making them filterable, not about changing
-                # what the product looks like to a similarity search.
-                extracted = specs_by_entity.get(item.entity_id)
-                if extracted:
-                    payload["specs"]          = extracted["specs"]
-                    payload["spec_keys"]      = extracted["spec_keys"]
-                    payload["spec_conflicts"] = extracted["spec_conflicts"]
-                    for key, meta in extracted["vocab"].items():
-                        spec_vocab_sink[key] = meta
-
                 vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
                 try:
                     sparse_vector = embed_sparse_document(text_for_embed)
@@ -534,13 +420,6 @@ def sync_batch(
         try:
             vocab_service.merge_categories(
                 db, license_data["client_id"], req.store_code, category_vocab_sink
-            )
-        except Exception:
-            pass
-    if spec_vocab_sink:
-        try:
-            vocab_service.merge_specs(
-                db, license_data["client_id"], req.store_code, spec_vocab_sink
             )
         except Exception:
             pass

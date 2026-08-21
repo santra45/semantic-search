@@ -39,7 +39,6 @@ from backend.app.magento.chatbot.routers.common import (
     decrypt_llm_key,
     maybe_persist_magento_creds,
 )
-from backend.app.magento.chatbot.services import vocab_service
 
 logger = logging.getLogger(__name__)
 
@@ -995,17 +994,6 @@ def retrieve_answer(
         make_retrieval_tools,
         MAX_ACTIVE_RETRIEVAL_ITERATIONS,
     )
-    # The spec tool's description is generated from this, so the model is
-    # told which specifications THIS store can be filtered by instead of
-    # guessing key names. Soft-fails to none: the tool then says so rather
-    # than inviting queries that cannot match.
-    spec_vocabulary = {}
-    if req.active_retrieval:
-        try:
-            spec_vocabulary = vocab_service.get_specs(db, client_id, req.store_code or "default")
-        except Exception as exc:
-            logger.warning("spec vocabulary lookup failed: %s - spec tool disabled", exc)
-
     if req.active_retrieval:
         tools, tool_map = make_retrieval_tools(
             client_id=client_id,
@@ -1014,7 +1002,6 @@ def retrieve_answer(
             store_code=req.store_code,
             hybrid=req.hybrid,
             source_formatter=_format_source_for_prompt,
-            spec_vocabulary=spec_vocabulary,
         )
     else:
         tools, tool_map = [], {}
@@ -1200,17 +1187,6 @@ def retrieve_answer_stream(
         make_retrieval_tools,
         MAX_ACTIVE_RETRIEVAL_ITERATIONS,
     )
-    # The spec tool's description is generated from this, so the model is
-    # told which specifications THIS store can be filtered by instead of
-    # guessing key names. Soft-fails to none: the tool then says so rather
-    # than inviting queries that cannot match.
-    spec_vocabulary = {}
-    if req.active_retrieval:
-        try:
-            spec_vocabulary = vocab_service.get_specs(db, client_id, req.store_code or "default")
-        except Exception as exc:
-            logger.warning("spec vocabulary lookup failed: %s - spec tool disabled", exc)
-
     if req.active_retrieval:
         tools, tool_map = make_retrieval_tools(
             client_id=client_id,
@@ -1219,7 +1195,6 @@ def retrieve_answer_stream(
             store_code=req.store_code,
             hybrid=req.hybrid,
             source_formatter=_format_source_for_prompt,
-            spec_vocabulary=spec_vocabulary,
         )
     else:
         tools, tool_map = [], {}
