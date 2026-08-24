@@ -11,9 +11,11 @@ touch any identifiers beyond client_id (already anonymous).
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
+import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -1070,6 +1072,21 @@ def retrieve_answer(
                 endpoint="chat_answer",
             )
 
+            # SALVAGE: flash-lite occasionally emits
+            #   <tool_code>print(default_api.<fn>(...))
+            # as content instead of a proper functionCall part. If tool_calls is
+            # empty but the content matches that pattern, parse it into synthetic
+            # tool_calls so the branch below executes them as if the model had
+            # emitted them correctly.
+            if req.active_retrieval and not (hasattr(resp, "tool_calls") and resp.tool_calls):
+                _salvaged = _salvage_tool_calls_from_content(resp, tool_map)
+                if _salvaged:
+                    logger.info(
+                        "salvaged %d malformed tool_call(s) from AIMessage content (model=%s)",
+                        len(_salvaged), model_name,
+                    )
+                    resp = AIMessage(content="", tool_calls=_salvaged)
+
             if req.active_retrieval and hasattr(resp, "tool_calls") and resp.tool_calls:
                 messages.append(resp)
                 for tool_call in resp.tool_calls:
@@ -1090,6 +1107,25 @@ def retrieve_answer(
                 iterations += 1
             else:
                 final_answer = _extract_text(resp.content).strip()
+                # Flash-lite sometimes returns 0 output tokens on turns that
+                # follow a ToolMessage — no tool_calls AND no content. When we
+                # already have tool results in `messages` we can force a final
+                # answer by re-invoking WITHOUT tools bound: the model can't
+                # decide to punt on tool-calling and has to text-answer from
+                # the accumulated context.
+                if not final_answer and iterations >= 1:
+                    try:
+                        _forced = llm.invoke(messages)
+                        _u = getattr(_forced, "usage_metadata", None) or {}
+                        input_tokens  += int(_u.get("input_tokens",  0) or 0)
+                        output_tokens += int(_u.get("output_tokens", 0) or 0)
+                        final_answer = _extract_text(_forced.content).strip()
+                        logger.info(
+                            "empty-response recovery invoke: %d output tokens (model=%s)",
+                            int(_u.get("output_tokens", 0) or 0), model_name,
+                        )
+                    except Exception as exc:
+                        logger.warning("empty-response recovery LLM invoke failed: %s", exc)
                 break
         else:
             if last_resp and hasattr(last_resp, "tool_calls") and last_resp.tool_calls:
@@ -1311,6 +1347,18 @@ def retrieve_answer_stream(
                     client_id=client_id,
                     endpoint="chat_answer_stream",
                 )
+
+                # SALVAGE: same flash-lite tool_code text fallback as the non-
+                # streaming path — parse and hoist into resp.tool_calls before
+                # the branch below decides "no tool call → break to final answer".
+                if not (hasattr(resp, "tool_calls") and resp.tool_calls):
+                    _salvaged = _salvage_tool_calls_from_content(resp, tool_map)
+                    if _salvaged:
+                        logger.info(
+                            "salvaged %d malformed tool_call(s) from AIMessage content (stream, model=%s)",
+                            len(_salvaged), model_name,
+                        )
+                        resp = AIMessage(content="", tool_calls=_salvaged)
 
                 if hasattr(resp, "tool_calls") and resp.tool_calls:
                     messages.append(resp)
@@ -2663,6 +2711,106 @@ def _log_invoke_turn(*, provider_name, model_name, turn_index,
     except Exception as _exc:
         # Never let logging crash the request path.
         logger.warning("per-turn log write failed: %s", _exc)
+
+
+def _iter_salvaged_default_api_calls(text: str):
+    """Yield (fn_name, kwargs_dict) for each `default_api.<fn>(...)` call in text.
+
+    gemini-2.5-flash-lite occasionally regresses to Google's older Python
+    code-execution text format on multi-turn tool loops, emitting
+
+        <tool_code
+        print(default_api.retrieve_more_content(query = "delivery timeframes"))
+
+    as `content` instead of a proper `functionCall` part. This walker locates
+    every `default_api.<fn>(...)` call in the string (with or without the
+    `<tool_code>` wrapper, with or without the outer `print(...)`) using paren-
+    balance so nested dict literals in `attribute_filters` don't confuse it, then
+    parses the argument list via `ast` and `ast.literal_eval` so only literal
+    values (str/int/float/bool/None/list/dict/tuple) survive -- never eval.
+    """
+    n = len(text)
+    i = 0
+    marker = "default_api."
+    while True:
+        j = text.find(marker, i)
+        if j == -1:
+            return
+        k = j + len(marker)
+        # Consume the fn identifier.
+        name_start = k
+        while k < n and (text[k].isalnum() or text[k] == "_"):
+            k += 1
+        if k == name_start or k >= n or text[k] != "(":
+            i = k + 1
+            continue
+        fn_name = text[name_start:k]
+        # Bracket-balance the argument list, respecting quoted strings so
+        # a `)` inside a string doesn't close it prematurely.
+        depth = 0
+        end = k
+        in_str: Optional[str] = None
+        while end < n:
+            ch = text[end]
+            if in_str is not None:
+                if ch == "\\" and end + 1 < n:
+                    end += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+            elif ch in ("'", '"'):
+                in_str = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end += 1
+                    break
+            end += 1
+        if depth != 0:
+            # Unbalanced (truncated emission) — try to close it heuristically.
+            args_src = text[k + 1:].rstrip()
+        else:
+            args_src = text[k + 1:end - 1]
+        # Rewrite as `_f(<args>)` so ast gives us a Call node we can walk.
+        try:
+            call_node = ast.parse(f"_f({args_src})", mode="eval").body
+        except SyntaxError:
+            i = end if end > k else k + 1
+            continue
+        if not isinstance(call_node, ast.Call):
+            i = end if end > k else k + 1
+            continue
+        kwargs: dict[str, Any] = {}
+        for kw in call_node.keywords:
+            if kw.arg is None:
+                continue
+            try:
+                kwargs[kw.arg] = ast.literal_eval(kw.value)
+            except (ValueError, SyntaxError):
+                continue
+        yield fn_name, kwargs
+        i = end if end > k else k + 1
+
+
+def _salvage_tool_calls_from_content(resp: Any, tool_map: dict) -> list[dict]:
+    """Parse a leaked `<tool_code>print(default_api.foo(...))` AIMessage.content
+    into a synthetic tool_calls list matching LangChain's schema. Only returns
+    calls whose fn_name is in tool_map; returns [] if nothing salvageable."""
+    text = _extract_text(getattr(resp, "content", "")) or ""
+    if "default_api." not in text:
+        return []
+    calls: list[dict] = []
+    for fn_name, kwargs in _iter_salvaged_default_api_calls(text):
+        if fn_name not in tool_map:
+            continue
+        calls.append({
+            "name": fn_name,
+            "args": kwargs,
+            "id":   f"salvaged-{uuid.uuid4().hex[:16]}",
+        })
+    return calls
 
 
 def _extract_text(content: Any) -> str:
