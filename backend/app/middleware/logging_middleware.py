@@ -37,7 +37,7 @@ SKIP_PATHS: tuple[str, ...] = (
     "/favicon.ico",
 )
 
-MAX_BODY_CHARS = 4000
+# MAX_BODY_CHARS = 4000
 RULE = "=" * 78
 INNER = "-" * 78
 
@@ -167,6 +167,7 @@ def _sanitize_headers(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
 def _format_body(body: bytes) -> str:
     if not body:
         return "     (empty)"
+
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
@@ -176,12 +177,16 @@ def _format_body(body: bytes) -> str:
     stripped = text.strip()
     if stripped and stripped[0] in "{[":
         try:
-            pretty = json.dumps(json.loads(stripped), indent=2, ensure_ascii=False)
-            return _indent(pretty[:MAX_BODY_CHARS]) + ("\n     …[truncated]" if len(pretty) > MAX_BODY_CHARS else "")
+            pretty = json.dumps(
+                json.loads(stripped),
+                indent=2,
+                ensure_ascii=False,
+            )
+            return _indent(pretty)
         except json.JSONDecodeError:
             pass
 
-    return _indent(text[:MAX_BODY_CHARS]) + ("\n     …[truncated]" if len(text) > MAX_BODY_CHARS else "")
+    return _indent(text)
 
 
 def _pretty(payload: dict) -> str:

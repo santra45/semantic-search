@@ -1045,6 +1045,7 @@ def retrieve_answer(
         client_id=client_id,
     ) as _log_ctx:
         while iterations < MAX_ACTIVE_RETRIEVAL_ITERATIONS:
+            _turn_prompt_snapshot = _render_message_list_for_log(messages)
             try:
                 resp = llm_to_use.invoke(messages)
             except Exception as exc:
@@ -1055,8 +1056,19 @@ def retrieve_answer(
 
             last_resp = resp
             usage = getattr(resp, "usage_metadata", None) or {}
-            input_tokens += int(usage.get("input_tokens", 0) or 0)
-            output_tokens += int(usage.get("output_tokens", 0) or 0)
+            _turn_in = int(usage.get("input_tokens", 0) or 0)
+            _turn_out = int(usage.get("output_tokens", 0) or 0)
+            input_tokens += _turn_in
+            output_tokens += _turn_out
+            _log_invoke_turn(
+                provider_name=provider_name, model_name=model_name,
+                turn_index=iterations + 1,
+                prompt_snapshot=_turn_prompt_snapshot,
+                resp=resp,
+                turn_in=_turn_in, turn_out=_turn_out,
+                client_id=client_id,
+                endpoint="chat_answer",
+            )
 
             if req.active_retrieval and hasattr(resp, "tool_calls") and resp.tool_calls:
                 messages.append(resp)
@@ -1276,6 +1288,7 @@ def retrieve_answer_stream(
             # (or we hit the iteration cap), the loop exits and the
             # final answer is streamed via llm.stream(messages) below.
             while iterations < MAX_ACTIVE_RETRIEVAL_ITERATIONS:
+                _turn_prompt_snapshot = _render_message_list_for_log(messages)
                 try:
                     resp = llm_to_use.invoke(messages)
                 except Exception as exc:
@@ -1285,8 +1298,19 @@ def retrieve_answer_stream(
 
                 last_resp = resp
                 usage = getattr(resp, "usage_metadata", None) or {}
-                in_tokens += int(usage.get("input_tokens", 0) or 0)
-                out_tokens += int(usage.get("output_tokens", 0) or 0)
+                _turn_in = int(usage.get("input_tokens", 0) or 0)
+                _turn_out = int(usage.get("output_tokens", 0) or 0)
+                in_tokens += _turn_in
+                out_tokens += _turn_out
+                _log_invoke_turn(
+                    provider_name=provider_name, model_name=model_name,
+                    turn_index=iterations + 1,
+                    prompt_snapshot=_turn_prompt_snapshot,
+                    resp=resp,
+                    turn_in=_turn_in, turn_out=_turn_out,
+                    client_id=client_id,
+                    endpoint="chat_answer_stream",
+                )
 
                 if hasattr(resp, "tool_calls") and resp.tool_calls:
                     messages.append(resp)
@@ -1940,21 +1964,22 @@ def _build_answer_prompt(
     active_retrieval_rule = ""
     if active_retrieval and purpose == "answer":
         active_retrieval_rule = (
-            " - **Active Retrieval Tools.** If the initial sources provided are insufficient, incomplete, or lack critical facts needed to answer the question, do NOT refuse or say you don't know yet. Fetch more instead. Use `retrieve_more_content` for policy or help content, `find_products_listing` when the customer names a specific figure, and `retrieve_more_products` only for open-ended browsing where no particular value was asked for. Only give up if, after executing your tool-calling step(s), the information remains unavailable.\n"
-            " - **Never name a product you have not looked up.** The moment you are about to mention ANY product other than the one the customer is looking at, call `find_products_listing` first and name only what it returns. Product descriptions routinely mention sibling models -- a pump's own copy may name the bigger version in the range -- and repeating that from the description gives the customer a name they cannot click, cannot price and cannot buy. Looking it up puts a real product card in front of them instead. This applies even when you already know the answer from the sources: knowing something is not the same as being able to show it.\n"
-            " - **Customer named a figure this product does not have?** A flow rate, a size, a rating, a capacity -- use `find_products_listing` with the value exactly as they said it. If they name no number at all -- 'something with a different flow rate', 'a bigger one' -- search the unit or the product family instead ('GPM', 'Panther') and offer what comes back. It matches the merchant's own written specifications, which ordinary product search cannot: search matches wording, so asking it for 10 GPM returns whatever reads like a pump.\n"
-            " - **Never convert a unit.** Report figures exactly as the store wrote them. If the customer asks in GPM and the store lists l/min, do NOT do the arithmetic -- a converted number is one the merchant never published and cannot stand behind. When `find_products_listing` reports NOT LISTED, say plainly that the exact figure is not listed, tell them which units this store does use, and invite them to ask again that way. Never offer a different number as though it answered them.\n"
+            " - **Active Retrieval Tools.** If the initial sources provided are insufficient, incomplete, or lack critical facts needed to answer the question, do NOT refuse or say you don't know yet. Fetch more instead. Use `retrieve_more_content` for policy or help content, `find_products_listing` when the customer names a specific figure, and `retrieve_more_products` whenever the answer would be a LIST of comparable products -- 'what else do you have', 'other options in the same colour / size / material / brand / category', 'similar to this one', 'a cheaper version', 'more like this'. Do NOT ask the customer to narrow it down themselves, and do NOT stop with only the on-page product when they clearly asked for more. Only give up if, after executing your tool-calling step(s), the information remains unavailable.\n"
+            " - **Never name a product you have not looked up.** The moment you are about to mention ANY product other than the one the customer is looking at, call `find_products_listing` first and name only what it returns. Product descriptions routinely mention sibling models -- a product's own copy may name a related model or a bigger version in the range -- and repeating that from the description gives the customer a name they cannot click, cannot price and cannot buy. Looking it up puts a real product card in front of them instead. This applies even when you already know the answer from the sources: knowing something is not the same as being able to show it.\n"
+            " - **Customer named a figure this product does not have?** Any specific value -- a number, a size, a rating, a capacity, a colour, a material -- use `find_products_listing` with the value exactly as they said it. If they name no number at all -- 'something with a different attribute', 'a bigger one' -- search the unit or the product family/brand instead -- the unit-of-measure or family/brand name exactly as it appears in this product's data -- and offer what comes back. It matches the merchant's own written specifications, which ordinary product search cannot: search matches wording, so a query using the value the customer named tends to return whatever product text actually lists it. Do NOT ask the customer permission first ('would you like us to search?', 'shall I look?') -- call the tool NOW with the value they named, and only then report what came back. Naming the gap and offering to search is HALF an answer; naming the gap and having already searched is a WHOLE answer.\n"
+            " - **Customer asked for MORE, OTHER, or SIMILAR products?** Even when this product already fits the criterion they named (e.g. they ask for 'other items in the same colour' and this product IS that colour, or 'similar to this brand' when this IS that brand), the answer they want is a LIST of comparable options, not a paragraph about the one they're on. Call `retrieve_more_products` with the criterion phrased as a browse query -- use the attribute value or family/brand name exactly as it appears in the current product's own data. Do NOT answer by describing the current product and asking the customer 'what specific type are you looking for' -- that punts the retrieval back to them and is the wrong shape of answer.\n"
+            " - **Never convert a unit.** Report figures exactly as the store wrote them. If the customer asks in one unit and the store lists another (e.g. kg vs lb, cm vs inch, GPM vs l/min), do NOT do the arithmetic -- a converted number is one the merchant never published and cannot stand behind. When `find_products_listing` reports NOT LISTED, say plainly that the exact figure is not listed, tell them which units this store does use, and invite them to ask again that way. Never offer a different number as though it answered them.\n"
         )
 
     return (
-        "You are a helpful, knowledgeable store assistant. Answer the customer's question using ONLY the "
+        "You are a helpful, knowledgeable store assistant. Answer the customer's question using the "
         "sources below — and use them FULLY: the sources often hold more detail than a one-liner conveys, so "
         "draw out the relevant information rather than giving a thin reply.\n\n"
         "Rules:\n"
         + active_retrieval_rule +
         " - **Name the gap before you fill it.** Before answering, decide whether the sources contain "
         "the SPECIFIC thing asked for — the exact attribute, measurement, date or term, not merely the "
-        "same topic. If they do not, your FIRST sentence must say that that detail is not listed. Only "
+        "same topic. If they do not, your FIRST sentence must say that that detail is not listed. If a search tool is available for what the customer named (a product spec, category, attribute or figure), that opening sentence is followed by calling the tool -- naming the gap OPENS the answer, it never completes it, and you never ask the customer permission to search. The gap sentence plus the tool's result together form the answer; the gap sentence alone does not. Only "
         "then offer what the sources DO cover, clearly labelled as adjacent ('what we do list is...'). "
         "NEVER present a different specification as though it answered the question: one measurement "
         "does not answer a question about a different measurement, and a neighbouring attribute does "
@@ -2544,6 +2569,81 @@ def _extract_attribute_lines(s: dict) -> list[str]:
         label = key.replace("_", " ").strip().title()
         lines.append(f"  - {label}: {text}")
     return lines
+
+
+def _render_message_list_for_log(messages: list) -> str:
+    """Render a LangChain message list as a human-readable block for llm.log.
+
+    Turns [HumanMessage, AIMessage(tool_call), ToolMessage, ...] into a
+    numbered stack with each message's kind, tool metadata, and content.
+    Used to log the actual bytes fed to invoke() on turns 2+ of the
+    active-retrieval loop — where the interesting stuff (the tool
+    result) lives but nothing currently captures it.
+    """
+    lines: list[str] = []
+    for i, m in enumerate(messages):
+        kind = type(m).__name__
+        header = f"--- [{i}] {kind}"
+        tcid = getattr(m, "tool_call_id", None)
+        if tcid:
+            header += f"  tool_call_id={tcid}"
+        name = getattr(m, "name", None)
+        if name and kind == "ToolMessage":
+            header += f"  name={name}"
+        lines.append(header + " ---")
+        tool_calls = getattr(m, "tool_calls", None) or []
+        for tc in tool_calls:
+            lines.append(
+                f"  tool_call: {tc.get('name')} args={tc.get('args')} "
+                f"id={tc.get('id')}"
+            )
+        content = _extract_text(getattr(m, "content", "")) or ""
+        if content:
+            lines.append(content)
+    return "\n".join(lines)
+
+
+def _log_invoke_turn(*, provider_name, model_name, turn_index,
+                     prompt_snapshot, resp, turn_in, turn_out,
+                     client_id, endpoint):
+    """Write one llm.log entry per tool-loop invoke.
+
+    llm.log's outer log_llm_call wraps the ENTIRE loop as one entry
+    with sums only, so turn 2+ (which is where the tool result lives)
+    is invisible. This dumps each turn's actual message list and
+    response, tagged purpose=<endpoint>.turn<N>.
+    """
+    try:
+        from backend.app.services.llm_rerank_service import MODEL_PRICING as _MP
+        _p = _MP.get(model_name, {})
+        _cost = turn_in * _p.get("input", 0.0) + turn_out * _p.get("output", 0.0)
+
+        _resp_text = _extract_text(getattr(resp, "content", "")) or ""
+        _tc = getattr(resp, "tool_calls", None) or []
+        if _tc:
+            _tc_lines = "\n".join(
+                f"tool_call: {tc.get('name')} args={tc.get('args')} id={tc.get('id')}"
+                for tc in _tc
+            )
+            _resp_text = (
+                (_resp_text + "\n") if _resp_text else ""
+            ) + "---tool_calls---\n" + _tc_lines
+
+        log_llm_interaction(
+            provider=provider_name,
+            model=model_name,
+            purpose=f"{endpoint}.turn{turn_index}",
+            prompt=prompt_snapshot,
+            response_text=_resp_text or "(empty)",
+            input_tokens=turn_in,
+            output_tokens=turn_out,
+            cost=float(_cost),
+            client_id=client_id,
+            extra={"tool_calls": len(_tc)},
+        )
+    except Exception as _exc:
+        # Never let logging crash the request path.
+        logger.warning("per-turn log write failed: %s", _exc)
 
 
 def _extract_text(content: Any) -> str:

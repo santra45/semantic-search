@@ -36,8 +36,8 @@ from typing import Optional
 
 from backend.app.utils.logging_config import llm_logger
 
-MAX_PROMPT_CHARS = 4000
-MAX_RESPONSE_CHARS = 4000
+# MAX_PROMPT_CHARS = 4000
+# MAX_RESPONSE_CHARS = 4000
 RULE = "=" * 78
 INNER = "-" * 78
 
@@ -76,11 +76,12 @@ def log_llm_interaction(
         import json as _json
         meta_lines.append("   Extra:    " + _json.dumps(extra, ensure_ascii=False))
 
-    prompt_block = _indent(_truncate(prompt, MAX_PROMPT_CHARS), "     ")
+    prompt_block = _indent(prompt, "     ")
+
     if error:
         response_block = _indent(f"ERROR: {error}", "     ")
     else:
-        response_block = _indent(_truncate(response_text, MAX_RESPONSE_CHARS), "     ")
+        response_block = _indent(response_text, "     ")
 
     body = (
         "\n" + RULE + "\n"
@@ -175,13 +176,13 @@ def log_llm_call(
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _truncate(text: str, limit: int) -> str:
-    if text is None:
-        return ""
-    text = str(text)
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n…[truncated]"
+# def _truncate(text: str, limit: int) -> str:
+#     if text is None:
+#         return ""
+#     text = str(text)
+#     if len(text) <= limit:
+#         return text
+#     return text[:limit] + "\n…[truncated]"
 
 
 def _indent(text: str, prefix: str = "     ") -> str:
