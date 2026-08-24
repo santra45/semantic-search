@@ -59,14 +59,6 @@ from backend.app.magento.chatbot.services.product_formatter import (
 )
 from backend.app.magento.chatbot.services.text_chunker import chunk_text
 
-# How big each chunk's *body* gets, and how much context is carried across
-# adjacent chunk boundaries. 500 chars (~80-100 words) lets a single chunk
-# semantically centre on one paragraph or short section. 200-char overlap
-# preserves cross-paragraph context for queries that straddle a section
-# break.
-_CHUNK_TARGET_SIZE = 500
-_CHUNK_OVERLAP     = 200
-
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -212,7 +204,7 @@ def _process_chunkable_item(
 
     base_payload["store_code"] = store_code
 
-    body_chunks = chunk_text(body, target_size=_CHUNK_TARGET_SIZE, overlap=_CHUNK_OVERLAP)
+    body_chunks = chunk_text(body)
 
     chunk_records: list[dict[str, Any]] = []
     for idx, chunk_body in enumerate(body_chunks):

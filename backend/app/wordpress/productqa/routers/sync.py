@@ -70,13 +70,6 @@ router = APIRouter()
 
 DEFAULT_STORE_CODE = "default"
 
-# Chunk geometry, matched to the Magento side on purpose: both platforms feed
-# the same embedding model and the same retrieval code, so a WordPress FAQ
-# chunk and a Magento one should be the same size or their scores aren't
-# comparable within a collection.
-_CHUNK_TARGET_SIZE = 500
-_CHUNK_OVERLAP = 200
-
 # How long an identical re-post of the same item is treated as already done.
 # Long enough to absorb WordPress firing `save_post` several times for one
 # editor click (WooCommerce saves the product, then its variations, then meta),
@@ -338,7 +331,7 @@ def _process_chunkable_item(
 
     chunk_records: list[dict[str, Any]] = []
     for idx, chunk_body in enumerate(
-        chunk_text(body, target_size=_CHUNK_TARGET_SIZE, overlap=_CHUNK_OVERLAP)
+        chunk_text(body)
     ):
         embed_text = f"{header}\nContent: {chunk_body}" if header else chunk_body
         vector = embed_document(embed_text, embedding_api_key, license_data["client_id"])

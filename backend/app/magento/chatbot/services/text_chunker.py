@@ -57,7 +57,21 @@ _SEPARATOR_CASCADE = (
 )
 
 
-def chunk_text(text: str, target_size: int = 500, overlap: int = 200) -> list[str]:
+# Chunk geometry defaults. 1500 chars ≈ 240-300 words -- a whole policy
+# paragraph fits in one chunk. 10% overlap bridges cross-boundary queries
+# without saturating recall with near-duplicate embeddings of the same page
+# (the pathology the previous 500/200 defaults produced: a 4.5KB page turned
+# into 12 heavily-overlapping chunks that monopolised top-K for any query
+# grazing any topic on the page).
+DEFAULT_TARGET_SIZE = 1500
+DEFAULT_OVERLAP = 150
+
+
+def chunk_text(
+    text: str,
+    target_size: int = DEFAULT_TARGET_SIZE,
+    overlap: int = DEFAULT_OVERLAP,
+) -> list[str]:
     """Split *text* into chunks of ~*target_size* chars with ~*overlap* char overlap.
 
     Always returns at least one element. For empty / short input the result
