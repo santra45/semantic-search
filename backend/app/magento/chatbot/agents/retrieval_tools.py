@@ -271,11 +271,19 @@ def make_retrieval_tools(
         browsing -- "what do you have in red?", "something for cold
         weather", "a quieter model".
 
-        NOT for a specific figure. Embeddings compare meaning, not
-        magnitude, so "10 GPM" and "8 GPM" look almost identical to this
-        and it will return either. When the customer names a value --
-        a flow rate, a size, a rating -- use `find_products_listing`,
-        which matches the merchant's written specification instead.
+        For a pure value question ('do you have 10 GPM?', 'anything in
+        size L?'), prefer `find_products_listing`: embeddings compare
+        meaning not magnitude, so "10 GPM" and "8 GPM" look almost
+        identical to this tool and it will return either.
+
+        EXCEPTION -- COMPOUND QUERIES. When the customer combines the
+        value with a product TYPE, category, colour, or descriptor
+        ('20 GPM nozzle', 'red waterproof jacket', 'wireless mouse
+        with USB-C'), use THIS tool with the compound phrase as
+        `query`. A literal-match search on the value alone (via
+        `find_products_listing`) will return anything mentioning the
+        value in any product type; semantic search here can rank
+        products that match BOTH the value AND the type/descriptor.
 
         Args:
             query: Refined product search phrase.
@@ -345,6 +353,19 @@ def make_retrieval_tools(
         in front of them does not have. Ordinary product search matches
         wording, so asking it for "10 GPM" returns whatever *reads* like a
         pump; this matches the merchant's own written specification instead.
+
+        Compound phrases will NOT match. This is LITERAL substring matching;
+        no product's text contains the exact string '20 GPM nozzle' back-to
+        -back even if 20 GPM nozzles are in the catalogue. For a compound
+        query that combines a value with a product type or descriptor, use
+        `retrieve_more_products` instead -- its semantic search can rank
+        products that match BOTH the value AND the descriptor.
+
+        The header line of this tool's result reports both the match count
+        and the truncation: 'N products list "X". Showing K of N.' If K is
+        less than N, the tail is not visible to you -- do not make claims
+        about what the tail does or does not contain; narrow the query and
+        call this tool again, or route to `retrieve_more_products`.
 
         Report the store's figures exactly as the merchant wrote them. Do NOT
         convert between units -- if the store lists l/min, answer in l/min.
