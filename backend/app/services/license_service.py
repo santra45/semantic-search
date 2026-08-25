@@ -6,6 +6,8 @@ from jose import jwt, JWTError
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
+from backend.app.services import catalog
+
 SECRET_KEY = os.getenv("JWT_SECRET")
 ALGORITHM  = "HS256"
 
@@ -23,6 +25,11 @@ PLAN_LIMITS = {
         "search_limit_per_month": 500000
     }
 }
+
+# The onboarding page advertises these same numbers from catalog.PLANS. Check at
+# import time that the two agree, so the process refuses to start rather than
+# quietly selling a 5,000-product plan and issuing a 500-product key.
+catalog.assert_plans_match(PLAN_LIMITS)
 
 
 # ─── Generate ──────────────────────────────────────────────────────────────────
@@ -74,16 +81,31 @@ def generate_license_key(
     client_id: str,
     allowed_domain: str,
     plan: str = "starter",
-    valid_days: int = 365
+    valid_days: int = 365,
+    product_code: Optional[str] = None,
 ) -> str:
     """
     Generate a JWT license key for a client and store it in MySQL.
     The JWT contains everything needed to authenticate a request
     without hitting the database on every search.
+
+    *product_code* scopes the key to one thing the customer bought — see
+    catalog.PRODUCTS. It matters because several Magento modules share backend
+    endpoints, so the route a request arrives on cannot identify the product;
+    the key is the only trustworthy carrier of that identity. The platform is
+    derived from the product rather than passed in, so a caller can't mint a
+    key claiming a (platform, product) pair that doesn't exist.
+
+    Passing None issues a legacy all-products key. That path exists for the
+    keys already deployed in customer stores and for internal tooling; new
+    keys from onboarding always carry a product.
     """
     limits     = PLAN_LIMITS.get(plan, PLAN_LIMITS["starter"])
     license_id = str(uuid.uuid4())
     expires_at = datetime.utcnow() + timedelta(days=valid_days)
+
+    # Raises ValueError with customer-safe wording on an unknown code.
+    platform = catalog.validate_selection(product_code) if product_code else None
 
     payload = {
         "license_id":     license_id,
@@ -96,16 +118,24 @@ def generate_license_key(
         "iat":            datetime.utcnow(),
     }
 
+    # Only stamp the claims when there's a product. An explicit null in the JWT
+    # and an absent claim would both have to be handled on the read side, and
+    # absent is the one that already matches every key issued before this
+    # change — so there's exactly one shape for "unscoped".
+    if product_code:
+        payload["product_code"] = product_code
+        payload["platform"]     = platform
+
     token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
     # Store in MySQL
     db.execute(text("""
         INSERT INTO license_keys
             (id, client_id, license_key, allowed_domain, product_limit,
-             search_limit_per_month, expires_at)
+             search_limit_per_month, expires_at, product_code, platform)
         VALUES
             (:id, :client_id, :token, :domain, :product_limit,
-             :search_limit, :expires_at)
+             :search_limit, :expires_at, :product_code, :platform)
     """), {
         "id":            license_id,
         "client_id":     client_id,
@@ -113,7 +143,9 @@ def generate_license_key(
         "domain":        allowed_domain,
         "product_limit": limits["product_limit"],
         "search_limit":  limits["search_limit_per_month"],
-        "expires_at":    expires_at
+        "expires_at":    expires_at,
+        "product_code":  product_code,
+        "platform":      platform,
     })
 
     db.commit()
@@ -141,7 +173,7 @@ def validate_license_key(token: str, db: Session) -> dict:
     # Step 2 — check license is active in MySQL
     result = db.execute(text("""
         SELECT lk.is_active, lk.expires_at, lk.product_limit,
-               lk.search_limit_per_month,
+               lk.search_limit_per_month, lk.product_code, lk.platform,
                c.is_active as client_active, c.name
         FROM license_keys lk
         JOIN clients c ON c.id = lk.client_id
@@ -161,6 +193,14 @@ def validate_license_key(token: str, db: Session) -> dict:
     if result.expires_at and result.expires_at < datetime.utcnow():
         raise ValueError("License key has expired")
 
+    # The row wins over the JWT claim. A key's product can be changed in the
+    # database — an upgrade, a correction — and the token in the customer's
+    # store is a snapshot from issue time that nobody can reissue on demand.
+    # Reading the row means such a change takes effect without asking the
+    # customer to paste a new key.
+    product_code = result.product_code or payload.get("product_code")
+    platform     = result.platform     or payload.get("platform")
+
     return {
         "client_id":     client_id,
         "license_id":    license_id,
@@ -169,7 +209,12 @@ def validate_license_key(token: str, db: Session) -> dict:
         "product_limit": result.product_limit,
         "search_limit":  result.search_limit_per_month,
         "client_name":   result.name,
-        "license_expires": expires
+        "license_expires": expires,
+        # None on keys issued before per-product licensing. Callers must treat
+        # that as "legacy, all products" rather than as an error — those keys
+        # are live in customer stores and cannot be recalled.
+        "product_code":  product_code,
+        "platform":      platform,
     }
 
 

@@ -1,0 +1,874 @@
+/* ==========================================================================
+   Czargroup onboarding — provisioning desk
+
+   The page's job is narrow: get someone from "I want this" to "I have a key
+   pasted into my store". So it is designed as a form that issues an official
+   credential, not as a marketing landing page with a signup bolted on.
+
+   Two ideas drive every choice below.
+
+   1. The accent colour is data, not decoration. It is unset until a platform
+      is chosen, then becomes that platform's own colour — Magento's clay,
+      WooCommerce's purple. Store operators recognise those instantly, so the
+      page tells you what you're provisioning for before you read a word.
+
+   2. The licence panel is the signature. It typesets itself as you fill the
+      form and stamps when the key is issued, because a scoped credential is
+      the actual artifact this page produces.
+
+   Type: Archivo for display (signage grotesque), Public Sans for prose (a face
+   drawn for government forms — this is a form that issues a licence), IBM Plex
+   Mono for anything that is a literal value: keys, domains, product codes,
+   shell commands.
+   ========================================================================== */
+
+/* ── Tokens ─────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Ground: cool vellum, like technical drawing paper. */
+  --paper:        #E9ECEF;
+  --paper-raised: #FDFDFC;
+  --paper-sunk:   #DFE3E8;
+
+  --ink:    #10161D;
+  --ink-2:  #46525F;
+  --ink-3:  #77838F;
+
+  --rule:        #CBD2DA;
+  --rule-strong: #A8B3BF;
+
+  /* Platform colours. Applied as --accent once a platform is chosen. */
+  --magento: #C7502A;
+  --woo:     #7F54B3;
+  /* Resting accent before any choice: instrument petrol, deliberately not
+     either platform so an unselected state can't be misread as a selection. */
+  --steel:   #1F4E5F;
+
+  --accent:     var(--steel);
+  --accent-ink: #FFFFFF;
+
+  --ok:   #2C6E49;
+  --warn: #9A3412;
+
+  --font-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --font-body:    "Public Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --s-1:  0.25rem;
+  --s-2:  0.5rem;
+  --s-3:  0.75rem;
+  --s-4:  1rem;
+  --s-5:  1.5rem;
+  --s-6:  2rem;
+  --s-7:  3rem;
+  --s-8:  4.5rem;
+  --s-9:  7rem;
+
+  --measure: 34rem;
+  --shell:   76rem;
+
+  --dur: 180ms;
+  --ease: cubic-bezier(0.2, 0, 0.1, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur: 0ms; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── Reset ──────────────────────────────────────────────────────────────── */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background-color: var(--paper);
+  /* Faint 32px grid, like the ruling on drafting vellum. Two hairline
+     gradients rather than an image so it costs nothing and stays crisp at
+     any zoom. */
+  background-image:
+    linear-gradient(to right,  rgba(16, 22, 29, 0.032) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(16, 22, 29, 0.032) 1px, transparent 1px);
+  background-size: 32px 32px;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 1rem;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+img { max-width: 100%; display: block; }
+
+h1, h2, h3, h4 {
+  font-family: var(--font-display);
+  font-weight: 800;
+  line-height: 1.02;
+  letter-spacing: -0.028em;
+  margin: 0;
+  text-wrap: balance;
+}
+
+p { margin: 0; }
+
+a { color: inherit; }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.u-visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ── Shared atoms ───────────────────────────────────────────────────────── */
+
+/* Small uppercase mono label. Used for field names, step markers, and any
+   machine-ish token. Deliberately the same treatment everywhere so the eye
+   learns "mono + tracked out = this is a literal value or a system label". */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.shell {
+  width: 100%;
+  max-width: var(--shell);
+  margin-inline: auto;
+  padding-inline: var(--s-5);
+}
+
+/* ── Masthead ───────────────────────────────────────────────────────────── */
+
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  background-color: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule);
+}
+
+.masthead__inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-5);
+  min-height: 4rem;
+}
+
+.wordmark {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 1.0625rem;
+  letter-spacing: -0.02em;
+  text-decoration: none;
+}
+
+.wordmark__mark {
+  display: inline-block;
+  width: 0.6rem;
+  height: 1.05rem;
+  background-color: var(--accent);
+  transition: background-color var(--dur) var(--ease);
+}
+
+.masthead__nav {
+  display: flex;
+  gap: var(--s-5);
+}
+
+.masthead__nav a {
+  font-size: 0.875rem;
+  color: var(--ink-2);
+  text-decoration: none;
+  padding-block: var(--s-1);
+  border-bottom: 1px solid transparent;
+}
+
+.masthead__nav a:hover { color: var(--ink); border-bottom-color: var(--accent); }
+
+@media (max-width: 40rem) {
+  .masthead__nav { display: none; }
+}
+
+/* ── Hero ───────────────────────────────────────────────────────────────── */
+
+.hero {
+  padding-block: var(--s-8) var(--s-7);
+  border-bottom: 1px solid var(--rule);
+}
+
+.hero__eyebrow { margin-bottom: var(--s-4); }
+
+.hero__title {
+  font-size: clamp(2.5rem, 7.5vw, 4.75rem);
+  text-transform: uppercase;
+  max-width: 18ch;
+}
+
+/* The one line that carries the whole proposition, set in the accent so it
+   recolours with the platform choice. */
+.hero__title em {
+  font-style: normal;
+  color: var(--accent);
+  transition: color var(--dur) var(--ease);
+}
+
+.hero__lede {
+  margin-top: var(--s-5);
+  max-width: var(--measure);
+  font-size: 1.125rem;
+  color: var(--ink-2);
+}
+
+.hero__meta {
+  margin-top: var(--s-6);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-5);
+}
+
+.hero__meta li {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.hero__meta ul { list-style: none; margin: 0; padding: 0; display: contents; }
+
+.hero__meta .eyebrow::before {
+  content: "";
+  display: inline-block;
+  width: 0.375rem;
+  height: 0.375rem;
+  margin-right: var(--s-2);
+  background-color: var(--accent);
+  transition: background-color var(--dur) var(--ease);
+}
+
+/* ── Provisioning layout ────────────────────────────────────────────────── */
+
+.provision {
+  padding-block: var(--s-7) var(--s-9);
+}
+
+.provision__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--s-7);
+}
+
+@media (min-width: 62rem) {
+  .provision__grid {
+    grid-template-columns: minmax(0, 1fr) 21rem;
+    gap: var(--s-7);
+    align-items: start;
+  }
+}
+
+/* ── Steps ──────────────────────────────────────────────────────────────── */
+
+/* Numbered because this genuinely is a dependency chain: products are
+   platform-specific, so step 2 cannot be answered before step 1. The numbers
+   encode that order, they aren't ornament. */
+.step {
+  border: 0;
+  padding: 0;
+  margin: 0 0 var(--s-7) 0;
+}
+
+.step__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+  padding-bottom: var(--s-3);
+  margin-bottom: var(--s-5);
+  border-bottom: 1px solid var(--rule);
+}
+
+.step__num {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  transition: color var(--dur) var(--ease);
+}
+
+.step__title {
+  font-size: 1.25rem;
+  letter-spacing: -0.02em;
+}
+
+.step__hint {
+  margin-left: auto;
+  font-size: 0.8125rem;
+  color: var(--ink-3);
+}
+
+@media (max-width: 34rem) {
+  .step__hint { display: none; }
+}
+
+/* ── Choice cards (platform + product) ──────────────────────────────────── */
+
+.choices {
+  display: grid;
+  gap: var(--s-3);
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+}
+
+.choice {
+  position: relative;
+  display: block;
+  cursor: pointer;
+}
+
+.choice input {
+  position: absolute;
+  opacity: 0;
+  width: 1px; height: 1px;
+}
+
+/* The card and its rows are <span>s inside a <label> — a label may not contain
+   block-level elements, so the structure is inline by necessity and the layout
+   has to be restored here. Without these display declarations every row runs
+   together on one line. */
+.choice__body {
+  display: block;
+  height: 100%;
+  padding: var(--s-4) var(--s-4) var(--s-4) var(--s-5);
+  background-color: var(--paper-raised);
+  border: 1px solid var(--rule);
+  transition:
+    border-color var(--dur) var(--ease),
+    box-shadow   var(--dur) var(--ease),
+    transform    var(--dur) var(--ease);
+}
+
+/* The selection marker is a solid bar on the leading edge — the same device
+   the licence panel uses, so "this is the chosen thing" reads identically in
+   both places. */
+.choice__body::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: 3px;
+  background-color: transparent;
+  transition: background-color var(--dur) var(--ease);
+}
+
+.choice:hover .choice__body { border-color: var(--rule-strong); }
+
+.choice input:focus-visible + .choice__body {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.choice input:checked + .choice__body {
+  border-color: var(--accent);
+  box-shadow: 0 1px 0 var(--accent);
+}
+
+.choice input:checked + .choice__body::before { background-color: var(--accent); }
+
+.choice__name {
+  display: block;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.0625rem;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+}
+
+.choice__tagline {
+  display: block;
+  margin-top: var(--s-2);
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: var(--ink-2);
+}
+
+.choice__artifact {
+  display: block;
+  margin-top: var(--s-3);
+  padding-top: var(--s-2);
+  border-top: 1px dotted var(--rule);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--ink-3);
+  /* `anywhere` rather than `break-all`: package names have natural break
+     points at the slash and hyphens, and break-all ignores them and splits
+     mid-token ("...product-q / a"). */
+  overflow-wrap: anywhere;
+}
+
+.choice input:disabled + .choice__body { opacity: 0.4; cursor: not-allowed; }
+
+/* Step 2 stays inert until a platform is chosen — there is nothing truthful
+   to show before then, and an empty enabled fieldset invites a click that
+   does nothing. */
+.step--locked .choices,
+.step--locked .field-grid {
+  opacity: 0.42;
+  pointer-events: none;
+}
+
+.step__locknote {
+  font-size: 0.875rem;
+  color: var(--ink-3);
+  font-style: italic;
+}
+
+.step:not(.step--locked) .step__locknote { display: none; }
+
+/* ── Fields ─────────────────────────────────────────────────────────────── */
+
+.field-grid {
+  display: grid;
+  gap: var(--s-4);
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+}
+
+.field--wide { grid-column: 1 / -1; }
+
+.field { display: flex; flex-direction: column; gap: var(--s-2); }
+
+.field > label {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.field input,
+.field select {
+  width: 100%;
+  padding: 0.7rem var(--s-3);
+  font-family: var(--font-body);
+  font-size: 0.9375rem;
+  color: var(--ink);
+  background-color: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-radius: 0;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+
+/* Anything the customer types that is a literal machine value gets the mono
+   face, so the form previews how it will appear in the licence panel. */
+.field input[type="url"],
+.field input[name="store_url"] {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+
+.field input:focus,
+.field select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.field select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-2) 50%),
+                    linear-gradient(135deg, var(--ink-2) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 50%, calc(100% - 13px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: var(--s-6);
+}
+
+.field__note { font-size: 0.8125rem; color: var(--ink-3); }
+
+/* ── Plans ──────────────────────────────────────────────────────────────── */
+
+.plans {
+  display: grid;
+  gap: var(--s-3);
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+}
+
+.plan__body {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-4);
+  background-color: var(--paper-raised);
+  border: 1px solid var(--rule);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+
+.plan input:checked + .plan__body {
+  border-color: var(--accent);
+  box-shadow: 0 1px 0 var(--accent);
+}
+
+.plan input:focus-visible + .plan__body {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.plan__price {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 2rem;
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+
+.plan__period { font-size: 0.8125rem; color: var(--ink-3); }
+
+.plan__features {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  font-size: 0.875rem;
+  color: var(--ink-2);
+}
+
+.plan__features li { display: flex; gap: var(--s-2); }
+
+.plan__features li::before {
+  content: "";
+  flex: none;
+  width: 0.3125rem;
+  height: 0.3125rem;
+  margin-top: 0.5rem;
+  background-color: var(--rule-strong);
+}
+
+/* ── Submit ─────────────────────────────────────────────────────────────── */
+
+.submit-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  flex-wrap: wrap;
+  padding-top: var(--s-5);
+  border-top: 1px solid var(--rule);
+}
+
+.btn {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 0.9375rem;
+  letter-spacing: 0.01em;
+  padding: 0.85rem var(--s-6);
+  border: 1px solid var(--accent);
+  border-radius: 0;
+  background-color: var(--accent);
+  color: var(--accent-ink);
+  cursor: pointer;
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+.btn:hover:not(:disabled) { background-color: var(--ink); border-color: var(--ink); }
+
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn--quiet {
+  background-color: transparent;
+  color: var(--ink);
+  border-color: var(--rule-strong);
+}
+
+.btn--quiet:hover:not(:disabled) {
+  background-color: var(--ink);
+  border-color: var(--ink);
+  color: var(--paper-raised);
+}
+
+.btn--small { font-size: 0.8125rem; padding: 0.5rem var(--s-4); }
+
+.submit-row__note { font-size: 0.8125rem; color: var(--ink-3); }
+
+.form-error {
+  margin-top: var(--s-4);
+  padding: var(--s-3) var(--s-4);
+  background-color: var(--paper-raised);
+  border: 1px solid var(--warn);
+  border-left-width: 3px;
+  color: var(--warn);
+  font-size: 0.9375rem;
+}
+
+.form-error:empty { display: none; }
+
+/* ── Licence panel — the signature ──────────────────────────────────────── */
+
+.licence {
+  position: relative;
+  background-color: var(--paper-raised);
+  border: 1px solid var(--rule-strong);
+}
+
+@media (min-width: 62rem) {
+  .licence { position: sticky; top: 5.5rem; }
+}
+
+/* Measured tick edge along the top, like the trim marks on a printed
+   certificate. Pure gradient, no asset. */
+.licence::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  top: 0;
+  height: 4px;
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--rule-strong) 0 1px,
+    transparent 1px 6px
+  );
+}
+
+.licence__bar {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: 3px;
+  background-color: var(--accent);
+  transition: background-color var(--dur) var(--ease);
+}
+
+.licence__head {
+  padding: var(--s-5) var(--s-4) var(--s-3) var(--s-5);
+  border-bottom: 1px solid var(--rule);
+}
+
+.licence__title {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 1.0625rem;
+  letter-spacing: -0.015em;
+  margin-top: var(--s-1);
+}
+
+.licence__rows { padding: var(--s-3) var(--s-4) var(--s-3) var(--s-5); }
+
+.licence__row {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
+  gap: var(--s-3);
+  align-items: baseline;
+  padding-block: var(--s-2);
+  border-bottom: 1px dotted var(--rule);
+}
+
+.licence__row:last-child { border-bottom: 0; }
+
+.licence__key {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.licence__val {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+/* Unfilled fields read as an em dash in muted ink, so the panel is legible as
+   a form-in-progress rather than looking broken. */
+.licence__val[data-empty="true"] { color: var(--rule-strong); }
+
+.licence__status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4) var(--s-3) var(--s-5);
+  border-top: 1px solid var(--rule);
+  background-color: var(--paper-sunk);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+.licence[data-state="issued"] .licence__status {
+  background-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.licence__stamp { font-weight: 600; }
+
+/* ── Issued view ────────────────────────────────────────────────────────── */
+
+.issued { display: none; padding-block: var(--s-7) var(--s-9); }
+
+.issued[data-visible="true"] { display: block; }
+
+.issued__head { margin-bottom: var(--s-6); }
+
+.issued__title {
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  text-transform: uppercase;
+  margin-top: var(--s-3);
+}
+
+.issued__lede {
+  margin-top: var(--s-4);
+  max-width: var(--measure);
+  color: var(--ink-2);
+}
+
+.keybox {
+  margin-bottom: var(--s-6);
+  background-color: var(--ink);
+  border-left: 3px solid var(--accent);
+}
+
+.keybox__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.keybox__label {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #8FA3B0;
+}
+
+.keybox__value {
+  display: block;
+  width: 100%;
+  padding: var(--s-4);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  color: #E8EDF1;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.copy-btn {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 0.4rem var(--s-3);
+  color: var(--ink);
+  background-color: #E8EDF1;
+  border: 0;
+  cursor: pointer;
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+.copy-btn:hover { background-color: #FFFFFF; }
+
+.copy-btn[data-copied="true"] { background-color: var(--ok); color: #FFFFFF; }
+
+.install__heading {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 1.25rem;
+  letter-spacing: -0.02em;
+  padding-bottom: var(--s-3);
+  margin-bottom: var(--s-5);
+  border-bottom: 1px solid var(--rule);
+}
+
+.install { display: grid; gap: var(--s-4); }
+
+.install__step {
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr);
+  gap: var(--s-4);
+  padding-bottom: var(--s-4);
+  border-bottom: 1px solid var(--rule);
+}
+
+.install__num {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  padding-top: 0.2rem;
+}
+
+.install__label {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+}
+
+.install__detail { margin-top: var(--s-2); color: var(--ink-2); font-size: 0.9375rem; }
+
+.install__code {
+  margin-top: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  background-color: var(--ink);
+  color: #E8EDF1;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.issued__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-3);
+  margin-top: var(--s-6);
+}
+
+/* ── Footer ─────────────────────────────────────────────────────────────── */
+
+.footer {
+  padding-block: var(--s-6);
+  border-top: 1px solid var(--rule);
+  background-color: var(--paper-sunk);
+}
+
+.footer__inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-4);
+}
+
+.footer p { font-size: 0.8125rem; color: var(--ink-3); }

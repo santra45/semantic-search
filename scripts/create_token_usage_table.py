@@ -21,7 +21,12 @@ def create_token_usage_table():
         id BIGINT AUTO_INCREMENT PRIMARY KEY,
         client_id VARCHAR(36) NOT NULL,
         request_id VARCHAR(255) NOT NULL UNIQUE,
-        query_type ENUM('embed_search', 'embed_document', 'embed_query', 'product_rerank', 'content_rerank', 'chat_answer', 'chat_context', 'chat_rewrite', 'wp_product_qa') NOT NULL,
+        -- Must stay in lockstep with QUERY_TYPES in
+        -- backend/app/services/token_usage_service.py. A type present in Python
+        -- but missing here passes the allowlist and then fails the INSERT under
+        -- STRICT_TRANS_TABLES, which is how wp_product_qa went unbilled: the
+        -- Python half of the fix shipped and the enum half never did.
+        query_type ENUM('embed_search', 'embed_document', 'embed_query', 'product_rerank', 'content_rerank', 'chat_answer', 'chat_context', 'chat_rewrite', 'chat_intent', 'chat_tool_call', 'chat_query_decompose', 'wp_product_qa') NOT NULL,
         llm_provider VARCHAR(50) NOT NULL,
         llm_model VARCHAR(100) NOT NULL,
         
@@ -60,21 +65,43 @@ def create_token_usage_table():
     
     try:
         with engine.connect() as conn:
-            # Drop table if it exists for clean recreation
-            conn.execute(text("DROP TABLE IF EXISTS token_usage_tracking"))
-            logger.info("Dropped existing token_usage_tracking table")
-            
-            # Create the new table without foreign key constraint
+            existing = conn.execute(text("""
+                SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_schema = DATABASE() AND table_name = 'token_usage_tracking'
+            """)).scalar()
+
+            if existing:
+                rows = conn.execute(
+                    text("SELECT COUNT(*) FROM token_usage_tracking")
+                ).scalar()
+                logger.info(
+                    "token_usage_tracking already exists with %s row(s) — leaving it alone.",
+                    f"{rows:,}",
+                )
+                logger.info(
+                    "This table is the billing ledger and the only per-request record "
+                    "in the system; it is never recreated automatically."
+                )
+                logger.info(
+                    "To change its shape, write an idempotent ALTER migration in "
+                    "scripts/ (see migrate_license_product_platform.py for the pattern)."
+                )
+                return False
+
+            # CREATE TABLE IF NOT EXISTS, so a race with another process that
+            # created it between the check above and here is a no-op rather
+            # than an error.
             conn.execute(text(create_table_sql))
             conn.commit()
-            logger.info("✅ Successfully created token_usage_tracking table")
-            
-            # Show table structure
+            logger.info("✅ Created token_usage_tracking table")
+
             result = conn.execute(text("DESCRIBE token_usage_tracking"))
             logger.info("Table structure:")
             for row in result:
                 logger.info(f"  {row}")
-                
+
+            return True
+
     except Exception as e:
         logger.error(f"❌ Failed to create token_usage_tracking table: {e}")
         raise
@@ -123,9 +150,14 @@ def test_table_operations():
 
 if __name__ == "__main__":
     logger.info("Creating token_usage_tracking table...")
-    create_token_usage_table()
-    
-    logger.info("Testing table operations...")
-    test_table_operations()
-    
-    logger.info("🎉 Token usage tracking table setup complete!")
+    created = create_token_usage_table()
+
+    # The smoke test writes and deletes a row. Only worth running against a
+    # table we just made — on a populated ledger it is a pointless write to
+    # production billing data.
+    if created:
+        logger.info("Testing table operations...")
+        test_table_operations()
+        logger.info("🎉 Token usage tracking table setup complete!")
+    else:
+        logger.info("Nothing to do.")
