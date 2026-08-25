@@ -1,6 +1,7 @@
 """WooCommerce content formatter — (embedding_text, qdrant_payload) pairs.
 
-Two content types, which is all this module syncs: `product` and `faq`.
+Four content types: `product`, `faq`, and the store's own site content —
+`page` and `post`.
 
 ONE FORMATTER, TWO CALLERS. Both WooCommerce plugins run their products
 through this module:
@@ -764,9 +765,115 @@ def format_faq(faq: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     return _final_clean(text), payload
 
 
+# ── Site content: pages and posts ────────────────────────────────────────────
+#
+# The store's own pages are where the answers to "how long does delivery take",
+# "can I return this" and "is there a warranty" actually live. None of that is
+# in product data, and a widget that can only read product data answers those
+# questions with an honest but useless "contact the store".
+#
+# Chunked, for the same reason cms_page is on the Magento side: a shipping
+# policy runs to several screens, and one vector over the whole thing lets the
+# opening paragraph decide what the page matches. The clause that answers the
+# question is three paragraphs down.
+#
+# The type label the shopper-facing prompt sees is deliberately different per
+# type. A `page` is store policy the assistant may state as fact; a `post` is
+# editorial that may be years old, and telling the model which it is reading is
+# the difference between quoting a current returns window and quoting one from
+# a 2019 blog announcement.
+
+_SITE_CONTENT_LABELS = {
+    "page": "Page",
+    "post": "Blog post",
+}
+
+
+def format_site_content_chunkable(
+    content_type: str, item: Dict[str, Any]
+) -> Tuple[str, str, Dict[str, Any]]:
+    """(header, body, base_payload) for one WordPress page or post.
+
+    The header repeats onto every chunk's embedding, so chunk 4 of a long
+    delivery page still carries "Page: Shipping & Delivery" in its vector and
+    stays findable even though its own paragraph never says "shipping".
+
+    `content` is absent from base_payload on purpose — the sync router sets it
+    per chunk. Copying the whole body onto every chunk would hand the prompt
+    the entire page whichever paragraph matched, which is the thing chunking
+    exists to avoid.
+    """
+    label = _SITE_CONTENT_LABELS.get(content_type, "Page")
+
+    title = str(item.get("title") or item.get("name") or "").strip()
+    slug_value = str(item.get("slug") or item.get("identifier") or "").strip()
+    # From whichever SEO plugin the store runs — Yoast, Rank Math, SEOPress.
+    # The plugin reads them; this module doesn't care which wrote them.
+    meta_description = str(item.get("meta_description") or "").strip()
+    meta_keywords = str(item.get("meta_keywords") or "").strip()
+    excerpt = html_to_structured_text(item.get("excerpt") or "")
+    content = html_to_structured_text(item.get("content") or "")
+    categories = _resolve_tags(item.get("categories"))
+    tags = _resolve_tags(item.get("tags"))
+
+    header_parts: list[str] = []
+    if title:
+        header_parts.append(f"{label}: {title}")
+    if slug_value and slug_value.lower() != title.lower():
+        header_parts.append(f"URL: {slug_value}")
+    if meta_description:
+        header_parts.append(f"Description: {meta_description}")
+    if meta_keywords:
+        header_parts.append(f"Keywords: {meta_keywords}")
+    if categories:
+        header_parts.append(f"Categories: {categories}")
+    if tags:
+        header_parts.append(f"Tags: {tags}")
+    # Only when it says something the body doesn't open with — a hand-written
+    # excerpt is a curated summary worth embedding, an auto-generated one is
+    # just the first 55 words of the content repeated back.
+    if excerpt and not content.startswith(excerpt[:80]):
+        header_parts.append(f"Summary: {excerpt}")
+
+    header_text = _final_clean("\n".join(header_parts))
+
+    summary = meta_description or excerpt or content[:300]
+
+    base_payload = {
+        "title": title,
+        "identifier": slug_value,
+        "meta_description": meta_description,
+        "meta_keywords": meta_keywords,
+        "excerpt": excerpt[:600],
+        "summary": summary[:600],
+        "permalink": str(item.get("permalink") or ""),
+        "author": str(item.get("author") or ""),
+        "date": str(item.get("date") or ""),
+        "modified": str(item.get("modified") or ""),
+        "categories": categories,
+        "tags": tags,
+        "status": str(item.get("status") or "publish"),
+    }
+
+    return header_text, content, base_payload
+
+
+def format_site_content(content_type: str, item: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Single-point variant, for the non-chunked fallback path."""
+    header, body, payload = format_site_content_chunkable(content_type, item)
+    payload["content"] = body
+    text = f"{header}\nContent: {body}" if header else body
+    return _final_clean(text), payload
+
+
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 
-SUPPORTED_TYPES = {"product", "faq"}
+SUPPORTED_TYPES = {"product", "faq", "page", "post"}
+
+# The subset that is the merchant's own site content rather than catalogue
+# data. Callers use this to decide what a "site content" action covers without
+# hard-coding the pair in four places.
+SITE_CONTENT_TYPES = ("page", "post")
 
 
 def format_item(
@@ -776,7 +883,7 @@ def format_item(
     attribute_vocab_sink: Optional[Dict[str, set[str]]] = None,
     category_vocab_sink: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Route to the right formatter. Only the two types this module syncs are
+    """Route to the right formatter. Only the types this module syncs are
     supported — the router rejects anything else before reaching here, so an
     unknown type arriving is a bug rather than a merchant misconfiguration."""
     if content_type == "product":
@@ -787,4 +894,6 @@ def format_item(
         )
     if content_type == "faq":
         return format_faq(item)
+    if content_type in SITE_CONTENT_TYPES:
+        return format_site_content(content_type, item)
     raise ValueError(f"Unsupported content_type for WordPress sync: {content_type!r}")

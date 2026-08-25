@@ -306,6 +306,48 @@ def format_faq_source(source: dict, title: str) -> str:
     return f"[faq] {title}\n{body}"
 
 
+# How a page or post is announced to the model. A `page` is store policy it may
+# state as our own; a `post` is editorial that may be years old. Naming which is
+# which is what stops a 2019 blog announcement being quoted as the current
+# returns window.
+_SITE_CONTENT_LABELS = {
+    "page": "store page",
+    "post": "blog post",
+}
+
+
+def format_site_content_source(source: dict, title: str, content_type: str) -> str:
+    """Render one of the store's own pages or posts.
+
+    `content` first, `summary` only as a fallback. These arrive chunked, so
+    `content` is the matched paragraph rather than the whole page — the thing
+    retrieval decided was relevant — whereas `summary` is the page's opening
+    300 characters, which is the part that specifically wasn't.
+
+    The permalink rides along so the link rule below can point the shopper at
+    the full policy instead of paraphrasing the whole of it.
+    """
+    label = _SITE_CONTENT_LABELS.get(content_type, "store page")
+    parts = [f"[{label}] {title}"]
+
+    permalink = str(source.get("permalink") or "").strip()
+    if permalink:
+        parts.append(f"URL: {permalink}")
+
+    # Only on posts: a page is current by definition, a post carries a date the
+    # model needs in order to hedge appropriately about how old the claim is.
+    if content_type == "post":
+        published = str(source.get("date") or "").strip()
+        if published:
+            parts.append(f"Published: {published}")
+
+    body = str(source.get("content") or source.get("summary") or source.get("excerpt") or "")
+    if body:
+        parts.append(body[:4000])
+
+    return "\n".join(parts)
+
+
 def format_source_for_prompt(source: dict) -> str:
     """Flatten one source into its prompt block."""
     content_type = (source.get("content_type") or "").lower()
@@ -321,6 +363,8 @@ def format_source_for_prompt(source: dict) -> str:
         return format_product_source(source, title)
     if content_type == "faq":
         return format_faq_source(source, title)
+    if content_type in _SITE_CONTENT_LABELS:
+        return format_site_content_source(source, title, content_type)
 
     body = (source.get("summary") or source.get("content") or source.get("description") or "")[:800]
     return f"[{content_type or 'source'}] {title}\n{body}"
@@ -360,19 +404,39 @@ def build_answer_prompt(
 
     instruction_block = f"\n\nAdditional framing instruction: {instruction.strip()}" if instruction else ""
 
-    # Only surfaced when an FAQ source is actually present, so neither the rule
-    # nor its tokens touch a pure product answer. The widget's markdown
-    # renderer only linkifies [text](url), so a bare URL in a merchant's FAQ
-    # answer would otherwise render as dead plain text.
-    faq_link_rule = ""
-    if any((s.get("content_type") or "").lower() == "faq" for s in (sources or [])):
-        faq_link_rule = (
-            " - **Links in FAQ answers.** When you use a fact from a `[faq]` source "
-            "that contains a URL (a tracking page, returns form, guide, etc.), "
-            "surface that link as a clickable **markdown link** with short "
-            "descriptive text — e.g. `[our returns form](https://example.com/returns)` "
-            "— never a bare URL and never a raw HTML `<a>` tag. Only for URLs that "
-            "actually appear in a `[faq]` source; never invent a link.\n"
+    present_types = {(s.get("content_type") or "").lower() for s in (sources or [])}
+
+    # Both rules below are conditional so neither their wording nor their
+    # tokens touch a pure product answer.
+    source_rules = ""
+
+    # The widget's markdown renderer only linkifies [text](url), so a bare URL
+    # in a merchant's FAQ answer would otherwise render as dead plain text.
+    if "faq" in present_types or present_types & set(_SITE_CONTENT_LABELS):
+        source_rules += (
+            " - **Links.** When you use a fact from a `[faq]`, `[store page]` or "
+            "`[blog post]` source that carries a URL — its own `URL:` line, or a "
+            "tracking page, returns form or guide named in the text — surface that "
+            "link as a clickable **markdown link** with short descriptive text, e.g. "
+            "`[our returns policy](https://example.com/returns)`. Never a bare URL, "
+            "never a raw HTML `<a>` tag, and only for URLs that actually appear in a "
+            "source; never invent a link.\n"
+        )
+
+    if present_types & set(_SITE_CONTENT_LABELS):
+        source_rules += (
+            " - **Store pages and blog posts are store-wide, not about this "
+            "product.** Use them for what product data cannot answer — delivery, "
+            "returns, warranty, payment, care and how we operate — and state those "
+            "terms as our own. Never treat such a source as describing this product "
+            "unless it names it, and never mention another product that appears in "
+            "one. Where a store-wide rule and this product's own data disagree about "
+            "the product, the product data wins. A `[blog post]` is editorial and "
+            "carries a publication date: if it is the only thing supporting a claim "
+            "about a current price, policy or timeframe, say where it came from "
+            "rather than stating it as today's terms. If a source is clearly "
+            "unrelated to what was asked, ignore it rather than stretching it into "
+            "an answer.\n"
         )
 
     return (
@@ -403,7 +467,7 @@ def build_answer_prompt(
         " - No markdown headings. Prefer plain prose, but you MAY use a short bulleted or "
         "numbered list when it genuinely makes a multi-part answer clearer (a set of steps, "
         "care instructions, or the options the sources lay out).\n"
-        + faq_link_rule
+        + source_rules
         + " - **Merchant guidance is authoritative.** When a product source carries a "
         "'Merchant guidance' block, weight it above anything you'd infer from the description "
         "— those are the store's own notes about this item.\n"

@@ -5,10 +5,11 @@
   GET  /api/wordpress/productqa/sync/status   — indexed counts
   POST /api/wordpress/productqa/sync/purge    — drop one content_type
 
-Two content types only: `product` and `faq`. Products are single points;
-FAQ entries chunk, because a merchant's returns policy is routinely long
-enough that a single vector lets the opening sentence dominate and buries the
-clause that actually answers the question.
+Four content types: `product`, `faq`, and the store's own site content —
+`page` and `post`. Products are single points; the other three chunk, because
+a merchant's returns policy is routinely long enough that a single vector lets
+the opening sentence dominate and buries the clause that actually answers the
+question.
 
 Everything writes into the same per-tenant collection the rest of the platform
 uses (`products_{domain}_{client_id}`), with the same point-id scheme. That is
@@ -59,10 +60,12 @@ from backend.app.wordpress.productqa.services.common import authorize_request, d
 # the same Qdrant point for the same product, so both must produce the same
 # bytes. See that module's header.
 from backend.app.wordpress.services.product_formatter import (
+    SITE_CONTENT_TYPES,
     SUPPORTED_TYPES,
     build_product_point,
     format_faq_chunkable,
     format_item,
+    format_site_content_chunkable,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,7 +177,10 @@ def sync_batch(
         request_license=req.license_key,
     )
 
-    # Quota is counted against products only — FAQ entries are free.
+    # Quota is counted against products only. FAQ entries, pages and posts are
+    # free: the plan limit is `get_client_product_count`, and folding a store's
+    # own help content into that total would stop a merchant sitting near their
+    # limit from indexing the delivery page that answers half their questions.
     incoming_products = sum(1 for item in req.items if item.content_type == "product")
     if incoming_products:
         current = get_client_product_count(license_data["client_id"], license_data["domain"])
@@ -313,20 +319,35 @@ def _process_chunkable_item(
     embedding_api_key: Optional[str],
     license_data: dict[str, Any],
 ) -> int:
-    """Embed and upsert one FAQ entry as N chunks.
+    """Embed and upsert one FAQ entry, page or post as N chunks.
 
-    The header (the merchant's question heading) is prepended to every chunk's
-    embedding text. That repetition is the whole trick: chunk 4 of a long
-    shipping policy still carries "FAQ: How long does delivery take" in its
-    vector, so it's findable even though its own text never says "delivery".
+    The header (the FAQ's question heading, or the page's title and URL) is
+    prepended to every chunk's embedding text. That repetition is the whole
+    trick: chunk 4 of a long shipping policy still carries "FAQ: How long does
+    delivery take" in its vector, so it's findable even though its own text
+    never says "delivery".
 
     Each chunk's payload carries only ITS body, so when retrieval lands on
     chunk 4 the prompt gets that paragraph rather than the whole policy.
     """
-    if item.content_type != "faq":
+    if item.content_type == "faq":
+        header, body, base_payload = format_faq_chunkable(item.payload)
+    elif item.content_type in SITE_CONTENT_TYPES:
+        header, body, base_payload = format_site_content_chunkable(
+            item.content_type, item.payload
+        )
+        # A page whose body cleans down to nothing — one built entirely out of
+        # page-builder shortcodes that render to markup, say — has nothing to
+        # embed. chunk_text returns [""] for empty input, so without this the
+        # embedder would be handed an empty string and the failure would be
+        # logged as an embedding error rather than as what it is.
+        if not body.strip():
+            raise ValueError(
+                f"{item.content_type} {item.entity_id} has no readable text after cleaning"
+            )
+    else:
         raise ValueError(f"non-chunkable content_type routed to chunked path: {item.content_type}")
 
-    header, body, base_payload = format_faq_chunkable(item.payload)
     base_payload["store_code"] = store_code
 
     chunk_records: list[dict[str, Any]] = []
