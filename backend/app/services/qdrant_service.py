@@ -82,7 +82,19 @@ KNOWN_CONTENT_TYPES = [
 # `faq` joined for the same reason — merchant-authored FAQ answers can run
 # long, and chunking keeps each answer grounded in its title (the embedding
 # anchor) on every chunk.
-CHUNKABLE_CONTENT_TYPES = {"cms_page", "cms_block", "category", "faq"}
+#
+# `page` / `post` (WordPress) joined when the product Q&A plugin started
+# indexing them: a store's delivery or returns page is the WordPress analogue
+# of a Magento cms_page and fails the same way as one vector — the opening
+# paragraph dominates and the clause that answers the question never surfaces.
+#
+# Both are also written as SINGLE points by the older semantic-search-woo sync
+# (upsert_page / upsert_post call upsert_content_item directly). Listing them
+# here does not break those: count_content_type's `chunk_index is empty` arm
+# counts a legacy single point exactly once, and delete_content_item's
+# filter-based path removes it by (content_type, entity_id) whether it is one
+# point or six.
+CHUNKABLE_CONTENT_TYPES = {"cms_page", "cms_block", "category", "faq", "page", "post"}
 
 
 # ── Hybrid-search named-vector slots (Phase 2.2) ────────────────────────────
