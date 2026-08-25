@@ -16,6 +16,7 @@ from typing import Optional
 import anthropic
 from google import genai
 from openai import OpenAI
+from groq import Groq
 
 from backend.app.services.llm_rerank_service import (
     MODEL_PRICING,
@@ -34,6 +35,7 @@ DEFAULT_MODELS = {
     "gemini":    "gemini-2.5-flash",
     "openai":    "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5-20251001",
+    "groq":      "llama-3.1-8b-instant",
 }
 
 
@@ -123,6 +125,21 @@ def complete(
             if getattr(block, "type", None) == "text":
                 parts.append(getattr(block, "text", "") or "")
         response_text = ("".join(parts)).strip()
+
+    elif provider == "groq":
+        if not api_key:
+            raise ValueError("Groq requires api_key")
+        client = Groq(api_key=api_key, http_client=make_http_client())
+        groq_kwargs: dict = {
+            "model":       model,
+            "messages":    [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens":  max_tokens,
+        }
+        if json_mode:
+            groq_kwargs["response_format"] = {"type": "json_object"}
+        response = client.chat.completions.create(**groq_kwargs)
+        response_text = (response.choices[0].message.content or "").strip()
 
     else:
         raise ValueError(f"Unknown provider: {provider}")
