@@ -12,6 +12,7 @@ import time
 from google import genai
 from openai import OpenAI
 import anthropic
+from groq import Groq
 
 router = APIRouter()
 
@@ -33,6 +34,11 @@ def test_llm_api_key(provider: str, api_key: str, model: str = None) -> bool:
         elif provider == "gemini":
             client = genai.Client(api_key=api_key)
             client.models.list()  # works in new SDK
+            return True
+
+        elif provider == "groq":
+            client = Groq(api_key=api_key)
+            client.models.list()
             return True
 
         else:

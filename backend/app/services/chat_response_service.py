@@ -7,6 +7,7 @@ from typing import Any
 import anthropic
 from google import genai
 from openai import OpenAI
+from groq import Groq
 
 from backend.app.services.llm_rerank_service import (
     MODEL_PRICING,
@@ -94,6 +95,7 @@ def _resolve_provider_defaults(llm_provider: str | None, llm_model: str | None) 
         "gemini": "gemini-2.5-flash",
         "openai": "gpt-5.4-mini",
         "anthropic": "claude-3-5-sonnet-20241022",
+        "groq": "llama-3.3-70b-versatile",
     }
     return provider, (llm_model or defaults.get(provider, defaults["gemini"])).strip()
 
@@ -184,6 +186,15 @@ def generate_grounded_answer(
             messages=[{"role": "user", "content": prompt}],
         )
         response_text = response.content[0].text.strip()
+    elif provider == "groq":
+        client = Groq(api_key=llm_api_key, http_client=make_http_client())
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=800,
+        )
+        response_text = response.choices[0].message.content.strip()
     else:
         raise ValueError(f"Unsupported llm provider: {provider}")
 
