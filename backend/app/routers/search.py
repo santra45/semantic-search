@@ -9,6 +9,10 @@ from backend.app.services.intent_service import analyze_intent
 from backend.app.services.rerank_service import extract_keywords, filter_and_rerank
 from backend.app.services.llm_rerank_service import llm_rerank_products, should_use_llm_reranking
 from backend.app.services.llm_key_service import decrypt_key
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 import time
 from backend.app.services.license_service import (validate_license_key, increment_search_count, check_search_quota, log_search)
 from backend.app.services.database import get_db
@@ -25,6 +29,12 @@ class SearchRequest(BaseModel):
     llm_provider: str = None
     llm_model: str = None
     llm_api_key_encrypted: str = None
+    # The tenant's separate embedding key, encrypted under the license key
+    # exactly like llm_api_key_encrypted. Absent = fall back to the LLM key,
+    # which is what every install predating the embedding config sends.
+    embedding_api_key_encrypted: str = None
+    embedding_provider: str = None
+    embedding_model: str = None
     content_types: list = None  # None = all types, ['product'], ['page'], ['post'], or ['product', 'page', 'post']
 
 
@@ -111,18 +121,14 @@ async def search(req: SearchRequest, request: Request, db: Session = Depends(get
     else:
         print(f"🌐 Cache MISS: '{query}' — calling Gemini")
         
-        # Decrypt embedding API key if provided
-        if req.llm_api_key_encrypted:
-            try:
-                embedding_api_key = decrypt_key(req.llm_api_key_encrypted, license_key)   
-            except Exception as e:
-                print(f"❌ Embedding API key decryption failed: {e}")
-                embedding_api_key = None
-        else:
-            print(f"Embedding API key not provided, using default")
-            embedding_api_key = None
-            
-        query_vector = embed_query(query, embedding_api_key, client_id)
+        # The embedding key if the merchant configured one, else the LLM key.
+        embedding_api_key = resolve_embedding_key(
+            req.embedding_api_key_encrypted,
+            req.llm_api_key_encrypted,
+            license_key,
+        )
+        embedding_model = resolve_embedding_model(req.embedding_model, req.embedding_provider)
+        query_vector = embed_query(query, embedding_api_key, client_id, model=embedding_model)
         set_cached_embedding(query, query_vector)
 
     # Step 5 — search Qdrant

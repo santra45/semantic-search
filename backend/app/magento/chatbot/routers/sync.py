@@ -26,6 +26,10 @@ from sqlalchemy.orm import Session
 from backend.app.services.cache_service import invalidate_client_results, r as redis_client
 from backend.app.services.database import get_db
 from backend.app.services.embedder import embed_document
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 from backend.app.services.license_service import increment_ingest_count
 from backend.app.services.qdrant_service import (
     CHUNKABLE_CONTENT_TYPES,
@@ -144,6 +148,11 @@ class SyncItem(BaseModel):
 class SyncBatchRequest(BaseModel):
     license_key: Optional[str] = None
     llm_api_key_encrypted: Optional[str] = None
+    # Body twins of the X-Embedding-* headers, for callers that can't set
+    # headers (and for anyone reproducing a sync with curl). Headers win.
+    embedding_api_key_encrypted: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
     items: list[SyncItem] = Field(default_factory=list)
     batch_number: int = 1
     total_batches: int = 1
@@ -169,6 +178,7 @@ def _process_chunkable_item(
     store_code: str,
     embedding_api_key: Optional[str],
     license_data: dict[str, Any],
+    embedding_model: Optional[str] = None,
 ) -> int:
     """Embed + upsert one CMS-style item as N chunks.
 
@@ -212,7 +222,9 @@ def _process_chunkable_item(
         # whole point of the chunked formatter — keeps every chunk's
         # vector grounded in the page's title + meta + anchors.
         embed_text = f"{header}\nContent: {chunk_body}" if header else chunk_body
-        vector = embed_document(embed_text, embedding_api_key, license_data["client_id"])
+        vector = embed_document(
+            embed_text, embedding_api_key, license_data["client_id"], model=embedding_model
+        )
         # Phase 2.2 — sparse BM25 vector generated from the SAME embed
         # text the dense vector saw. Fast (~5 ms CPU) and free; cached
         # nothing because each chunk is unique. Failure is non-fatal —
@@ -253,6 +265,9 @@ def sync_batch(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     x_magento_creds: Optional[str] = Header(None, alias="X-Magento-Admin-Creds-Encrypted"),
     # When the Magento side sets this header (truthy value), skip the
     # Redis dedup guard. Full-sync batches are authoritative — if we get
@@ -290,8 +305,17 @@ def sync_batch(
                 ),
             )
 
-    embedding_api_key = decrypt_llm_key(
-        x_llm_api_key_encrypted or req.llm_api_key_encrypted, license_data["license_key"]
+    # Sync is pure embedding — no completion model is called on this path,
+    # so the LLM key is only ever the fallback for tenants who haven't set
+    # a separate embedding key.
+    embedding_api_key = resolve_embedding_key(
+        x_embedding_api_key_encrypted or req.embedding_api_key_encrypted,
+        x_llm_api_key_encrypted or req.llm_api_key_encrypted,
+        license_data["license_key"],
+    )
+    embedding_model = resolve_embedding_model(
+        x_embedding_model or req.embedding_model,
+        x_embedding_provider or req.embedding_provider,
     )
 
     attribute_vocab_sink: dict[str, set[str]] = defaultdict(set)
@@ -352,7 +376,7 @@ def sync_batch(
                 # content_item filter-deletes first so old chunks (or
                 # legacy single points pre-chunking) can't leave orphans.
                 _process_chunkable_item(
-                    item, store_code, embedding_api_key, license_data,
+                    item, store_code, embedding_api_key, license_data, embedding_model,
                 )
             else:
                 # Single-point path — unchanged from pre-chunking behaviour
@@ -372,7 +396,10 @@ def sync_batch(
                 payload["embedded_text"] = text_for_embed
                 payload["store_code"]    = store_code
 
-                vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
+                vector = embed_document(
+                    text_for_embed, embedding_api_key, license_data["client_id"],
+                    model=embedding_model,
+                )
                 try:
                     sparse_vector = embed_sparse_document(text_for_embed)
                 except Exception as exc:

@@ -127,6 +127,7 @@ def ingest_items(
     domain: str,
     items: list[dict[str, Any]],
     embedding_api_key: str | None = None,
+    embedding_model: str | None = None,
 ) -> dict[str, Any]:
     success_ids = []
     failed_ids = []
@@ -141,6 +142,7 @@ def ingest_items(
                 api_key=embedding_api_key,
                 client_id=client_id,
                 query_type="embed_document",
+                model=embedding_model,
             )
             payload = build_payload(item)
             payload["embedded_text"] = embedded_text

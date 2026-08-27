@@ -27,6 +27,10 @@ from sqlalchemy.orm import Session
 
 from backend.app.services.database import get_db
 from backend.app.services.embedder import embed_query
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 from backend.app.services.qdrant_service import (
     retrieve_content_by_entity_ids,
     search_content as qdrant_search_content,
@@ -178,6 +182,9 @@ def retrieve_content(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     db: Session = Depends(get_db),
 ):
     """Semantic search over the merchant's FAQ entries.
@@ -197,8 +204,15 @@ def retrieve_content(
 
     timer = StageTimer("wp/retrieve/content", request)
 
-    embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
-    query_vector = embed_query(req.query.strip(), embedding_api_key, license_data["client_id"])
+    embedding_api_key = resolve_embedding_key(
+        x_embedding_api_key_encrypted,
+        x_llm_api_key_encrypted,
+        license_data["license_key"],
+    )
+    embedding_model = resolve_embedding_model(x_embedding_model, x_embedding_provider)
+    query_vector = embed_query(
+        req.query.strip(), embedding_api_key, license_data["client_id"], model=embedding_model
+    )
 
     # BM25 alongside the dense vector when the merchant has hybrid on. Policy
     # questions lean on exact terms ("warranty", "restocking fee") that

@@ -152,6 +152,8 @@ def make_retrieval_tools(
     client_id: str,
     domain: str,
     api_key: str,
+    embed_api_key: Optional[str] = None,
+    embed_model: Optional[str] = None,
     store_code: Optional[str] = None,
     hybrid: bool = False,
     source_formatter: Callable[[dict[str, Any]], str],
@@ -164,9 +166,15 @@ def make_retrieval_tools(
 
     Each tool is a closure over the per-request context:
       * client_id + domain — tenant + collection scoping
-      * api_key            — Gemini embedding key (same key the LLM
-                             call uses; this matches the existing
-                             convention in retrieve.py / classify.py)
+      * api_key            — the LLM key, used for anything that calls
+                             a completion model
+      * embed_api_key      — the tenant's separate embedding key. None
+                             falls back to api_key, which is what every
+                             install predating the embedding config
+                             sends.
+      * embed_model        — embedding model id, already validated by
+                             embedding_key_service. None means the
+                             server default.
       * store_code         — store-view scoping for the search filter
                              (None = no store filter, used by legacy
                              single-store deployments)
@@ -235,7 +243,7 @@ def make_retrieval_tools(
             text = query.strip()
             if not text:
                 return "No query provided."
-            q_vec = embed_query(text, api_key, client_id)
+            q_vec = embed_query(text, embed_api_key or api_key, client_id, model=embed_model)
             sparse_vec = _maybe_sparse(text)
             hits = qdrant_search_content(
                 client_id=client_id,
@@ -306,7 +314,7 @@ def make_retrieval_tools(
             text = query.strip()
             if not text:
                 return "No query provided."
-            q_vec = embed_query(text, api_key, client_id)
+            q_vec = embed_query(text, embed_api_key or api_key, client_id, model=embed_model)
             sparse_vec = _maybe_sparse(text)
             hits = qdrant_search_products(
                 client_id=client_id,

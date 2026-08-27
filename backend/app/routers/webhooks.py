@@ -21,6 +21,10 @@ from backend.app.services.license_service import increment_ingest_count, validat
 from backend.app.services.database import get_db
 from backend.app.services.product_service import build_product_text, extract_payload  # ← import
 from backend.app.services.llm_key_service import decrypt_key
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 from backend.app.wordpress.services.product_formatter import LEGACY_MANAGED_BY, MANAGED_BY
 
 router    = APIRouter()
@@ -73,7 +77,7 @@ def _has_full_woo_payload(client_id: str, domain: str, product_id: str) -> bool:
     return bool(hits) and str(hits[0].get("managed_by") or "") in (MANAGED_BY, LEGACY_MANAGED_BY)
 
 
-def process_upsert(product: dict, action: str, client_id: str, db: Session, license_data: dict = None, llm_api_key_encrypted: str = None) -> dict:
+def process_upsert(product: dict, action: str, client_id: str, db: Session, license_data: dict = None, llm_api_key_encrypted: str = None, embedding_api_key_encrypted: str = None, embedding_provider: str = None, embedding_model: str = None) -> dict:
     """
     Shared logic for created + updated webhooks.
     Both do the same thing — embed and upsert.
@@ -118,22 +122,20 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session, lice
     #         detail=f"Product limit exceeded. Current: {current_count}, Limit: {license_data['product_limit']}"
     #     )
 
-    # Decrypt embedding API key if provided
-    if llm_api_key_encrypted:
-        try:
-            print(f"Decrypting embedding API key for license {license_data['license_key']}")
-            print(f"LLM API key encrypted: {llm_api_key_encrypted}")
-            embedding_api_key = decrypt_key(llm_api_key_encrypted, license_data["license_key"])   
-        except Exception as e:
-            print(f"❌ Embedding API key decryption failed: {e}")
-            embedding_api_key = None
-    else:
-        print(f"Embedding API key not provided, using default")
-        embedding_api_key = None
+    # The merchant's embedding key if they configured one, else their LLM
+    # key. The raw blobs are no longer printed — a webhook fires on every
+    # product save, and this was writing an encrypted key into the log on
+    # each one.
+    embedding_api_key = resolve_embedding_key(
+        embedding_api_key_encrypted,
+        llm_api_key_encrypted,
+        license_data["license_key"],
+    )
+    embedding_model = resolve_embedding_model(embedding_model, embedding_provider)
 
     # Uses product_service — raw WooCommerce format with nested categories/tags/attributes
     text    = build_product_text(product)
-    vector  = embed_document(text, embedding_api_key, client_id)
+    vector  = embed_document(text, embedding_api_key, client_id, model=embedding_model)
     payload = extract_payload(product)
     payload["embedded_text"] = text
 
@@ -173,6 +175,9 @@ def product_created(
     request: Request,
     client_id: str = Query(...),   # ← reads ?client_id= from URL
     llm_api_key: Optional[str] = Query(None),  # ← reads ?llm_api_key= from URL
+    embedding_api_key: Optional[str] = Query(None),  # ← reads ?embedding_api_key= from URL
+    embedding_provider: Optional[str] = Query(None),
+    embedding_model: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     x_wc_webhook_signature: Optional[str] = Header(None)
 ):
@@ -211,7 +216,10 @@ def product_created(
             action="created",
             client_id=client_id,
             db=db,
-            llm_api_key_encrypted=llm_api_key
+            llm_api_key_encrypted=llm_api_key,
+            embedding_api_key_encrypted=embedding_api_key,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
         )
     except HTTPException as e:
         # Re-raise HTTPExceptions to preserve status codes
@@ -226,6 +234,9 @@ def product_updated(
     request: Request,
     client_id: str = Query(...),   # ← reads ?client_id= from URL
     llm_api_key: Optional[str] = Query(None),  # ← reads ?llm_api_key= from URL
+    embedding_api_key: Optional[str] = Query(None),  # ← reads ?embedding_api_key= from URL
+    embedding_provider: Optional[str] = Query(None),
+    embedding_model: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     x_wc_webhook_signature: Optional[str] = Header(None)
 ):
@@ -263,7 +274,10 @@ def product_updated(
             action="updated",
             client_id=client_id,
             db=db,
-            llm_api_key_encrypted=llm_api_key
+            llm_api_key_encrypted=llm_api_key,
+            embedding_api_key_encrypted=embedding_api_key,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
         )
     except HTTPException as e:
         # Re-raise HTTPExceptions to preserve status codes

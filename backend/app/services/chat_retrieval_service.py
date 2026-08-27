@@ -86,12 +86,14 @@ def retrieve_evidence(
     embedding_api_key: str | None = None,
     allowed_content_types: list[str] | None = None,
     limit: int = 6,
+    embedding_model: str | None = None,
 ) -> dict[str, Any]:
     query_vector = embed_query(
         message,
         api_key=embedding_api_key,
         client_id=client_id,
         query_type="chat_context",
+        model=embedding_model,
     )
 
     raw_results = search_content(
