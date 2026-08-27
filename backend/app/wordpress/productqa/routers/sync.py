@@ -31,6 +31,10 @@ from sqlalchemy.orm import Session
 from backend.app.services.cache_service import invalidate_client_results, r as redis_client
 from backend.app.services.database import get_db
 from backend.app.services.embedder import embed_document
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 from backend.app.services.license_service import increment_ingest_count
 from backend.app.services.qdrant_service import (
     CHUNKABLE_CONTENT_TYPES,
@@ -96,6 +100,11 @@ class SyncItem(BaseModel):
 class SyncBatchRequest(BaseModel):
     license_key: Optional[str] = None
     llm_api_key_encrypted: Optional[str] = None
+    # Body twins of the X-Embedding-* headers, for callers that can't set
+    # headers (and for anyone reproducing a sync with curl). Headers win.
+    embedding_api_key_encrypted: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
     items: list[SyncItem] = Field(default_factory=list)
     batch_number: int = 1
     total_batches: int = 1
@@ -162,6 +171,9 @@ def sync_batch(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     # Set by full-sync runs. A full sync is authoritative: if the same product
     # turns up twice we WANT the second one embedded, because it reflects the
     # latest state. Counting it as "success, skipped" is how an index ends up
@@ -193,8 +205,17 @@ def sync_batch(
                 ),
             )
 
-    embedding_api_key = decrypt_llm_key(
-        x_llm_api_key_encrypted or req.llm_api_key_encrypted, license_data["license_key"]
+    # Sync only embeds — no completion model runs on this path, so the LLM
+    # key is here purely as the fallback for tenants who haven't configured
+    # a separate embedding key.
+    embedding_api_key = resolve_embedding_key(
+        x_embedding_api_key_encrypted or req.embedding_api_key_encrypted,
+        x_llm_api_key_encrypted or req.llm_api_key_encrypted,
+        license_data["license_key"],
+    )
+    embedding_model = resolve_embedding_model(
+        x_embedding_model or req.embedding_model,
+        x_embedding_provider or req.embedding_provider,
     )
 
     attribute_vocab_sink: dict[str, set[str]] = defaultdict(set)
@@ -227,7 +248,9 @@ def sync_batch(
             store_code = item.store_code or req.store_code or DEFAULT_STORE_CODE
 
             if item.content_type in CHUNKABLE_CONTENT_TYPES:
-                _process_chunkable_item(item, store_code, embedding_api_key, license_data)
+                _process_chunkable_item(
+                    item, store_code, embedding_api_key, license_data, embedding_model,
+                )
             else:
                 if item.content_type == "product":
                     # Shared with routers/sync.py — the search plugin's endpoint
@@ -244,7 +267,10 @@ def sync_batch(
                     payload["embedded_text"] = text_for_embed
                     payload["store_code"] = store_code
 
-                vector = embed_document(text_for_embed, embedding_api_key, license_data["client_id"])
+                vector = embed_document(
+                    text_for_embed, embedding_api_key, license_data["client_id"],
+                    model=embedding_model,
+                )
                 try:
                     sparse_vector = embed_sparse_document(text_for_embed)
                 except Exception as exc:
@@ -318,6 +344,7 @@ def _process_chunkable_item(
     store_code: str,
     embedding_api_key: Optional[str],
     license_data: dict[str, Any],
+    embedding_model: Optional[str] = None,
 ) -> int:
     """Embed and upsert one FAQ entry, page or post as N chunks.
 
@@ -355,7 +382,9 @@ def _process_chunkable_item(
         chunk_text(body)
     ):
         embed_text = f"{header}\nContent: {chunk_body}" if header else chunk_body
-        vector = embed_document(embed_text, embedding_api_key, license_data["client_id"])
+        vector = embed_document(
+            embed_text, embedding_api_key, license_data["client_id"], model=embedding_model
+        )
         try:
             sparse_vector = embed_sparse_document(embed_text)
         except Exception as exc:

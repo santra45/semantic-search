@@ -50,21 +50,26 @@ def _embed(
     query_type: str,
     api_key: str,
     client_id: str,
+    model: str = None,
 ) -> list[float]:
-    client = get_client(api_key)
+    # `model` is the tenant's configured embedding model, already validated
+    # against the supported set by embedding_key_service. None means they
+    # never set one, which is every install predating the embedding config.
+    model       = model or EMBED_MODEL
+    client      = get_client(api_key)
     result = client.models.embed_content(
-        model=EMBED_MODEL,
+        model=model,
         contents=text,
         config={"task_type": task_type},
     )
 
     token_count = get_embed_token_count(result, text)
-    cost        = estimate_embed_cost(EMBED_MODEL, token_count)
+    cost        = estimate_embed_cost(model, token_count)
     dims        = len(result.embeddings[0].values)
 
     log_llm_interaction(
         provider="google",
-        model=EMBED_MODEL,
+        model=model,
         purpose=query_type,
         prompt=text,
         response_text=f"<embedding vector: {dims} dims>",
@@ -80,7 +85,7 @@ def _embed(
             client_id=client_id,
             query_type=query_type,
             llm_provider="google",
-            llm_model=EMBED_MODEL,
+            llm_model=model,
             input_tokens=token_count,
             output_tokens=0,
             input_cost=cost,
@@ -103,7 +108,11 @@ def _embed(
 # callers (which cache under the bare-text key, possibly a different model).
 # Documents are deliberately NOT cached — they embed once at sync time and
 # caching every chunk would bloat Redis for no reuse.
-_QUERY_CACHE_NS = f"{EMBED_MODEL}:RETRIEVAL_QUERY"
+# Built per-call rather than once at import, because the model is now a
+# per-tenant value. Two tenants on different embedding models must not share
+# a cache entry — the vectors are not interchangeable.
+def _query_cache_ns(model: str) -> str:
+    return f"{model}:RETRIEVAL_QUERY"
 
 
 def embed_query(
@@ -111,13 +120,15 @@ def embed_query(
     api_key: str = None,
     client_id: str = "anonymous",
     query_type: str = "embed_search",
+    model: str = None,
 ) -> list[float]:
-    cached = get_cached_embedding(text, _QUERY_CACHE_NS)
+    ns = _query_cache_ns(model or EMBED_MODEL)
+    cached = get_cached_embedding(text, ns)
     if cached is not None:
         return cached
-    vector = _embed(text, "RETRIEVAL_QUERY", query_type, api_key, client_id)
+    vector = _embed(text, "RETRIEVAL_QUERY", query_type, api_key, client_id, model)
     try:
-        set_cached_embedding(text, vector, _QUERY_CACHE_NS)
+        set_cached_embedding(text, vector, ns)
     except Exception as exc:  # a cache-write hiccup must never break embedding
         logger.warning(f"embedding cache write failed: {exc}")
     return vector
@@ -128,5 +139,6 @@ def embed_document(
     api_key: str = None,
     client_id: str = "anonymous",
     query_type: str = "embed_document",
+    model: str = None,
 ) -> list[float]:
-    return _embed(text, "RETRIEVAL_DOCUMENT", query_type, api_key, client_id)
+    return _embed(text, "RETRIEVAL_DOCUMENT", query_type, api_key, client_id, model)

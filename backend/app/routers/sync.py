@@ -13,6 +13,10 @@ from backend.app.services.cache_service import invalidate_client_results
 from backend.app.services.product_service import build_page_text, extract_page_payload, build_post_text, extract_post_payload
 from backend.app.services.domain_auth_service import DomainAuthorizer
 from backend.app.services.llm_key_service import decrypt_key
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 
 # Products go through the SHARED WooCommerce formatter, not the local
 # product_service helpers. Both WooCommerce plugins write to the same Qdrant
@@ -101,6 +105,12 @@ class SyncBatchRequest(BaseModel):
     batch_number:  int = 1
     total_batches: int = 1
     llm_api_key_encrypted: str = None
+    # The tenant's separate embedding key, encrypted under the license key
+    # exactly like llm_api_key_encrypted. Absent = fall back to the LLM key,
+    # which is what every install predating the embedding config sends.
+    embedding_api_key_encrypted: str = None
+    embedding_provider: str = None
+    embedding_model: str = None
     content_type: str = "product"  # 'product', 'page', 'post', or 'all'
 
 
@@ -124,16 +134,13 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
     domain      = license_data["domain"]
     license_key = req.license_key
     
-    # Decrypt embedding API key if provided
-    if req.llm_api_key_encrypted:
-        try:
-            embedding_api_key = decrypt_key(req.llm_api_key_encrypted, license_key)   
-        except Exception as e:
-            print(f" Embedding API key decryption failed: {e}")
-            embedding_api_key = None
-    else:
-        print(f"Embedding API key not provided, using default")
-        embedding_api_key = None
+    # The embedding key if the merchant configured one, else the LLM key.
+    embedding_api_key = resolve_embedding_key(
+        req.embedding_api_key_encrypted,
+        req.llm_api_key_encrypted,
+        license_key,
+    )
+    embedding_model = resolve_embedding_model(req.embedding_model, req.embedding_provider)
     
     # CRITICAL: Enforce secure domain authorization
     authorizer = DomainAuthorizer(db)
@@ -171,7 +178,7 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
                 attribute_vocab_sink=attribute_vocab_sink,
                 category_vocab_sink=category_vocab_sink,
             )
-            vector = embed_document(text, embedding_api_key, client_id)
+            vector = embed_document(text, embedding_api_key, client_id, model=embedding_model)
 
             # The sparse half of hybrid retrieval. Best-effort: a point stored
             # dense-only is still findable, it just contributes nothing to the
@@ -223,7 +230,7 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
         try:
             p = page.model_dump()
             text    = build_page_text(p)
-            vector  = embed_document(text, embedding_api_key, client_id)
+            vector  = embed_document(text, embedding_api_key, client_id, model=embedding_model)
             payload = extract_page_payload(p)
             payload["embedded_text"] = text
             upsert_page(client_id, domain, page.page_id, vector, payload)
@@ -237,7 +244,7 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
         try:
             p = post.model_dump()
             text    = build_post_text(p)
-            vector  = embed_document(text, embedding_api_key, client_id)
+            vector  = embed_document(text, embedding_api_key, client_id, model=embedding_model)
             payload = extract_post_payload(p)
             payload["embedded_text"] = text
             upsert_post(client_id, domain, post.post_id, vector, payload)

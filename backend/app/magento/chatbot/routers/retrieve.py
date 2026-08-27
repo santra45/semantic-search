@@ -25,6 +25,10 @@ from sqlalchemy.orm import Session
 
 from backend.app.services.database import get_db
 from backend.app.services.embedder import embed_query
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 from backend.app.utils.stage_timer import StageTimer
 from backend.app.services.qdrant_service import (
     get_collection_name,
@@ -434,6 +438,9 @@ def retrieve_products(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     x_magento_creds: Optional[str] = Header(None, alias="X-Magento-Admin-Creds-Encrypted"),
     db: Session = Depends(get_db),
 ):
@@ -465,7 +472,16 @@ def retrieve_products(
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="query or skus is required")
 
-    embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
+    # Two keys, two spends. The LLM key pays for decomposition and rerank;
+    # the embedding key pays for the query vectors. A tenant who configured
+    # only the LLM key gets the old behaviour — one key for both.
+    llm_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
+    embedding_api_key = resolve_embedding_key(
+        x_embedding_api_key_encrypted,
+        x_llm_api_key_encrypted,
+        license_data["license_key"],
+    )
+    embedding_model = resolve_embedding_model(x_embedding_model, x_embedding_provider)
 
     timer = StageTimer("retrieve/products", request)
 
@@ -483,7 +499,7 @@ def retrieve_products(
                 req.query.strip(),
                 llm_provider=req.llm_provider,
                 llm_model=req.llm_model,
-                api_key=embedding_api_key,
+                api_key=llm_api_key,
                 client_id=client_id,
             )
         except Exception as exc:
@@ -494,12 +510,12 @@ def retrieve_products(
     # Embed each sub-query. Single-query case is exactly one embed call
     # — same cost as pre-3.3. Multi-sub-query case pays N embed calls
     # (~$0.0001 each for Gemini, sub-millisecond latency each).
-    query_vector = embed_query(sub_queries[0], embedding_api_key, client_id)
+    query_vector = embed_query(sub_queries[0], embedding_api_key, client_id, model=embedding_model)
     query_vectors: Optional[list[list[float]]] = None
     if decomposed:
         query_vectors = [query_vector]
         for sq in sub_queries[1:]:
-            query_vectors.append(embed_query(sq, embedding_api_key, client_id))
+            query_vectors.append(embed_query(sq, embedding_api_key, client_id, model=embedding_model))
 
     # Phase 2.2 — when the admin has hybrid on, also generate a BM25
     # sparse query vector. Soft-fail on import / inference errors so a
@@ -770,7 +786,7 @@ def retrieve_products(
                 req.query.strip(),
                 hits,
                 license_data=license_data,
-                llm_api_key=embedding_api_key,
+                llm_api_key=llm_api_key,
                 llm_provider=req.llm_provider,
                 llm_model=req.llm_model,
                 db=db,
@@ -799,6 +815,9 @@ def retrieve_content(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     db: Session = Depends(get_db),
 ):
     license_data = authorize_request(
@@ -810,7 +829,13 @@ def retrieve_content(
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="query is required")
 
-    embedding_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
+    llm_api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
+    embedding_api_key = resolve_embedding_key(
+        x_embedding_api_key_encrypted,
+        x_llm_api_key_encrypted,
+        license_data["license_key"],
+    )
+    embedding_model = resolve_embedding_model(x_embedding_model, x_embedding_provider)
 
     timer = StageTimer("retrieve/content", request)
 
@@ -832,7 +857,7 @@ def retrieve_content(
                 req.query.strip(),
                 llm_provider=None,
                 llm_model=None,
-                api_key=embedding_api_key,
+                api_key=llm_api_key,
                 client_id=license_data["client_id"],
             )
         except Exception as exc:
@@ -840,12 +865,12 @@ def retrieve_content(
             sub_queries = [req.query.strip()]
     decomposed = len(sub_queries) > 1
 
-    query_vector = embed_query(sub_queries[0], embedding_api_key, license_data["client_id"])
+    query_vector = embed_query(sub_queries[0], embedding_api_key, license_data["client_id"], model=embedding_model)
     query_vectors: Optional[list[list[float]]] = None
     if decomposed:
         query_vectors = [query_vector]
         for sq in sub_queries[1:]:
-            query_vectors.append(embed_query(sq, embedding_api_key, license_data["client_id"]))
+            query_vectors.append(embed_query(sq, embedding_api_key, license_data["client_id"], model=embedding_model))
 
     # Phase 2.2 — sparse query vector for hybrid mode. Same soft-fail
     # pattern as retrieve_products so a CMS query never gets bricked by
@@ -959,6 +984,9 @@ def retrieve_answer(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     db: Session = Depends(get_db),
 ):
     """Optional RAG summary. Admin-toggled on the Magento side; if the
@@ -973,6 +1001,14 @@ def retrieve_answer(
         raise HTTPException(status_code=400, detail="query and sources are required")
 
     api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
+    # Only used when active retrieval is on — the tools embed their own
+    # follow-up queries, and that spend belongs to the embedding key.
+    embedding_api_key = resolve_embedding_key(
+        x_embedding_api_key_encrypted,
+        x_llm_api_key_encrypted,
+        license_data["license_key"],
+    )
+    embedding_model = resolve_embedding_model(x_embedding_model, x_embedding_provider)
 
     from backend.app.magento.chatbot.agents.llm_factory import build_llm
 
@@ -1006,6 +1042,8 @@ def retrieve_answer(
             client_id=client_id,
             domain=domain,
             api_key=api_key,
+            embed_api_key=embedding_api_key,
+            embed_model=embedding_model,
             store_code=req.store_code,
             hybrid=req.hybrid,
             source_formatter=_format_source_for_prompt,
@@ -1214,6 +1252,9 @@ def retrieve_answer_stream(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     db: Session = Depends(get_db),
 ):
     """Streaming variant of /retrieve/answer.
@@ -1244,6 +1285,14 @@ def retrieve_answer_stream(
         raise HTTPException(status_code=400, detail="query and sources are required")
 
     api_key = decrypt_llm_key(x_llm_api_key_encrypted, license_data["license_key"])
+    # Only used when active retrieval is on — the tools embed their own
+    # follow-up queries, and that spend belongs to the embedding key.
+    embedding_api_key = resolve_embedding_key(
+        x_embedding_api_key_encrypted,
+        x_llm_api_key_encrypted,
+        license_data["license_key"],
+    )
+    embedding_model = resolve_embedding_model(x_embedding_model, x_embedding_provider)
 
     from backend.app.magento.chatbot.agents.llm_factory import build_llm
 
@@ -1276,6 +1325,8 @@ def retrieve_answer_stream(
             client_id=client_id,
             domain=domain,
             api_key=api_key,
+            embed_api_key=embedding_api_key,
+            embed_model=embedding_model,
             store_code=req.store_code,
             hybrid=req.hybrid,
             source_formatter=_format_source_for_prompt,

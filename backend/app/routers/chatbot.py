@@ -27,6 +27,10 @@ from backend.app.services.license_service import (
     validate_license_key,
 )
 from backend.app.services.llm_key_service import decrypt_key
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 from backend.app.services.qdrant_service import get_client_content_counts, get_client_product_count
 
 router = APIRouter()
@@ -66,6 +70,12 @@ class ChatbotSyncBatchRequest(BaseModel):
     batch_number: int = 1
     total_batches: int = 1
     llm_api_key_encrypted: Optional[str] = None
+    # The tenant's separate embedding key, encrypted under the license key
+    # exactly like llm_api_key_encrypted. Absent = fall back to the LLM key,
+    # which is what every install predating the embedding config sends.
+    embedding_api_key_encrypted: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
 
 
 class ChatbotDeleteRequest(BaseModel):
@@ -92,6 +102,12 @@ class ChatMessageRequest(BaseModel):
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     llm_api_key_encrypted: Optional[str] = None
+    # The tenant's separate embedding key, encrypted under the license key
+    # exactly like llm_api_key_encrypted. Absent = fall back to the LLM key,
+    # which is what every install predating the embedding config sends.
+    embedding_api_key_encrypted: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
 
 
 def resolve_headers(
@@ -100,11 +116,20 @@ def resolve_headers(
     x_llm_api_key_encrypted: Optional[str],
     request_license: Optional[str],
     request_llm_key: Optional[str],
+    x_embedding_api_key_encrypted: Optional[str] = None,
+    request_embedding_key: Optional[str] = None,
+    x_embedding_provider: Optional[str] = None,
+    request_embedding_provider: Optional[str] = None,
+    x_embedding_model: Optional[str] = None,
+    request_embedding_model: Optional[str] = None,
 ) -> dict[str, Optional[str]]:
     return {
         "license_key": extract_license_key_from_authorization(authorization) or request_license,
         "api_key": x_api_key,
         "llm_api_key_encrypted": x_llm_api_key_encrypted or request_llm_key,
+        "embedding_api_key_encrypted": x_embedding_api_key_encrypted or request_embedding_key,
+        "embedding_provider": x_embedding_provider or request_embedding_provider,
+        "embedding_model": x_embedding_model or request_embedding_model,
     }
 
 
@@ -136,6 +161,9 @@ def chatbot_sync_batch(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     db: Session = Depends(get_db),
 ):
     headers = resolve_headers(
@@ -144,6 +172,12 @@ def chatbot_sync_batch(
         x_llm_api_key_encrypted,
         req.license_key,
         req.llm_api_key_encrypted,
+        x_embedding_api_key_encrypted,
+        req.embedding_api_key_encrypted,
+        x_embedding_provider,
+        req.embedding_provider,
+        x_embedding_model,
+        req.embedding_model,
     )
     if not headers["license_key"]:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -166,18 +200,21 @@ def chatbot_sync_batch(
             detail="Product limit exceeded for this license.",
         )
 
-    embedding_api_key = None
-    if headers["llm_api_key_encrypted"]:
-        try:
-            embedding_api_key = decrypt_key(headers["llm_api_key_encrypted"], headers["license_key"])
-        except Exception:
-            embedding_api_key = None
+    embedding_api_key = resolve_embedding_key(
+        headers["embedding_api_key_encrypted"],
+        headers["llm_api_key_encrypted"],
+        headers["license_key"],
+    )
+    embedding_model = resolve_embedding_model(
+        headers["embedding_model"], headers["embedding_provider"]
+    )
 
     payload = ingest_items(
         client_id=license_data["client_id"],
         domain=license_data["domain"],
         items=[item.model_dump() for item in req.items],
         embedding_api_key=embedding_api_key,
+        embedding_model=embedding_model,
     )
 
     if payload["success_count"]:
@@ -278,6 +315,9 @@ def chatbot_message(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     db: Session = Depends(get_db),
 ):
     start_time = time.time()
@@ -287,6 +327,12 @@ def chatbot_message(
         x_llm_api_key_encrypted,
         req.license_key,
         req.llm_api_key_encrypted,
+        x_embedding_api_key_encrypted,
+        req.embedding_api_key_encrypted,
+        x_embedding_provider,
+        req.embedding_provider,
+        x_embedding_model,
+        req.embedding_model,
     )
     if not headers["license_key"]:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -318,12 +364,23 @@ def chatbot_message(
         except Exception:
             decrypted_llm_key = None
 
+    # Retrieval embeds the shopper's message; the answer below is generated
+    # with decrypted_llm_key. Two spends, two keys.
+    embedding_api_key = resolve_embedding_key(
+        headers["embedding_api_key_encrypted"],
+        headers["llm_api_key_encrypted"],
+        headers["license_key"],
+    )
+
     evidence = retrieve_evidence(
         client_id=license_data["client_id"],
         domain=license_data["domain"],
         message=req.message.strip(),
-        embedding_api_key=decrypted_llm_key,
+        embedding_api_key=embedding_api_key,
         allowed_content_types=req.allowed_content_types or DEFAULT_ALLOWED_TYPES,
+        embedding_model=resolve_embedding_model(
+            headers["embedding_model"], headers["embedding_provider"]
+        ),
     )
 
     if evidence["grounded"]:

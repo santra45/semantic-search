@@ -9,6 +9,10 @@ from backend.app.services.domain_auth_service import DomainAuthorizer
 from backend.app.services.embedder import embed_query, embed_document
 from backend.app.services.license_service import validate_license_key, check_search_quota, increment_search_count, log_search, increment_ingest_count, extract_license_key_from_authorization
 from backend.app.services.llm_key_service import decrypt_key
+from backend.app.services.embedding_key_service import (
+    resolve_embedding_key,
+    resolve_embedding_model,
+)
 from backend.app.services.llm_rerank_service import llm_rerank_products
 from backend.app.services.mmr import apply_mmr, strip_vector
 from backend.app.services.qdrant_service import search_products, upsert_product, delete_product, get_client_product_count
@@ -39,6 +43,12 @@ class MagentoSearchRequest(BaseModel):
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     llm_api_key_encrypted: Optional[str] = None
+    # The tenant's separate embedding key, encrypted under the license key
+    # exactly like llm_api_key_encrypted. Absent = fall back to the LLM key,
+    # which is what every install predating the embedding config sends.
+    embedding_api_key_encrypted: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
 
     # ── Structured filters (mirror of ProductRetrieveRequest) ─────────────────
     # Extracted Magento-side by the AISearch vocab matchers (attribute / brand /
@@ -229,6 +239,12 @@ class MagentoSyncBatchRequest(BaseModel):
     batch_number: int = 1
     total_batches: int = 1
     llm_api_key_encrypted: Optional[str] = None
+    # The tenant's separate embedding key, encrypted under the license key
+    # exactly like llm_api_key_encrypted. Absent = fall back to the LLM key,
+    # which is what every install predating the embedding config sends.
+    embedding_api_key_encrypted: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
 
 
 class MagentoDeleteRequest(BaseModel):
@@ -242,11 +258,20 @@ def resolve_headers(
     x_llm_api_key_encrypted: Optional[str],
     request_license: Optional[str],
     request_llm_key: Optional[str],
+    x_embedding_api_key_encrypted: Optional[str] = None,
+    request_embedding_key: Optional[str] = None,
+    x_embedding_provider: Optional[str] = None,
+    request_embedding_provider: Optional[str] = None,
+    x_embedding_model: Optional[str] = None,
+    request_embedding_model: Optional[str] = None,
 ):
     return {
         "license_key": extract_license_key_from_authorization(authorization) or request_license,
         "api_key": x_api_key,
         "llm_api_key_encrypted": x_llm_api_key_encrypted or request_llm_key,
+        "embedding_api_key_encrypted": x_embedding_api_key_encrypted or request_embedding_key,
+        "embedding_provider": x_embedding_provider or request_embedding_provider,
+        "embedding_model": x_embedding_model or request_embedding_model,
     }
 
 
@@ -331,6 +356,9 @@ async def magento_search(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     db: Session = Depends(get_db)
 ):
     start_time = time.time()
@@ -344,6 +372,12 @@ async def magento_search(
         x_llm_api_key_encrypted,
         req.license_key,
         req.llm_api_key_encrypted,
+        x_embedding_api_key_encrypted,
+        req.embedding_api_key_encrypted,
+        x_embedding_provider,
+        req.embedding_provider,
+        x_embedding_model,
+        req.embedding_model,
     )
     if not headers["license_key"]:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -372,12 +406,20 @@ async def magento_search(
     cache_query = query_text.lower()
     cache_key = _build_cache_key(cache_query, req)
 
-    embedding_api_key = None
+    # Two keys, two spends: decomposition and rerank are completion calls
+    # and stay on the LLM key; the query vectors go on the embedding key.
+    llm_api_key = None
     if headers["llm_api_key_encrypted"]:
         try:
-            embedding_api_key = decrypt_key(headers["llm_api_key_encrypted"], headers["license_key"])
+            llm_api_key = decrypt_key(headers["llm_api_key_encrypted"], headers["license_key"])
         except Exception:
-            embedding_api_key = None
+            llm_api_key = None
+    embedding_api_key = resolve_embedding_key(
+        headers["embedding_api_key_encrypted"],
+        headers["llm_api_key_encrypted"],
+        headers["license_key"],
+    )
+    embedding_model = resolve_embedding_model(headers["embedding_model"], headers["embedding_provider"])
 
     cached = get_cached_results(f"{client_id}_{domain}", cache_key)
     if cached is not None:
@@ -414,7 +456,7 @@ async def magento_search(
                 query_text,
                 llm_provider=req.llm_provider,
                 llm_model=req.llm_model,
-                api_key=embedding_api_key,
+                api_key=llm_api_key,
                 client_id=client_id,
             )
         except Exception as exc:
@@ -426,13 +468,13 @@ async def magento_search(
     # cache; decomposed sub-queries embed fresh (matches retrieve/products).
     query_vector = get_cached_embedding(cache_query)
     if query_vector is None:
-        query_vector = embed_query(sub_queries[0], embedding_api_key, client_id)
+        query_vector = embed_query(sub_queries[0], embedding_api_key, client_id, model=embedding_model)
         set_cached_embedding(cache_query, query_vector)
     query_vectors: Optional[List[List[float]]] = None
     if decomposed:
         query_vectors = [query_vector]
         for sq in sub_queries[1:]:
-            query_vectors.append(embed_query(sq, embedding_api_key, client_id))
+            query_vectors.append(embed_query(sq, embedding_api_key, client_id, model=embedding_model))
 
     # ── Fan-out sizing (mirror of retrieve/products) ──────────────────────────
     # Structured pre-filters need no oversample (every returned hit already
@@ -605,7 +647,7 @@ async def magento_search(
                 len(results),
                 llm_provider=req.llm_provider,
                 llm_model=req.llm_model,
-                llm_api_key=embedding_api_key,
+                llm_api_key=llm_api_key,
                 client_id=client_id,
             )
             if reranked:
@@ -650,6 +692,9 @@ def magento_sync_batch(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
+    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
+    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
+    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
     db: Session = Depends(get_db)
 ):
     headers = resolve_headers(
@@ -658,6 +703,12 @@ def magento_sync_batch(
         x_llm_api_key_encrypted,
         req.license_key,
         req.llm_api_key_encrypted,
+        x_embedding_api_key_encrypted,
+        req.embedding_api_key_encrypted,
+        x_embedding_provider,
+        req.embedding_provider,
+        x_embedding_model,
+        req.embedding_model,
     )
     if not headers["license_key"]:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -681,12 +732,12 @@ def magento_sync_batch(
             detail=f"Product limit exceeded. Current: {current_count}, Incoming: {incoming_count}, Limit: {license_data['product_limit']}",
         )
 
-    embedding_api_key = None
-    if headers["llm_api_key_encrypted"]:
-        try:
-            embedding_api_key = decrypt_key(headers["llm_api_key_encrypted"], headers["license_key"])
-        except Exception:
-            embedding_api_key = None
+    embedding_api_key = resolve_embedding_key(
+        headers["embedding_api_key_encrypted"],
+        headers["llm_api_key_encrypted"],
+        headers["license_key"],
+    )
+    embedding_model = resolve_embedding_model(headers["embedding_model"], headers["embedding_provider"])
 
     success_ids = []
     failed_ids = []
@@ -699,7 +750,7 @@ def magento_sync_batch(
             # rollups (variant_attributes, children, child_skus) the search
             # filters and the popup rely on.
             text, payload = format_product(p)
-            vector = embed_document(text, embedding_api_key, client_id)
+            vector = embed_document(text, embedding_api_key, client_id, model=embedding_model)
             payload["embedded_text"] = text
             upsert_product(client_id, domain, product.product_id, vector, payload)
             success_ids.append(product.product_id)
