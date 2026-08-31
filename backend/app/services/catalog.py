@@ -5,10 +5,10 @@ Why this exists as its own module rather than inline dicts in the onboarding
 router: the same catalogue has to be agreed on by four places that must never
 drift apart —
 
-  * the onboarding UI (renders the platform/product pickers),
-  * license issuance (writes `platform` + `product_code` onto the key),
-  * license validation (returns them so request handlers know what was bought),
-  * usage accounting (stamps them onto every token_usage_tracking row).
+  * the onboarding UI (renders the platform/product/plan pickers),
+  * licence issuance (the subscription a minted key hangs off names a product),
+  * licence resolution (returns them so request handlers know what was bought),
+  * usage accounting (stamps them onto every usage_events row).
 
 If any two of those disagree about what `woo_product_qa` means, keys get issued
 that nothing will honour, or usage lands under a product code the dashboard
@@ -65,6 +65,7 @@ PLATFORMS: dict[str, dict] = {
 PRODUCTS: dict[str, dict] = {
     "magento_chatbot": {
         "code": "magento_chatbot",
+        "key_segment": "mchat",
         "platform": "magento",
         "name": "AI Chatbot",
         "tagline": "Conversational shopping assistant for the storefront.",
@@ -82,6 +83,7 @@ PRODUCTS: dict[str, dict] = {
     },
     "magento_product_qa": {
         "code": "magento_product_qa",
+        "key_segment": "mpqa",
         "platform": "magento",
         "name": "AI Product Q&A",
         "tagline": "Per-product “Ask about this product” on the product page.",
@@ -95,6 +97,7 @@ PRODUCTS: dict[str, dict] = {
     },
     "magento_search": {
         "code": "magento_search",
+        "key_segment": "msrch",
         "platform": "magento",
         "name": "AI Search",
         "tagline": "Semantic search that reads intent, not keywords.",
@@ -108,6 +111,7 @@ PRODUCTS: dict[str, dict] = {
     },
     "woo_product_qa": {
         "code": "woo_product_qa",
+        "key_segment": "wpqa",
         "platform": "woocommerce",
         "name": "AI Product Q&A",
         "tagline": "Per-product question box for WooCommerce.",
@@ -121,6 +125,7 @@ PRODUCTS: dict[str, dict] = {
     },
     "woo_search": {
         "code": "woo_search",
+        "key_segment": "wsrch",
         "platform": "woocommerce",
         "name": "Semantic Search",
         "tagline": "Natural-language product search for WooCommerce.",
@@ -135,24 +140,143 @@ PRODUCTS: dict[str, dict] = {
 }
 
 
-# ── Plans ────────────────────────────────────────────────────────────────────
+# ── Plans: two ladders, not one ──────────────────────────────────────────────
 #
-# Mirrors PLAN_LIMITS in license_service, which stays the authority for what
-# gets written onto a key. The copy here is presentation only — the numbers are
-# duplicated deliberately so the marketing surface can't silently disagree with
-# what a key actually grants; assert_plans_match() below is what keeps them
-# honest.
+# There are two ladders because there are two scopes, and the reason is a fact
+# about the vector store rather than a pricing preference.
+#
+# Every module installed on one store shares ONE Qdrant collection, named per
+# (client, domain). A store running AIChatbot, AIProductQA and AISearch syncs
+# its catalogue once and all three read the same points. So:
+#
+#   * catalogue size is consumed once per STORE   -> INDEX_PLANS,  sites.index_plan
+#   * licences and request quota are per MODULE   -> MODULE_PLANS, subscriptions.plan
+#
+# These cannot collapse back into one ladder. The tempting shortcut is to drop
+# INDEX_PLANS and derive a site's catalogue ceiling from its subscriptions —
+# the max of their plans, say. That breaks on cancellation: a store on three
+# modules cancels whichever one happened to carry the biggest plan, the derived
+# ceiling drops below the number of items already sitting in the collection,
+# and there is no clean resolution. Nothing can be un-indexed to get back under
+# the line; refusing every sync bricks a store still paying for two modules;
+# silently keeping the old ceiling means the number on the dashboard is a lie.
+# A site owning its own index_plan has none of that — cancelling a module
+# changes what that module may serve and nothing about what the store may hold.
+#
+# The independence runs the other way too, which is why neither ladder gates
+# the other: a store on `free` can perfectly reasonably buy a `pro` licence for
+# one module. 500 catalogue items answered 500,000 times a month is an ordinary
+# shape for a small store with a lot of traffic.
+#
+# These dicts are now presentation AND authority. The onboarding page renders
+# straight out of them, and onboarding writes the numeric limit from here onto
+# the row it creates. That is the point: the old arrangement had catalog.PLANS
+# advertising numbers while license_service.PLAN_LIMITS granted them, which
+# needed an import-time assert_plans_match() to stop the two drifting. One dict
+# cannot disagree with itself.
+#
+# The first line of each `features` list restates that plan's numeric limit for
+# the pricing page. Change the number and change the copy with it: the import-
+# time guard below checks structure, not prose, and cannot catch a stale bullet
+# promising 5,000 items on a rung that grants 500.
 
-PLANS: dict[str, dict] = {
+
+# Bought once per SITE. Gates how much catalogue the store's shared collection
+# may hold, counted in logical entities (a configurable product and its CMS
+# pages are entities, not vector points).
+
+INDEX_PLANS: dict[str, dict] = {
+    "free": {
+        "code": "free",
+        "name": "Free",
+        "price": "$0",
+        "period": "per month",
+        "catalogue_limit": 500,
+        "features": [
+            "Up to 500 catalogue items",
+            "Shared by every module on the store",
+            "Catalogue and site content",
+        ],
+    },
+    "small": {
+        "code": "small",
+        "name": "Small",
+        "price": "$19",
+        "period": "per month",
+        "catalogue_limit": 5_000,
+        "features": [
+            "Up to 5,000 catalogue items",
+            "Shared by every module on the store",
+            "Catalogue and site content",
+        ],
+    },
+    "medium": {
+        "code": "medium",
+        "name": "Medium",
+        "price": "$49",
+        "period": "per month",
+        "catalogue_limit": 25_000,
+        "features": [
+            "Up to 25,000 catalogue items",
+            "Shared by every module on the store",
+            "Incremental sync on catalogue changes",
+        ],
+    },
+    "large": {
+        "code": "large",
+        "name": "Large",
+        "price": "$149",
+        "period": "per month",
+        "catalogue_limit": 100_000,
+        "features": [
+            "Up to 100,000 catalogue items",
+            "Shared by every module on the store",
+            "Incremental sync on catalogue changes",
+        ],
+    },
+}
+
+
+# Bought per SUBSCRIPTION, i.e. once per (site x product). Gates billable
+# requests per calendar month. `billable` is true on exactly one usage_events
+# row per customer-visible action, so this counts answers a shopper saw — not
+# the several LLM calls that may have gone into producing one.
+#
+# The three sellable rungs carry the same request numbers the single old ladder
+# advertised. Deliberate: the module half of what customers were already quoted
+# is unchanged, and only the catalogue half moved out into INDEX_PLANS.
+
+MODULE_PLANS: dict[str, dict] = {
+    "trial": {
+        "code": "trial",
+        "name": "Trial",
+        "price": "$0",
+        "period": "while you evaluate",
+        "request_limit": 250,
+        # A trial is a real subscription row with a small allowance, never the
+        # absence of one. An absent subscription would mean a licence that
+        # resolves to nothing, and every resolver would need a second code path
+        # for "authorised but unmetered" — which is precisely the path that
+        # forgets to write a usage row.
+        #
+        # Not sellable, so it never renders on the pricing page: it is the
+        # status a subscription starts in, not a rung anyone picks. Showing it
+        # beside Starter would only invite "why would I pay for Starter", and
+        # Starter is the same module with forty times the allowance.
+        "selectable": False,
+        "features": [
+            "250 requests to try it on your own catalogue",
+            "Every feature of the paid plans",
+            "Upgrade in place — the same key keeps working",
+        ],
+    },
     "starter": {
         "code": "starter",
         "name": "Starter",
         "price": "$0",
         "period": "per month",
-        "product_limit": 500,
-        "search_limit_per_month": 10_000,
+        "request_limit": 10_000,
         "features": [
-            "Up to 500 catalogue items",
             "10,000 requests a month",
             "Usage dashboard",
             "Email support",
@@ -163,10 +287,8 @@ PLANS: dict[str, dict] = {
         "name": "Growth",
         "price": "$29",
         "period": "per month",
-        "product_limit": 5_000,
-        "search_limit_per_month": 100_000,
+        "request_limit": 100_000,
         "features": [
-            "Up to 5,000 catalogue items",
             "100,000 requests a month",
             "Usage dashboard",
             "Priority support",
@@ -177,10 +299,8 @@ PLANS: dict[str, dict] = {
         "name": "Pro",
         "price": "$99",
         "period": "per month",
-        "product_limit": 25_000,
-        "search_limit_per_month": 500_000,
+        "request_limit": 500_000,
         "features": [
-            "Up to 25,000 catalogue items",
             "500,000 requests a month",
             "Usage dashboard",
             "Dedicated support",
@@ -189,7 +309,28 @@ PLANS: dict[str, dict] = {
 }
 
 
-DEFAULT_PLAN = "starter"
+# Ladder order, cheapest rung first, and simultaneously the sellable set.
+# Written out rather than relying on dict insertion order because it carries a
+# second meaning: a rung absent from here is one the pricing page never renders
+# and no customer can choose. `trial` is absent on purpose. A new rung added to
+# the dict above and forgotten here would exist as a legal plan value that
+# reaches the database only via a hand-written UPDATE, with nobody able to
+# explain where it came from — assert_plan_ladders_sane() makes that an import
+# failure instead.
+
+INDEX_PLAN_ORDER = ("free", "small", "medium", "large")
+MODULE_PLAN_ORDER = ("starter", "growth", "pro")
+
+
+DEFAULT_INDEX_PLAN = "free"
+
+# The rung the pricing page pre-selects, not what a subscription starts on.
+# A subscription created without an explicit purchase starts at status='trial'
+# on TRIAL_MODULE_PLAN; DEFAULT_MODULE_PLAN is only the radio button that comes
+# up checked.
+DEFAULT_MODULE_PLAN = "starter"
+
+TRIAL_MODULE_PLAN = "trial"
 
 
 # ── Lookups ──────────────────────────────────────────────────────────────────
@@ -202,8 +343,55 @@ def is_valid_product(code: Optional[str]) -> bool:
     return code in PRODUCTS
 
 
-def is_valid_plan(code: Optional[str]) -> bool:
-    return code in PLANS
+# No is_valid_plan(). There is no such thing as "a plan" any more — asking
+# whether 'pro' is valid has two different answers depending on whether it is
+# going onto sites.index_plan or subscriptions.plan, and a single validator
+# would happily let a form post 'large' into a subscription.
+
+def is_valid_index_plan(code: Optional[str]) -> bool:
+    return code in INDEX_PLANS
+
+
+def is_valid_module_plan(code: Optional[str]) -> bool:
+    return code in MODULE_PLANS
+
+
+def catalogue_limit_for(index_plan: str) -> int:
+    """Items the site's shared collection may hold on *index_plan*.
+
+    Raises on an unknown rung rather than falling back to the smallest. The old
+    onboarding did `if not is_valid_plan(plan): plan = DEFAULT_PLAN`, which is
+    fine for coercing a tampered radio button but catastrophic here: this value
+    is written to sites.catalogue_limit and then enforced against every sync, so
+    guessing means either a customer who paid for 100,000 items being cut off at
+    500, or the reverse. Validate the form value with is_valid_index_plan()
+    first; by the time you are asking for the number, guessing is not an option.
+    """
+    plan = INDEX_PLANS.get(index_plan)
+    if plan is None:
+        raise ValueError(
+            f"Unknown index plan '{index_plan}'. Expected one of: "
+            + ", ".join(INDEX_PLAN_ORDER)
+        )
+    return plan["catalogue_limit"]
+
+
+def request_limit_for(module_plan: str) -> int:
+    """Billable requests a month on *module_plan*. Written to
+    subscriptions.request_limit. Raises on an unknown rung, for the same reason
+    catalogue_limit_for() does.
+
+    Accepts 'trial' — it is a real rung with a real number, just not a sellable
+    one, and the code path that opens a trial subscription needs its limit from
+    the same place everything else gets one.
+    """
+    plan = MODULE_PLANS.get(module_plan)
+    if plan is None:
+        raise ValueError(
+            f"Unknown module plan '{module_plan}'. Expected one of: "
+            + ", ".join(MODULE_PLAN_ORDER) + f", or '{TRIAL_MODULE_PLAN}'."
+        )
+    return plan["request_limit"]
 
 
 def get_product(code: str) -> Optional[dict]:
@@ -261,9 +449,15 @@ def public_catalog() -> dict:
     """The catalogue as the onboarding page consumes it.
 
     Shaped for the client rather than mirroring the internal dicts: products are
-    nested under their platform so the UI can filter without a join, and the
+    nested under their platform so the UI can filter without a join, and each
     plan list is ordered cheapest-first so the renderer doesn't have to know the
     tier ordering.
+
+    The single `plans` / `default_plan` pair this used to return is gone, and
+    the page now has two pickers to render: how big the store's catalogue is
+    (once, whatever it buys), and how much traffic this module handles (per
+    module). `trial` is filtered out of module_plans by INDEX/MODULE_PLAN_ORDER
+    — nothing here is a rung the customer cannot buy.
     """
     return {
         "platforms": [
@@ -283,31 +477,117 @@ def public_catalog() -> dict:
             }
             for platform in PLATFORMS.values()
         ],
-        "plans": [PLANS[code] for code in ("starter", "growth", "pro")],
-        "default_plan": DEFAULT_PLAN,
+        "index_plans": [INDEX_PLANS[code] for code in INDEX_PLAN_ORDER],
+        "module_plans": [MODULE_PLANS[code] for code in MODULE_PLAN_ORDER],
+        "default_index_plan": DEFAULT_INDEX_PLAN,
+        "default_module_plan": DEFAULT_MODULE_PLAN,
     }
 
 
-def assert_plans_match(plan_limits: dict) -> None:
-    """Fail loudly if the advertised plans drift from the issued ones.
+def assert_plan_ladders_sane() -> None:
+    """Every rung renderable, reachable, and above the one below it.
 
-    Called at import time by license_service. The failure mode this prevents is
-    quiet and expensive: the pricing table promises 5,000 products, the key
-    grants 500, and nobody notices until a customer's sync starts getting
-    rejected halfway through.
+    Replaces assert_plans_match(), which existed to catch drift between this
+    module and license_service.PLAN_LIMITS. There is no second copy of the
+    numbers any more, so that whole failure mode is gone; what is left are the
+    ways one dict can be wrong on its own, all of which are quiet:
+
+      * A rung whose 'code' disagrees with its dict key. The radio button posts
+        the code, everything else looks the plan up by key, and the mismatch
+        surfaces as a customer being put on a plan they did not pick.
+      * A sellable rung missing from its *_ORDER tuple: a legal plan value that
+        no page renders and no customer can choose.
+      * A rung missing a display field. The onboarding renderer reads name,
+        price, period and features unguarded, so this is a JavaScript exception
+        in the browser and an empty pricing section — a failure that never
+        reaches the server logs.
+      * Limits that do not strictly ascend. One transposed digit and an upgrade
+        buys less than the rung below it, and the page renders that happily.
+
+    Called at import time, at the bottom of this module. It reads only literals
+    defined a few lines up, so it costs microseconds and can only fail if this
+    file is internally inconsistent — which is exactly when you want to find
+    out, rather than when a customer clicks Buy.
     """
-    for code, plan in PLANS.items():
-        limits = plan_limits.get(code)
-        if limits is None:
+    ladders = (
+        ("INDEX_PLANS", "INDEX_PLAN_ORDER", INDEX_PLANS, INDEX_PLAN_ORDER, "catalogue_limit"),
+        ("MODULE_PLANS", "MODULE_PLAN_ORDER", MODULE_PLANS, MODULE_PLAN_ORDER, "request_limit"),
+    )
+
+    for plans_name, order_name, plans, order, limit_field in ladders:
+        for code, plan in plans.items():
+            if plan.get("code") != code:
+                raise RuntimeError(
+                    f"{plans_name}['{code}'] carries code '{plan.get('code')}' — "
+                    f"the pricing page posts the code and everything else looks "
+                    f"up the key, so these must be the same string."
+                )
+            for field in ("name", "price", "period", "features", limit_field):
+                if not plan.get(field):
+                    raise RuntimeError(
+                        f"{plans_name}['{code}'] has no '{field}'. The onboarding "
+                        f"page reads it unguarded and would render nothing."
+                    )
+            if code not in order and plan.get("selectable", True):
+                raise RuntimeError(
+                    f"{plans_name} defines sellable rung '{code}' but {order_name} "
+                    f"does not list it — no customer could ever choose it."
+                )
+
+        for code in order:
+            if code not in plans:
+                raise RuntimeError(
+                    f"{order_name} names '{code}', which {plans_name} does not define."
+                )
+
+        limits = [plans[code][limit_field] for code in order]
+        if any(nxt <= prev for prev, nxt in zip(limits, limits[1:])):
             raise RuntimeError(
-                f"catalog.PLANS advertises plan '{code}' but license_service "
-                f"has no limits for it — a key issued on this plan would fall "
-                f"back to starter limits."
+                f"{plans_name} {limit_field} values do not ascend: {limits}. "
+                f"An upgrade would buy less than the rung below it."
             )
-        if (limits["product_limit"] != plan["product_limit"]
-                or limits["search_limit_per_month"] != plan["search_limit_per_month"]):
+
+    # The defaults are what a request that named no plan lands on, so a typo in
+    # one is a KeyError deep inside signup rather than here.
+    if DEFAULT_INDEX_PLAN not in INDEX_PLANS:
+        raise RuntimeError(f"DEFAULT_INDEX_PLAN '{DEFAULT_INDEX_PLAN}' is not an INDEX_PLANS rung.")
+    if DEFAULT_MODULE_PLAN not in MODULE_PLANS:
+        raise RuntimeError(f"DEFAULT_MODULE_PLAN '{DEFAULT_MODULE_PLAN}' is not a MODULE_PLANS rung.")
+    if TRIAL_MODULE_PLAN not in MODULE_PLANS:
+        raise RuntimeError(f"TRIAL_MODULE_PLAN '{TRIAL_MODULE_PLAN}' is not a MODULE_PLANS rung.")
+
+
+def assert_key_segments_unique() -> None:
+    """Every product needs its own key segment.
+
+    The segment exists so a customer pasting three keys into three module
+    configs can tell them apart at a glance. Two products sharing one defeats
+    that, and it is the kind of thing a copy-pasted catalogue entry does
+    quietly. Called at import time by license_key consumers.
+    """
+    seen: dict[str, str] = {}
+    for product in PRODUCTS.values():
+        seg = product.get("key_segment")
+        if not seg:
+            raise RuntimeError(f"Product '{product['code']}' has no key_segment.")
+        if seg in seen:
             raise RuntimeError(
-                f"Plan '{code}' disagrees between catalog and license_service: "
-                f"advertised {plan['product_limit']}/{plan['search_limit_per_month']}, "
-                f"issued {limits['product_limit']}/{limits['search_limit_per_month']}."
+                f"Products '{seen[seg]}' and '{product['code']}' both use key "
+                f"segment '{seg}' — keys for them would be indistinguishable."
             )
+        seen[seg] = product["code"]
+
+
+# Self-checked at import. assert_plans_match() used to be invoked by
+# license_service, which the schema rewrite deletes; leaving its replacement to
+# be called by some future consumer would make it dead code from the day it was
+# written, and a guard nobody runs is worse than no guard because it reads like
+# one that does.
+assert_plan_ladders_sane()
+
+# The same argument applies here, and this one had already gone wrong: the
+# segment guard was written, and then nothing called it. A duplicate segment is
+# what a copy-pasted PRODUCTS entry produces, and it stays invisible until two
+# of a customer's keys are indistinguishable in the one place the segment
+# exists to help - the module config screen they are pasting into.
+assert_key_segments_unique()

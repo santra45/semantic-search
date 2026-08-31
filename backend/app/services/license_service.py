@@ -309,6 +309,69 @@ def log_search(
 
 def get_client_license(db: Session, client_id: str) -> dict:
     """
+    DEPRECATED. Cannot be ported to the v2 schema. Do not add callers.
+
+    WHY IT CANNOT SURVIVE
+    ---------------------
+    This is the only function in the tree that reads a customer's PLAINTEXT
+    licence key back out of the database (`lk.license_key`), and the field it
+    returns it in is load-bearing rather than incidental: `llm_key_service.
+    decrypt_key` derives its AES key as sha256(license_key), so the licence key
+    is the key-encryption key for every merchant-supplied LLM and embedding key
+    on that store. webhooks.py feeds `license_data["license_key"]` straight
+    into `resolve_embedding_key`, and that is the only reason it calls this at
+    all.
+
+    schema_v2 stores `licences.key_hash` — a SHA-256 hex digest — and has no
+    plaintext column anywhere. A hash cannot be un-hashed, so after the
+    migration this SELECT has nothing left to select. There is no version of
+    this function that works against v2; it is not a rewrite, it is a removal.
+
+    WHAT REPLACED IT
+    ----------------
+    The push method ai-product-qa-woo already uses. Its plugin hooks
+    WordPress actions directly (`woocommerce_update_product`,
+    `woocommerce_delete_product`, `save_post_page`, ...), defers the work to a
+    scheduled single event, and calls the API itself with
+    `Authorization: Bearer <license_key>` on every request — see
+    AIPQA_API_Client::build_headers() in ai-product-qa-woo/includes/
+    class-api-client.php. The plaintext key is therefore always in scope FROM
+    THE REQUEST, so the KEK is available without any database lookup and the
+    server never needs to be able to read a key back.
+
+    semantic-search-woo is being switched to the same shape, which removes the
+    last two callers. docs/webhook-migration.md is the plan, file by file.
+
+    THE OTHER HALF: IT IS ALSO WRONG UNDER PER-PRODUCT LICENSING
+    ------------------------------------------------------------
+    Even a caller that only wants the domain or the limits — never the key —
+    must not be moved onto this. `ORDER BY lk.expires_at DESC LIMIT 1` assumes
+    one active licence per client. v2 makes that false by design: a client
+    holds one subscription per module per site, each with its own licence, so
+    "the newest one" is an arbitrary pick between two products that may sit on
+    different plans with different quotas. It also folds every liveness gate
+    into the WHERE clause, which collapses five distinct denial reasons into
+    "no row" — the exact failure licensing_service's docstring calls out, where
+    a deactivated site, a lapsed subscription and a key from the wrong store
+    are indistinguishable to support.
+
+    The v2 answer to "who is this caller" is
+    `licensing_service.resolve_key(db, presented_key)`: it takes the key the
+    caller actually presented, hashes it, and returns client_id, site_id,
+    subscription_id, collection_name and both limits from their own levels,
+    with a separate log line per denial reason.
+
+    CALLERS AS OF 2026-08-27 (both die with webhooks.py)
+    ---------------------------------------------------
+      * backend/app/routers/webhooks.py:20   import
+      * backend/app/routers/webhooks.py      process_upsert() — for the KEK
+      * backend/app/routers/webhooks.py      product_deleted() — for the domain
+
+    Nothing else in the backend imports it. The same two live on the deployed
+    checkout at C:/xampp/htdocs/semantic-search. Prose references (not
+    callers): ADMIN_CONSOLE_PLAN.md:162, licensing_service.py's docstring, and
+    the migration report in scripts/migrate_v2_schema.py.
+
     Get active license data for a client by client_id.
     Raises ValueError if no active license found.
     """
