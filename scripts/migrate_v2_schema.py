@@ -335,7 +335,14 @@ class Migration:
         """One row of information_schema.columns, or None. `column_type` is the
         full declaration ('varchar(36)'), which `data_type` alone is not."""
         found = self.rows("""
-            SELECT column_type, collation_name, is_nullable
+            -- Aliased explicitly. MySQL 8 labels information_schema columns
+            -- in UPPERCASE and SQLAlchemy's mapping keys are case sensitive, so
+            -- an unaliased `collation_name` comes back as COLLATION_NAME and
+            -- every lookup below raises NoSuchColumnError. Aliasing pins the
+            -- label regardless of what the server decides to return.
+            SELECT column_type    AS column_type,
+                   collation_name AS collation_name,
+                   is_nullable    AS is_nullable
             FROM information_schema.columns
             WHERE table_schema = DATABASE()
               AND table_name   = :table
@@ -345,7 +352,7 @@ class Migration:
 
     def table_columns(self, table: str) -> set[str]:
         found = self.rows("""
-            SELECT column_name FROM information_schema.columns
+            SELECT column_name AS column_name FROM information_schema.columns
             WHERE table_schema = DATABASE() AND table_name = :table
         """, {"table": table})
         return {row["column_name"] for row in found}
@@ -360,7 +367,7 @@ class Migration:
 
     def foreign_keys(self, table: str) -> list[str]:
         found = self.rows("""
-            SELECT constraint_name FROM information_schema.table_constraints
+            SELECT constraint_name AS constraint_name FROM information_schema.table_constraints
             WHERE table_schema    = DATABASE()
               AND table_name      = :table
               AND constraint_type = 'FOREIGN KEY'
