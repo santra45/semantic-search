@@ -26,10 +26,15 @@ PLAN_LIMITS = {
     }
 }
 
-# The onboarding page advertises these same numbers from catalog.PLANS. Check at
-# import time that the two agree, so the process refuses to start rather than
-# quietly selling a 5,000-product plan and issuing a 500-product key.
-catalog.assert_plans_match(PLAN_LIMITS)
+# PLAN_LIMITS above is v1's single ladder and is now frozen: it feeds only the
+# JWT path in this module, which the v2 schema replaces. It is deliberately no
+# longer cross-checked against catalog, because there is nothing left to check
+# it against - catalog.PLANS split into INDEX_PLANS (per site) and MODULE_PLANS
+# (per subscription), and neither is the shape assert_plans_match compared.
+#
+# Nothing new should read these numbers. New allowances come from
+# catalog.catalogue_limit_for() and catalog.request_limit_for(), which the v2
+# services already use.
 
 
 # ─── Generate ──────────────────────────────────────────────────────────────────

@@ -172,7 +172,7 @@ async def signup_client(
     platform: Optional[str] = Form(None),
     platform_version: Optional[str] = Form(None),
     estimated_products: Optional[str] = Form(None),
-    plan: str = Form(catalog.DEFAULT_PLAN),
+    plan: str = Form(catalog.DEFAULT_MODULE_PLAN),
     db: Session = Depends(get_db),
 ):
     """Issue a license key scoped to one product on one store.
@@ -193,8 +193,8 @@ async def signup_client(
 
         domain = extract_domain(store_url)
 
-        if not catalog.is_valid_plan(plan):
-            plan = catalog.DEFAULT_PLAN
+        if not catalog.is_valid_module_plan(plan):
+            plan = catalog.DEFAULT_MODULE_PLAN
 
         # Find-or-create. A customer buying their second product is the normal
         # case now, not an error — the old code raised "email already exists"
@@ -263,7 +263,7 @@ async def signup_client(
                 "accent": platform_meta["accent"],
             },
             domain=domain,
-            plan=catalog.PLANS[plan],
+            plan=catalog.MODULE_PLANS[plan],
             install=_install_instructions(product, platform_meta, license_key, domain),
             reissued=reissued,
         )
@@ -284,7 +284,7 @@ async def signup_client(
 async def get_plans():
     """Plan tiers. Kept at its original path — the WooCommerce plugin's
     settings screen fetches this to show the customer what they're on."""
-    return {"plans": {code: plan for code, plan in catalog.PLANS.items()}}
+    return {"plans": {code: plan for code, plan in catalog.MODULE_PLANS.items()}}
 
 
 @router.get("/{artifact}.zip")

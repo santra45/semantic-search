@@ -172,7 +172,7 @@
     input.type = "radio";
     input.name = "plan";
     input.value = plan.code;
-    if (plan.code === state.catalog.default_plan) input.checked = true;
+    if (plan.code === state.catalog.default_module_plan) input.checked = true;
 
     var body = document.createElement("span");
     body.className = "choice__body plan__body";
@@ -402,9 +402,12 @@
           el.platformChoices.appendChild(platformCard(platform));
         });
 
-        data.plans.forEach(function (plan) {
+        // module_plans, not plans: the catalogue carries two ladders now.
+        // This picker is the per-module request allowance; the site's index
+        // plan (catalogue size) is a separate choice the v2 wiring will add.
+        data.module_plans.forEach(function (plan) {
           el.planChoices.appendChild(planCard(plan));
-          if (plan.code === data.default_plan) state.plan = plan;
+          if (plan.code === data.default_module_plan) state.plan = plan;
         });
 
         refreshPanel();
