@@ -225,21 +225,30 @@ def validate_license_key(token: str, db: Session) -> dict:
 
 # ─── Usage Tracking ────────────────────────────────────────────────────────────
 
+# v1's per-client counters. The v2 migration renamed `usage_logs` to
+# `usage_logs_archive_v1`, so every statement here was raising 1146 and taking
+# two live endpoints (/api/dashboard/stats and /api/magento/search) to HTTP 500
+# with it.
+#
+# The WRITES are retired rather than repointed. usage_counters, written by
+# usage_service.record(), is the v2 replacement and is keyed per SUBSCRIPTION
+# rather than per client - which is the whole point, since v1's counter was
+# incremented by two endpoints out of fifteen and therefore metered AI Search
+# traffic and nothing else. Writing into a frozen archive would corrupt the one
+# historical record we kept.
+#
+# The READS point at the archive, so a dashboard still shows the history it
+# always showed rather than dropping to a zero it would present as a
+# measurement.
+
+
 def increment_search_count(db: Session, client_id: str):
-    """Increment search count for current month."""
-    month = datetime.utcnow().strftime("%Y-%m")
+    """Retired. v2 counts billable requests in usage_counters.
 
-    db.execute(text("""
-        INSERT INTO usage_logs (id, client_id, month, search_count)
-        VALUES (:id, :client_id, :month, 1)
-        ON DUPLICATE KEY UPDATE search_count = search_count + 1
-    """), {
-        "id":        str(uuid.uuid4()),
-        "client_id": client_id,
-        "month":     month
-    })
-
-    db.commit()
+    Kept as a no-op because eleven call sites still reach it and deleting the
+    function would turn a dead counter into eleven import errors.
+    """
+    return None
 
 
 def get_monthly_usage(db: Session, client_id: str) -> dict:
@@ -248,7 +257,7 @@ def get_monthly_usage(db: Session, client_id: str) -> dict:
 
     result = db.execute(text("""
         SELECT search_count, ingest_count
-        FROM usage_logs
+        FROM usage_logs_archive_v1
         WHERE client_id = :client_id AND month = :month
     """), {"client_id": client_id, "month": month}).fetchone()
 
@@ -414,18 +423,5 @@ def get_client_license(db: Session, client_id: str) -> dict:
 # ─── Ingest Logging ────────────────────────────────────────────────────────────
 
 def increment_ingest_count(db: Session, client_id: str, count: int = 1):
-    """Increment ingest count for current month."""
-    month = datetime.utcnow().strftime("%Y-%m")
-
-    db.execute(text("""
-        INSERT INTO usage_logs (id, client_id, month, ingest_count)
-        VALUES (:id, :client_id, :month, :count)
-        ON DUPLICATE KEY UPDATE ingest_count = ingest_count + :count
-    """), {
-        "id":        str(uuid.uuid4()),
-        "client_id": client_id,
-        "month":     month,
-        "count":     count
-    })
-
-    db.commit()
+    """Retired alongside increment_search_count - see the note above it."""
+    return None

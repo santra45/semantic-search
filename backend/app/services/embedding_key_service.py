@@ -16,7 +16,10 @@ the pair:
     sends today and must keep working untouched.
 
 Both arrive encrypted under the tenant's license key and are decrypted here,
-in memory, exactly like the LLM key.
+in memory, exactly like the LLM key. That licence key is the key-encryption
+key, which means reissuing it orphans both blobs at once — see the re-wrap
+requirement in llm_key_service._kek(), and resolve_embedding_key() below for
+what that costs us when it happens.
 """
 
 from __future__ import annotations
@@ -25,7 +28,11 @@ import logging
 from typing import Optional
 
 from backend.app.config import EMBED_MODEL
-from backend.app.services.llm_key_service import decrypt_key
+from backend.app.services.llm_key_service import (
+    decrypt_key,
+    licence_for_log,
+    tenant_for_log,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +76,66 @@ def resolve_embedding_key(
     behaviour for installs that configured neither. A key that fails to
     decrypt is treated as absent rather than fatal: a corrupted option value
     in someone's admin should degrade to the server key, not 500 every sync.
+
+    TREATED AS ABSENT, NO LONGER TREATED AS UNREMARKABLE. Falling back is
+    harmless only when the tenant configured nothing. When they DID configure a
+    key and it would not open, the identical fallback moves their embedding
+    spend onto OUR Google budget: embedder.get_client(None) builds
+    genai.Client(api_key=None), which reads the server key out of the
+    environment and succeeds. No layer above this one can separate the two
+    cases — a router sees None either way — so they are separated here, and
+    only the second one logs.
+
+    The partial case is covered too and needs no line of its own: a tenant
+    whose embedding blob is orphaned but whose LLM blob still opens gets the
+    LLM key back (correct — that is the documented fallback order) and
+    decrypt_key has already logged which of the two failed and why.
     """
+    # Whether the tenant has anything stored at all. This is the entire
+    # difference between "never configured a key", which is most installs and
+    # must stay quiet, and "configured one we cannot open", which is money.
+    configured = False
+
     for encrypted, source in ((embedding_encrypted, "embedding"), (llm_encrypted, "llm")):
         if not encrypted:
             continue
+        configured = True
         try:
-            key = decrypt_key(encrypted, license_key)
+            key = decrypt_key(encrypted, license_key, purpose=f"{source} key")
         except Exception as exc:
-            logger.warning("%s key failed to decrypt, skipping: %s", source, exc)
+            # decrypt_key does not raise, by contract: it logs and returns
+            # None. This stays as belt and braces for the day that changes, and
+            # is NOT the failure path — a key that would not open arrives below
+            # as a falsy `key`, which is what the fallback warning keys off.
+            # Reading this except block as the failure handler is what let the
+            # silent fallback survive: it has never once executed.
+            logger.warning(
+                "%s key: decrypt_key raised instead of returning None (%s: %s). "
+                "%s",
+                source,
+                type(exc).__name__,
+                exc,
+                tenant_for_log(),
+            )
             continue
         if key:
             return key
+
+    if configured:
+        # Carries its own tenant and KEK fields rather than saying "see the
+        # line above". Under concurrency there is no line above: uvicorn
+        # interleaves requests and the decrypt_key warning for THIS tenant can
+        # be several other tenants' lines back.
+        logger.warning(
+            "embedding key: FALLING BACK TO THE SERVER KEY - this tenant has "
+            "at least one stored provider key and none of them could be "
+            "unwrapped, so these embeddings are billed to OUR Google account "
+            "instead of theirs. %s %s. llm_key_service.decrypt_key logged "
+            "which key failed and why.",
+            tenant_for_log(),
+            licence_for_log(license_key),
+        )
+
     return None
 
 

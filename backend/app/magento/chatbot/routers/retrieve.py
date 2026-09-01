@@ -19,7 +19,15 @@ import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+# NO `from fastapi.responses import StreamingResponse` HERE, ON PURPOSE.
+#
+# It used to sit on this line, and the streaming endpoint below is the only
+# thing in the backend that returns a streaming body. An import of the raw
+# class is an invitation to write the next one as StreamingResponse(gen(), ...),
+# which streams perfectly and silently loses the whole turn's billable usage row
+# - measured: the tenant context reads None in every chunk and at the terminal
+# write. Return request_context.streaming_response(gen(), license_data, ...)
+# instead; it builds the StreamingResponse for you with the context pinned.
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
@@ -1307,7 +1315,7 @@ def retrieve_answer_stream(
     cost computation, same billable usage_events row at the end. The only
     difference is the response shape — and that the row has to carry its
     tenant context explicitly, because the generator runs after this function
-    returns. See the pinned_stream() comment at the return statement.
+    returns. See the streaming_response() comment at the return statement.
     """
     license_data = authorize_request(
         request=request, db=db,
@@ -1557,9 +1565,13 @@ def retrieve_answer_stream(
         # chunk 2 onwards. Anyone verifying by eyeballing the first token ships
         # it, and this write — the LAST thing the generator does — silently
         # loses the billable row for the whole turn. The streaming response is
-        # wrapped in request_context.pinned_stream() at the return statement
+        # built by request_context.streaming_response() at the return statement
         # below for the same reason, which is what keeps the embedding calls the
         # active-retrieval tool loop makes inside this generator attributable.
+        # That shape is no longer only a convention: get_context() logs at ERROR
+        # if it is ever read as absent from inside a streaming body, so an
+        # endpoint written the bare way says so on its first usage write instead
+        # of quietly dropping every row.
         #
         # billable=True here and at /retrieve/answer is safe: the module calls
         # one endpoint or the other per turn, never both.
@@ -1599,22 +1611,45 @@ def retrieve_answer_stream(
             },
         }) + "\n"
 
-    # PINNED, not bare. Everything inside event_stream() runs after this
-    # function has returned, in a fresh copy of the event loop's context, so the
-    # tenant identity the chokepoint bound is provably absent there — measured
-    # in the container as None in the first chunk, the second and the terminal
-    # one. The chat_answer write at the end of the generator handles that by
-    # passing its ctx explicitly, but the active-retrieval tool loop also runs
-    # in here, and every embed_query() it fires writes usage through the shared
-    # embedder, which has no ctx to pass and can only read the ambient one.
-    # Without this wrapper those rows are refused as NO CONTEXT and a streamed
-    # turn is billed for its answer and nothing else.
+    # streaming_response(), not StreamingResponse(). Everything inside
+    # event_stream() runs after this function has returned, in a fresh copy of
+    # the event loop's context, so the tenant identity the chokepoint bound is
+    # provably absent there — measured in the container as None in the first
+    # chunk, the second and the terminal one. The chat_answer write at the end
+    # of the generator handles that by passing its ctx explicitly, but the
+    # active-retrieval tool loop also runs in here, and every embed_query() it
+    # fires writes usage through the shared embedder, which has no ctx to pass
+    # and can only read the ambient one. Built any other way, those rows are
+    # refused as NO CONTEXT and a streamed turn is billed for its answer and
+    # nothing else.
     #
-    # Pinned LAST, on purpose: copy_context() snapshots the variables as they
+    # The helper owns the response object, not just the iterator, and that is
+    # what gives the body a deterministic close(). starlette never closes a
+    # streaming body itself — iterate_in_threadpool() takes iter() and drops it
+    # — so under a bare StreamingResponse any disconnect-time cleanup in
+    # event_stream() runs whenever the garbage collector gets to it: on an
+    # arbitrary thread, outside the pinned context, and after this request's db
+    # session has been torn down. There is no finally block in event_stream()
+    # today; this is what makes it safe to add one.
+    #
+    # Called LAST, on purpose: copy_context() snapshots the variables as they
     # stand right now, so anything bound after this call would be invisible
     # inside the stream.
-    return StreamingResponse(
-        request_context.pinned_stream(event_stream(), license_data),
+    #
+    # UNCONDITIONAL, and do NOT "fix" it to pin only on the v2 path. The
+    # chokepoint's bind_context() is v2-only, and copying that condition here
+    # looks like consistency but breaks two things. First, a v1 license_data is
+    # a perfectly good dict to pin: usage_service decides what to do with it by
+    # SHAPE, sees no tenant identifiers and refuses the row as NO CONTEXT at
+    # WARNING, which is the same outcome as not pinning and the correct one
+    # during the dual-read window. Second, get_context() now logs at ERROR when
+    # it is read as absent from inside a streaming body — pinning conditionally
+    # would make every v1 streamed turn trip that guard, which is a false alarm
+    # on today's entire traffic and the fastest way to get the marker filtered
+    # out before a real one ever fires.
+    return request_context.streaming_response(
+        event_stream(),
+        license_data,
         media_type="application/x-ndjson",
     )
 

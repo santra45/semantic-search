@@ -48,22 +48,37 @@ around that:
   * bind_context() hands back no token, so there is nothing to forget to reset.
   * request_context() is the only way to take a scope you own, and it cannot be
     entered without the paired reset.
-  * pinned_stream() exists because a StreamingResponse generator is the one
-    place a bound context provably does NOT reach, and the naive fix passes a
-    smoke test before failing where it counts. See its docstring.
+  * streaming_response() is how you return a StreamingResponse from this
+    codebase, because a SYNC streaming body is the one place a bound context
+    provably does NOT reach and the naive fix passes a smoke test before
+    failing where it counts. (An async body on an `async def` endpoint keeps
+    the binding - measured - and needs none of this; pinned_stream() says so
+    and refuses one.) See its docstring, and pinned_stream() below it.
+  * get_context() logs at ERROR when it is read as absent from inside a
+    streaming body, which is the shape that used to lose a whole turn's
+    billable row with no error anywhere. See _in_streaming_body().
   * bind_context() logs at ERROR if it finds a different tenant already bound,
     which is the only way the brief's leakage story could ever come true. If
     that line ever fires, the premises above have changed and this comment is
     the thing to re-verify.
 
-STDLIB ONLY, DELIBERATELY
--------------------------
-This module imports nothing from the rest of the application, and must not
-start. usage_service.record() is going to import it to read the ambient
-context; usage_service already imports licensing_service. The moment this file
-imports usage_service back - for new_interaction_id(), which is the tempting
-one - that is a circular import and the app stops booting. Minting stays with
-the caller. interaction_id_from_header() below only sanitises.
+NO APPLICATION IMPORTS, EVER
+----------------------------
+This module must not import anything from backend.app. usage_service.record()
+imports it to read the ambient context; usage_service already imports
+licensing_service. The moment this file imports usage_service back - for
+new_interaction_id(), which is the tempting one - that is a circular import and
+the app stops booting. Minting stays with the caller.
+interaction_id_from_header() below only sanitises.
+
+That rule used to be written here as "stdlib only", which is a stricter line
+than the reason behind it justifies and which streaming_response() now crosses:
+it imports starlette's StreamingResponse. starlette is a leaf dependency that
+cannot import this application, so it cannot participate in the cycle the rule
+exists to prevent, and the alternative - a helper that constructs the response
+without naming its class - is worse code for a rule that never meant that.
+Third-party leaf imports are fine. backend.app imports are not, at module scope
+or inside a function.
 """
 
 from __future__ import annotations
@@ -71,8 +86,12 @@ from __future__ import annotations
 import contextvars
 import logging
 import re
+import sys
 from contextlib import contextmanager
-from typing import Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
+
+from starlette.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
@@ -95,14 +114,83 @@ _CTX: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
 
 # -- Reading -----------------------------------------------------------------
 
+# How far up the stack _in_streaming_body() will look before giving up. The
+# frame it wants is a handful above the writer - get_context, _implicit_ctx,
+# record, the shared service, the generator body, _next - but an active
+# retrieval tool loop puts a dozen langchain frames in between, so this is
+# generous. It only ever runs when the context is already missing, i.e. on a
+# path that is about to refuse a billing row anyway.
+_STACK_SCAN_LIMIT = 60
+
+
+def _in_streaming_body() -> bool:
+    """True when the caller is running inside a StreamingResponse body pull.
+
+    THE ONLY THING THAT SEPARATES A LOST BILLING ROW FROM AN EXPECTED ONE.
+
+    A missing context is routine in this codebase and will stay routine for the
+    whole dual-read window: a v1 JWT request has no v2 identity to bind, and
+    several entry points (the WooCommerce webhooks, the AI Search family) have
+    no chokepoint at all. Logging every absent context at ERROR would bury the
+    one case that is genuinely a defect.
+
+    That case is a streaming body that was not pinned. starlette pulls a sync
+    streaming body with iterate_in_threadpool(), which dispatches
+    `_next(as_iterator)` onto an AnyIO worker thread through
+    anyio.to_thread.run_sync - and that dispatch takes a FRESH copy_context(),
+    so nothing the chokepoint bound is visible inside. Because `_next` is the
+    callable handed to the thread, its frame sits directly beneath the
+    generator's on that thread's stack, and walking f_back from a writer finds
+    it. Nothing else in starlette/concurrency.py reaches a worker thread's
+    stack: run_in_threadpool() awaits on the event-loop thread and its frame is
+    on a different stack entirely, so an ordinary sync `def` endpoint does not
+    match here (verified against the running container - a plain sync handler
+    reading an absent context stays silent).
+
+    A pinned body cannot reach this function, because pinned_stream() refuses an
+    empty ctx, so inside a pinned stream the context is never None. Absent
+    context plus this frame therefore means exactly one thing: someone returned
+    StreamingResponse(gen(), ...) instead of streaming_response(gen(), ctx).
+
+    Only the SYNC body shape is detected, and that is the whole population worth
+    detecting: an async body never goes near iterate_in_threadpool, is iterated
+    on the event loop inside the request's own Task, and keeps the chokepoint's
+    binding (measured - see pinned_stream). There is no silent loss to catch.
+
+    Matched on the module path rather than only the function name so that
+    renaming `_next` does not silently retire the guard; the name is kept as a
+    second, independent condition in case the file moves instead. If starlette
+    ever does both, this goes quiet and streaming_response() is the defence
+    that remains - which is why that helper exists rather than this check alone.
+    """
+    frame = sys._getframe()
+    depth = 0
+    while frame is not None and depth < _STACK_SCAN_LIMIT:
+        code = frame.f_code
+        path = code.co_filename.replace("\\", "/")
+        if "starlette" in path and (
+            path.endswith("/concurrency.py") or code.co_name == "_next"
+        ):
+            return True
+        frame = frame.f_back
+        depth += 1
+    return False
+
+
 def get_context() -> Optional[dict]:
     """The tenant context bound for this request, or None.
 
     None means one of three things and the caller has to treat them the same
     way: no chokepoint ran (a router that still authenticates inline), the
-    caller is not on a request at all, or the caller is inside a
-    StreamingResponse generator, which cannot see a bound context - see
-    pinned_stream().
+    caller is not on a request at all, or the caller is inside a streaming
+    response body that was not built with streaming_response().
+
+    Only the third of those is a defect, and it is the one that used to be
+    invisible, so it is the one that gets a log line here - see
+    _in_streaming_body() for why the other two stay quiet. Logged here rather
+    than in usage_service because this is the module that knows what a pinned
+    stream is, and because a streaming body that reads an absent context has
+    already lost the row by the time any writer sees the None.
 
     The dict is the SAME OBJECT the chokepoint returned to the handler, not a
     copy. That is on purpose: what a shared service reads here is exactly what
@@ -112,7 +200,41 @@ def get_context() -> Optional[dict]:
     because that key is the KEK every merchant-supplied LLM key is encrypted
     under and roughly twenty call sites need it. Never log this dict whole.
     """
-    return _CTX.get()
+    ctx = _CTX.get()
+
+    # THE GUARD FOR THE FAILURE THAT HAS NO OTHER SYMPTOM.
+    #
+    # Everything else that goes wrong with this module is at least visible: a
+    # refused usage row logs, a rebind logs, a bad ctx shape raises. A streaming
+    # endpoint written as StreamingResponse(gen(), ...) logs nothing anywhere -
+    # the answer streams perfectly, the shopper is happy, and the turn's
+    # billable row silently does not exist. Measured in the container: every
+    # chunk and the terminal write read None.
+    #
+    # The near-miss variant is the reason this is at ERROR rather than WARNING.
+    # Binding the ContextVar at the top of the generator gives the right tenant
+    # in chunk 1 and None from chunk 2 onwards, because the generator FRAME
+    # survives across yields and the Context does not. A reviewer who checks the
+    # first token concludes it works and ships it. This line fires from chunk 2
+    # on, which is the only moment that shape is distinguishable from a correct
+    # one.
+    #
+    # Deliberately not rate-limited. One line per lost row is the correct
+    # volume: each is a real billing row that will not exist, and a stream that
+    # fires this fifty times is fifty rows gone.
+    if ctx is None and _in_streaming_body():
+        logger.error(
+            "request context: ABSENT INSIDE A STREAMING BODY - this turn's "
+            "usage rows are being lost. The endpoint returned a bare "
+            "StreamingResponse, so the body is pulled through "
+            "iterate_in_threadpool() in a fresh context copy and nothing the "
+            "auth chokepoint bound can reach it. Fix the endpoint, not the "
+            "writer: return request_context.streaming_response(gen(), "
+            "license_data, media_type=...) instead of StreamingResponse(gen(), "
+            "...). See request_context.streaming_response()."
+        )
+
+    return ctx
 
 
 def current_interaction_id() -> Optional[str]:
@@ -120,6 +242,13 @@ def current_interaction_id() -> Optional[str]:
 
     Convenience over get_context() because a writer that only needs the id
     should not have to know the context is a dict, nor guess the key name.
+
+    Reads _CTX directly rather than going through get_context(), so it does NOT
+    trip the unpinned-stream guard. That is deliberate: a missing interaction_id
+    costs a grouping, not a row - the row is still written, just harder to thread
+    back to its turn - and the guard's whole value is that it only ever fires on
+    an actual lost row. Anything that would lose a row goes through
+    get_context().
     """
     ctx = _CTX.get()
     return ctx.get("interaction_id") if isinstance(ctx, dict) else None
@@ -225,19 +354,163 @@ class _PinnedIterator:
     def close(self) -> None:
         """Close the wrapped generator INSIDE the pinned context.
 
-        Not decorative. A generator's finally block is where a usage write
-        belongs if the shopper disconnects mid-stream, and that block runs
-        during close(). Closing from outside the pinned context would leave
-        exactly that write - the one for a turn that was paid for and not
-        delivered - without a tenant.
+        WHO ACTUALLY CALLS THIS, BECAUSE IT IS NOT STARLETTE.
+
+        The previous version of this docstring asserted that a generator's
+        finally block "runs during close()" as if the framework guaranteed the
+        call. It does not, and the difference is the whole point. starlette
+        1.3.1's iterate_in_threadpool() does `as_iterator = iter(iterator)` and
+        never closes it; StreamingResponse never touches body_iterator on the
+        way out either. Abandon a stream mid-flight and this object is dropped
+        by refcount, the wrapped generator is finalised by the interpreter, and
+        its finally block runs on whatever thread the collection happened on,
+        OUTSIDE the pinned context - and, worse, after the request's db session
+        has been torn down. FastAPI's AsyncExitStackMiddleware wraps the router,
+        so every `yield` dependency (get_db among them) unwinds the moment
+        Response.__call__ returns; a write from a GC-driven close has no live
+        Session to write to even if it had a tenant.
+
+        Measured against the running container, real uvicorn, a real socket RST
+        after the first chunk: chunks 0-3 read client_id=probe-client, the
+        finally block read client_id=None. The instrumented close() never fired.
+
+        So the caller is ours. _PinnedStreamingResponse.__call__() invokes this
+        in a finally, which runs on every exit - clean end, client disconnect,
+        cancelled shutdown - and runs while the request's dependencies are still
+        alive. That is what streaming_response() returns, and it is the only
+        thing that makes the guarantee above real.
+
+        A bare StreamingResponse(pinned_stream(gen, ctx), ...) gets the pinning
+        for the chunks and NOT this. Do not write one; use streaming_response().
+
+        Synchronous on the event-loop thread, on purpose. Dispatching the close
+        to a worker would make it an await, and an await inside a cancelled
+        scope raises before the callable runs - losing the cleanup at exactly
+        the moment (server shutdown) it is least recoverable. The cost is that a
+        disconnect-time finally block blocks the loop for its duration, so keep
+        one to a single small write.
         """
         closer = getattr(self._iterator, "close", None)
-        if closer is not None:
+        if closer is None:
+            return
+        try:
             self._context.run(closer)
+        except Exception as exc:
+            # Never let cleanup replace a clean client disconnect with a
+            # traceback. Two things reach here: a finally block in the body that
+            # raised (its own bug, but the response is already over), and
+            # ValueError("generator already executing") if a future change ever
+            # lets the pull thread outlive the response - anyio's
+            # to_thread.run_sync defaults to abandon_on_cancel=False, which is
+            # what currently makes that impossible, so if this ever fires with
+            # that message the default has been overridden somewhere.
+            logger.warning(
+                "request context: closing a pinned stream body raised (%s: %s). "
+                "The response was already finished; nothing is retried.",
+                type(exc).__name__, exc,
+            )
+
+
+class _PinnedStreamingResponse(StreamingResponse):
+    """A StreamingResponse that closes its pinned body, inside the pinned context.
+
+    The whole reason streaming_response() returns a response object rather than
+    leaving the caller to build one. starlette never closes a streaming body
+    (see _PinnedIterator.close for the measurement), so the only place a
+    deterministic close can be hung is the response's own __call__, which is
+    what this overrides.
+    """
+
+    def __init__(self, body: _PinnedIterator, **kwargs: Any) -> None:
+        super().__init__(body, **kwargs)
+        # Our own handle, because self.body_iterator is NOT this object:
+        # StreamingResponse.__init__ replaces a sync iterable with the
+        # iterate_in_threadpool() async generator that wraps it, and that
+        # wrapper has no close() worth calling.
+        self._pinned_body = body
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # EVERY exit runs this: the stream ending normally, the shopper
+            # closing the tab (starlette's disconnect handling differs by ASGI
+            # spec_version - 2.3 collapses the task group and returns, 2.4+
+            # raises ClientDisconnect - and a finally covers both, where the
+            # `background=` hook starlette offers covers only one), and a
+            # cancelled shutdown. Closing an already-exhausted generator is a
+            # no-op, so the normal path costs nothing.
+            self._pinned_body.close()
+
+
+def streaming_response(
+    iterable: Iterable,
+    ctx: dict,
+    *,
+    media_type: Optional[str] = None,
+    status_code: int = 200,
+    headers: Optional[Mapping[str, str]] = None,
+    background: Any = None,
+) -> _PinnedStreamingResponse:
+    """RETURN THIS, NOT StreamingResponse, FROM EVERY STREAMING ENDPOINT.
+
+    THE FUNCTION THAT EXISTS SO THE NEXT ONE OF THESE IS NOT WRITTEN WRONG.
+
+    pinned_stream() below is correct and was, for one release, a manual per-site
+    opt-in with exactly one caller. Nothing stopped the next streaming endpoint
+    from being written the obvious way - StreamingResponse(gen(), ...) - and
+    that shape was measured losing the context in every chunk AND at the
+    terminal write, with no error raised anywhere. A billing row that silently
+    does not exist is found in a reconciliation months later, if at all. So the
+    pinning is no longer something to remember; it is what the constructor you
+    are supposed to reach for does.
+
+    Two independent things keep a naive endpoint from shipping quietly:
+    returning this instead of building a response by hand, and the ERROR that
+    get_context() logs when it is read as absent from inside a streaming body.
+    The second catches the endpoint that ignores the first.
+
+    *ctx* is the dict the chokepoint returned - license_data. Passing it rather
+    than reading get_context() here is deliberate: at the streaming site it is
+    a local the handler is already holding, and requiring it means a caller who
+    forgot to authorise cannot silently pin nothing.
+
+    Pass it whatever auth path the request took. A v1 JWT license_data has none
+    of the six tenant identifiers on it, but it is still the right thing to pin:
+    usage_service decides by SHAPE and will refuse the row as NO CONTEXT at
+    WARNING either way, whereas pinning conditionally would leave the context
+    genuinely absent inside the body and trip get_context()'s guard on every v1
+    streamed turn - a false ERROR on the whole of today's traffic. The
+    chokepoint's bind_context() IS v2-only; that asymmetry is deliberate and
+    the reason is written at the call site in retrieve.py.
+
+    Call this LAST in the handler, for the reason in pinned_stream().
+
+    The keyword arguments are StreamingResponse's own, forwarded unchanged, so
+    there is nothing to learn here beyond the name. Note that *background* runs
+    after the body is exhausted and does NOT run on a client disconnect on this
+    stack - disconnect cleanup belongs in the generator's finally, which
+    _PinnedStreamingResponse closes into the pinned context.
+    """
+    body = pinned_stream(iterable, ctx)
+    return _PinnedStreamingResponse(
+        body,
+        status_code=status_code,
+        headers=headers,
+        media_type=media_type,
+        background=background,
+    )
 
 
 def pinned_stream(iterable: Iterable, ctx: dict) -> _PinnedIterator:
-    """Wrap a StreamingResponse body so *ctx* is visible inside it.
+    """Wrap a streaming body so *ctx* is visible inside it.
+
+    The mechanism behind streaming_response(), and separate from it only
+    because the two do different jobs: this pins the context to the iteration,
+    that one also owns the response object and therefore the close. Reach for
+    streaming_response() unless you are building a response starlette does not
+    - handing this to a bare StreamingResponse gets the chunks right and loses
+    the disconnect-time cleanup (see _PinnedIterator.close).
 
     THE ONE PLACE A BOUND CONTEXT DOES NOT REACH, and the reason this function
     exists rather than a comment saying "be careful".
@@ -260,21 +533,38 @@ def pinned_stream(iterable: Iterable, ctx: dict) -> _PinnedIterator:
     silent loss this rewrite exists to end.
 
     So the context is pinned to the Context object itself, and every next() and
-    the final close() run inside it.
+    the close() run inside it.
 
     Pin LAST. copy_context() snapshots every contextvar as it stands right now,
     so anything bound after this call is invisible inside the stream.
 
-    Passing *ctx* explicitly, rather than reading get_context() here, is also
-    deliberate: at the streaming site the resolved dict is a local the handler
-    is already holding, and requiring it means a caller who forgot to
-    authorise cannot silently pin nothing.
+    NONE OF THIS APPLIES TO AN ASYNC BODY, and the check below says so rather
+    than letting iter() raise something cryptic. starlette only reaches for
+    iterate_in_threadpool() when the body is a plain iterable; an AsyncIterable
+    is iterated directly with `async for` on the event loop, inside the same
+    Task the handler ran in, so an `async def` endpoint's binding is simply
+    still there. Measured the same way as everything else here - async endpoint,
+    async generator, bare StreamingResponse, real socket RST after the first
+    chunk: every chunk AND the finally block read the bound tenant. There is
+    nothing for this function to fix there.
     """
     if not isinstance(ctx, dict) or not ctx:
         raise TypeError(
             "pinned_stream() needs the tenant context the chokepoint returned; "
             f"got {type(ctx).__name__}. Pass the handler's license_data - "
             "pinning an empty context is the same silent loss as not pinning."
+        )
+
+    if hasattr(iterable, "__aiter__"):
+        raise TypeError(
+            "pinned_stream() takes a SYNC iterable; got an async one "
+            f"({type(iterable).__name__}). An async body does not need pinning: "
+            "starlette iterates it on the event loop inside the request's own "
+            "Task, so the chokepoint's context is still bound and every chunk "
+            "sees it (measured). Return StreamingResponse(agen(), ...) directly "
+            "- but check first that the endpoint is `async def`, because a sync "
+            "`def` handler runs in a worker thread whose context is discarded "
+            "before the body starts, and neither shape saves it."
         )
 
     context = contextvars.copy_context()

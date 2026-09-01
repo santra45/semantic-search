@@ -51,8 +51,11 @@ def dashboard_stats(
 
     # Usage this month
     usage = db.execute(text("""
+        -- The archive, not usage_logs: the v2 migration renamed the table and
+        -- this SELECT was 500ing the whole endpoint. Reading history rather
+        -- than reporting a zero it never measured.
         SELECT search_count, ingest_count
-        FROM usage_logs
+        FROM usage_logs_archive_v1
         WHERE client_id = :client_id AND month = :month
     """), {"client_id": client_id, "month": month}).fetchone()
 

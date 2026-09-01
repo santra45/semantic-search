@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
 from backend.app.services import (
     auth_cache,
+    catalog,
     licensing_service,
     request_context,
+    tenancy_service,
     usage_service,
 )
 # Aliased because `license_key` is the name of the local holding the presented
@@ -35,6 +38,8 @@ from backend.app.magento.chatbot.agents.request_context import RequestContext
 from backend.app.magento.chatbot.services import admin_token_service, magento_creds_service
 from backend.app.magento.chatbot.services.magento_client import MagentoClient
 
+logger = logging.getLogger(__name__)
+
 
 def resolve_license_key(
     authorization: Optional[str],
@@ -51,6 +56,13 @@ def resolve_license_key(
 # _enforce_search_quota and decrypt_llm_key are already copied between them —
 # and the WordPress file's docstring makes a point of not importing anything
 # from the Magento package. Change one, change the other in the same commit.
+#
+# ONE EXCEPTION, AND IT IS NOT AN OVERSIGHT: the product authorisation table
+# below. This chokepoint fronts three products through shared endpoints and so
+# needs a per-route mapping; the WordPress twin fronts exactly one product
+# across its whole package and so carries a single constant instead. Both files
+# say so at the top of that section. Everything else here still has to move in
+# lockstep.
 
 # Which v2 alias fills which v1 contract key. RENAMED, never replaced:
 # license_data is read at roughly a hundred sites across this package and the
@@ -95,6 +107,119 @@ if _UNKNOWN_V2_FIELDS:
 # empty, and a v1 JWT cannot be hashed forward into a v2 key.
 AUTH_PATH_V2 = "v2"
 AUTH_PATH_V1 = "v1"
+
+
+# ── Which product may call which endpoint ────────────────────────────────────
+#
+# THE BYPASS THIS CLOSES. A licence names exactly one product, and until this
+# table existed nothing compared that product against the endpoint being
+# called. Measured: a real v2 licence for product_code=magento_chatbot was
+# presented to the WordPress ProductQA chokepoint and answered HTTP 200 with
+# auth_path=v2, and the usage_events row it produced read product_code=
+# magento_chatbot, platform=magento — written from a WordPress request.
+# usage_service.record() takes product_code and subscription_id straight off
+# the resolved context and never off the request, so a merchant holding the
+# cheapest module's key could drive every other module, book its cost against
+# the wrong product, and draw billable requests out of the wrong
+# subscription's usage_counters row. The per-product billing this rewrite
+# exists to enable would be reporting fiction.
+#
+# PER ENDPOINT, NOT PER CHOKEPOINT. catalog.py says why in as many words:
+# "Three of the Magento modules share backend endpoints (AIChatbot, AIProductQA
+# and AISearch all call /magento/chatbot/agent/sync/*), which is exactly why
+# the product identity has to travel on the license key: the route the request
+# arrived on cannot tell them apart." The route cannot identify the product on
+# its own — but it does narrow the set, and narrowing three products to one is
+# the difference between billing fiction and billing.
+#
+# DERIVED FROM THE MODULES, NOT INVENTED. Every entry below is the set of
+# Czargroup PHP modules that actually builds that URL. Re-derive it with:
+#
+#   grep -rno "api/magento/chatbot/[a-zA-Z0-9_/-]*" Czargroup/
+#
+# which today reports Czargroup/AIChatbot/Model/ApiClient.php (+ its
+# Model/Agent/ToolCallClassifier.php), Czargroup/AIProductQA/Model/ApiClient.php
+# and Czargroup/AISearch/Model/ApiClient.php. If a module starts calling an
+# endpoint it did not call before, the new caller 403s until it is added here —
+# which is the loud direction of failure, and the only one available: this
+# table cannot be validated against the mounted routes at import time, because
+# the routers import this module and the reverse import would be a cycle.
+
+# The whole platform, taken from the catalogue rather than typed out, so that
+# adding a fourth Magento product widens the shared sync surface in the same
+# edit that adds it to catalog.PRODUCTS.
+_MAGENTO_PRODUCTS = frozenset(
+    product["code"] for product in catalog.products_for_platform("magento")
+)
+
+# Every Magento module writes into the ONE Qdrant collection its store shares,
+# so the whole /agent/sync/* family is granted to the whole platform. Both
+# catalog.py and Czargroup/AISearch/Helper/IndexOwnership.php describe the
+# family — "ultimately POST to the same /api/magento/chatbot/agent/sync/*
+# endpoints" — rather than individual routes, and IndexOwnership hands the
+# whole family to whichever module wins the ownership contest. Granting only
+# the two routes AISearch's ApiClient happens to build this month would 403 a
+# store the moment ownership moved. Over-granting inside this family costs
+# nothing that matters: a magento_search key driving a sync IS a magento_search
+# sync, and record() attributes it to magento_search correctly.
+_SYNC_FAMILY = _MAGENTO_PRODUCTS
+
+# The retrieval surface AIProductQA shares with AIChatbot: it asks for matching
+# products, matching content, and an answer built from them. AISearch is
+# absent on purpose and is not an omission — its read path is
+# POST /api/magento/search in backend/app/routers/search.py, which
+# authenticates inline and never reaches this chokepoint at all.
+_ANSWERING_PRODUCTS = frozenset({"magento_chatbot", "magento_product_qa"})
+
+# The conversational surface, which only AIChatbot has. AIProductQA answers one
+# question about one product on its own page: no tool-calling turn, no intent
+# classifier, no token stream, and no usage panel of its own (its dashboard
+# reads /api/token-usage/me/*, not this package).
+_CHATBOT_ONLY = frozenset({"magento_chatbot"})
+
+_ROUTE_PRODUCTS: dict[str, frozenset[str]] = {
+    "/magento/chatbot/agent/sync/batch": _SYNC_FAMILY,
+    "/magento/chatbot/agent/sync/delete": _SYNC_FAMILY,
+    "/magento/chatbot/agent/sync/status": _SYNC_FAMILY,
+    "/magento/chatbot/agent/sync/purge": _SYNC_FAMILY,
+    "/magento/chatbot/agent/sync/purge/collection": _SYNC_FAMILY,
+    "/magento/chatbot/retrieve/products": _ANSWERING_PRODUCTS,
+    "/magento/chatbot/retrieve/content": _ANSWERING_PRODUCTS,
+    "/magento/chatbot/retrieve/answer": _ANSWERING_PRODUCTS,
+    "/magento/chatbot/retrieve/content_by_ids": _CHATBOT_ONLY,
+    "/magento/chatbot/retrieve/answer/stream": _CHATBOT_ONLY,
+    "/magento/chatbot/classify": _CHATBOT_ONLY,
+    "/magento/chatbot/agent/tool-call": _CHATBOT_ONLY,
+    "/magento/chatbot/usage/stats": _CHATBOT_ONLY,
+}
+
+# The prefix every route above shares, and the anchor the lookup cuts on.
+# main.py mounts these routers with prefix="/api", so the path a request
+# carries is /api/magento/chatbot/... — searching for this root rather than
+# stripping a hard-coded "/api" means a re-mount under a different prefix
+# cannot silently stop matching, i.e. cannot silently stop authorising.
+_ROUTE_ROOT = "/magento/chatbot/"
+
+# Proof at IMPORT that every code named above is one the catalogue actually
+# sells, in the same spirit as the _V2_TO_V1_KEYS guard above. A product code
+# that no longer exists would not raise anywhere: it would simply never match
+# license_data['product_code'], and this table would 403 the module it was
+# written to allow. PRODUCT CODES ARE PERMANENT (catalog.py says so), so this
+# can only fire on a typo or on a code that was renamed against that rule —
+# both of which are cheaper to find at boot than in a merchant's support
+# ticket.
+_UNKNOWN_PRODUCT_CODES = sorted(
+    {code for codes in _ROUTE_PRODUCTS.values() for code in codes}
+    - set(catalog.PRODUCTS)
+)
+if _UNKNOWN_PRODUCT_CODES:
+    raise ImportError(
+        "The Magento chokepoint authorises endpoints for "
+        + ", ".join(_UNKNOWN_PRODUCT_CODES) + ", which catalog.PRODUCTS does "
+        "not define. Product codes are permanent by contract — do not rename "
+        "one to match this table; fix the table. The catalogue sells: "
+        + ", ".join(sorted(catalog.PRODUCTS)) + "."
+    )
 
 
 def _resolve_v2_context(db: Session, license_key: str) -> Optional[dict]:
@@ -159,6 +284,187 @@ def _license_data_from_v2_context(context: dict) -> dict:
     return license_data
 
 
+def _assert_collection_name_agrees(context: dict) -> None:
+    """Refuse a v2 context whose stored collection name is not the derived one.
+
+    THE VALUE IS CARRIED AND READ BY NOBODY. _license_data_from_v2_context()
+    copies `collection_name` out of the resolved context, and all ten Qdrant
+    call sites still derive the name themselves from (client_id, domain) —
+    qdrant_service.py at 140/256/583/1166/1207/1314/1365/1371, retrieve.py:3059
+    and tenancy_service.py:218. licensing_service._context_from_row() says why
+    the value is stored and "never recomputed from `domain`": get_collection_name
+    maps shop.example.com, shop-example-com and shop_example_com onto the same
+    string, live collections were named from an UNNORMALISED host, and
+    sites.domain is normalised by tenancy_service.normalise_domain() —
+    lowercased, no www, no port. So the two can differ, and when they do, every
+    read goes to a collection that does not exist. Qdrant answers a missing
+    collection with zero results rather than an error: the store simply goes
+    quiet, with nothing in the logs, days after whatever caused the drift.
+
+    WHY AN ASSERTION HERE RATHER THAN AT ISSUANCE. Issuance only covers licences
+    minted after the check lands; this is the one place EVERY v2 request passes,
+    so it covers the ones already out in the field too. It is also the only
+    option that does not require editing the ten call sites, none of which can
+    be made to prefer the stored value one at a time without the half-migrated
+    state being worse than either end of it.
+
+    WHY IT REFUSES RATHER THAN LOGS AND CONTINUES. On a mismatch we cannot tell
+    from here which of the two names holds the points — the stored one if the
+    collection predates domain normalisation, the derived one if the store has
+    re-synced since, because a sync derives the name exactly as a read does.
+    That is not a decision to make silently on a shopper's request. Serving it
+    means picking `derived` by accident and finding out never; refusing means a
+    human looks at Qdrant, sees which name has points, and re-seeds
+    sites.collection_name from it (or renames the collection).
+
+    500 rather than 403, deliberately: the caller's key is perfectly good and
+    telling a paying merchant it is not would be a lie. _resolve_v2_context()
+    already settled this same question the same way — "if MySQL or the context
+    shape is broken the honest answer is a 500".
+
+    Currently latent and expected to stay that way: all four local sites have
+    sites.collection_name identical to get_collection_name(client_id, domain),
+    and the column is NOT NULL, so an empty value is itself a broken row.
+    """
+    stored = context.get("collection_name")
+    derived = tenancy_service.derive_collection_name(
+        str(context.get("client_id") or ""),
+        str(context.get("domain") or ""),
+    )
+    if stored and stored == derived:
+        return
+
+    # Both names, at ERROR, because the remediation is "go and look at which of
+    # these two collections actually holds points" and neither name is
+    # recoverable from the other.
+    logger.error(
+        "licence resolved with a collection name nothing will read: "
+        "sites.collection_name=%r but every Qdrant call site derives %r from "
+        "client_id=%s domain=%r. Reads against the derived name return zero "
+        "results rather than an error, so this request is refused instead of "
+        "answered emptily. Check which collection holds the store's points and "
+        "re-seed sites.collection_name from it.",
+        stored,
+        derived,
+        context.get("client_id"),
+        context.get("domain"),
+    )
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            "This store's search index is misconfigured on our side. "
+            "Please contact support — no change is needed to your license key."
+        ),
+    )
+
+
+def _route_key(request: Request) -> Optional[str]:
+    """The declared route path with the mount prefix cut off, or None.
+
+    scope["route"] first: FastAPI writes the matched APIRoute there
+    (fastapi/routing.py sets child_scope["route"] = self), so this is the
+    framework's own answer to "which endpoint is running" rather than a second
+    guess at it from the URL, and it is immune to a trailing slash, a
+    percent-encoded segment or a redirect. request.url.path is the fallback for
+    a caller that is not a mounted route — a test holding a hand-built Request,
+    say — and returning None for anything with no recognisable route is what
+    makes an unmapped endpoint fail closed rather than unasserted.
+    """
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    cut = path.find(_ROUTE_ROOT)
+    return path[cut:] if cut != -1 else None
+
+
+def _product_label(code: str) -> str:
+    """The customer-facing name plus the code: AI Chatbot (magento_chatbot).
+
+    The name alone is ambiguous (two products are called "AI Product Q&A", one
+    per platform) and the code alone means nothing to the merchant reading the
+    403 in their admin log. Both, or the refusal generates a support ticket.
+    """
+    product = catalog.get_product(code)
+    return f"{product['name']} ({code})" if product else code
+
+
+def _assert_product_allowed(
+    request: Request,
+    license_data: dict,
+    expected_product: Optional[Union[str, frozenset, set]] = None,
+) -> None:
+    """403 unless the licence's product is one this endpoint serves.
+
+    *expected_product* lets a caller state the product itself — a single code
+    or a set of them — for an entry point that _ROUTE_PRODUCTS cannot key,
+    which is anything not mounted under _ROUTE_ROOT. No router passes it today;
+    every endpoint on this chokepoint is in the table.
+
+    SKIPPED ENTIRELY ON THE v1 PATH, and that is not laziness. v1 keys predate
+    per-product licensing: license_service.create_license_key() takes
+    product_code as an OPTIONAL argument and all four local keys carry NULL, so
+    the honest reading of a v1 key is "all products" and enforcing against it
+    would 403 tenants who did nothing wrong. Worse, the v1 keys that DO name a
+    product were issued when one key was expected to serve all three Magento
+    modules on a store — turning that into a refusal would take working
+    storefronts down to fix an accounting problem that only exists on the v2
+    path, where record() reads the product off the context.
+
+    The `product_code is None` guard below is therefore belt and braces for the
+    same shape arriving through v2, not a duplicate of the auth_path test.
+    """
+    if license_data.get("auth_path") != AUTH_PATH_V2:
+        return
+
+    product_code = license_data.get("product_code")
+    if not product_code:
+        return
+
+    route_key = _route_key(request)
+
+    if expected_product is None:
+        allowed = _ROUTE_PRODUCTS.get(route_key) if route_key else None
+    elif isinstance(expected_product, str):
+        allowed = frozenset({expected_product})
+    else:
+        allowed = frozenset(expected_product)
+
+    if allowed is None:
+        # FAIL CLOSED. An endpoint missing from _ROUTE_PRODUCTS is an endpoint
+        # outside the authorisation gate, which is precisely the bug this
+        # function exists to close — so a new route is refused for v2 keys
+        # until someone maps it, rather than quietly inheriting the old
+        # anything-goes behaviour. Costs nothing today: with licences=0 no
+        # request reaches this branch at all, and v1 returned above.
+        logger.error(
+            "no product mapping for %r — refusing a v2 licence (%s) on an "
+            "endpoint outside the product gate. Add the route to "
+            "_ROUTE_PRODUCTS in this module (and in the WordPress twin if it "
+            "belongs there); an unmapped endpoint is how a one-product key "
+            "ends up driving every product.",
+            route_key or request.url.path,
+            product_code,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This license key is for {_product_label(str(product_code))} "
+                f"and is not authorised for {request.url.path}."
+            ),
+        )
+
+    if product_code not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This license key is for {_product_label(str(product_code))}, "
+                f"which does not include {request.url.path}. That "
+                "endpoint is served by: "
+                + ", ".join(_product_label(code) for code in sorted(allowed))
+                + ". Use the license key issued for that module."
+            ),
+        )
+
+
 def _interaction_id_for(request: Request) -> str:
     """The id every usage row of this turn will share.
 
@@ -189,6 +495,7 @@ def authorize_request(
     authorization: Optional[str],
     x_api_key: Optional[str],
     request_license: Optional[str],
+    expected_product: Optional[Union[str, frozenset, set]] = None,
 ) -> dict:
     """Authenticate the caller, bind their tenant context, return license_data.
 
@@ -196,6 +503,12 @@ def authorize_request(
     licensing_service.resolve_key(); anything else falls back to the v1 JWT
     decoder exactly as before. Both paths produce the same dict contract plus
     an `auth_path` discriminator.
+
+    *expected_product* overrides the _ROUTE_PRODUCTS lookup for a caller whose
+    endpoint this module cannot key by path. Leave it unset in these routers —
+    the table already covers every route mounted under _ROUTE_ROOT, and a
+    router that declares its own product while the table says something else is
+    two answers to one question.
 
     MUST STAY A PLAIN CALL INSIDE THE HANDLER BODY. Refactoring this into a
     FastAPI Depends() looks tidier and silently breaks every usage row:
@@ -213,6 +526,9 @@ def authorize_request(
 
     context = _resolve_v2_context(db, license_key)
     if context is not None:
+        # Before the context is copied into a hundred call sites' license_data:
+        # the collection name it carries has to be the one they will derive.
+        _assert_collection_name_agrees(context)
         license_data = _license_data_from_v2_context(context)
         license_data["auth_path"] = AUTH_PATH_V2
     else:
@@ -223,6 +539,13 @@ def authorize_request(
         license_data["auth_path"] = AUTH_PATH_V1
 
     DomainAuthorizer(db).validate_request(request, license_data, api_key=x_api_key)
+    # Which STORE may call, then which PRODUCT may call. Both are 403s and the
+    # order between them is not arbitrary: the domain gate is the older, more
+    # specific answer ("this key is not for this shop"), and a caller who fails
+    # it should hear that rather than a message about product codes. Both run
+    # before the quota check so a refused request never spends a counter read,
+    # and before bind_context() so it never leaves a tenant identity behind.
+    _assert_product_allowed(request, license_data, expected_product)
     _enforce_search_quota(db, license_data)
 
     # Both paths. The v2 context stores only a hash and a display prefix, but
