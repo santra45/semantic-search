@@ -333,6 +333,35 @@ DEFAULT_MODULE_PLAN = "starter"
 TRIAL_MODULE_PLAN = "trial"
 
 
+# The onboarding form asks for catalogue size as a range, because a merchant
+# knows roughly how many products they sell and does not know which rung that
+# buys. This is the only place the two vocabularies meet.
+#
+# Keys are the option values in templates/onboarding.html — change one and the
+# other must change with it, which assert_plan_ladders_sane() enforces for the
+# values but cannot for the keys. A range that lands on the rung BELOW its own
+# upper bound would cap a store short of the catalogue it was told it could
+# index, so each range maps to the rung whose catalogue_limit covers its top.
+CATALOGUE_SIZE_INDEX_PLAN: dict[str, str] = {
+    "1-500": "free",         # 500     <= free.catalogue_limit
+    "501-5000": "small",     # 5,000   <= small.catalogue_limit
+    "5001-25000": "medium",  # 25,000  <= medium.catalogue_limit
+    "25000+": "large",       # 100,000 <= large.catalogue_limit
+}
+
+
+def index_plan_for_catalogue_size(value: Optional[str]) -> str:
+    """The INDEX_PLANS rung a stated catalogue size buys.
+
+    Falls back to DEFAULT_INDEX_PLAN when the field was left blank or carries a
+    value the form never offered. Falling back to the SMALLEST rung is
+    deliberate and is the safe direction: a store that under-declares gets a
+    ceiling it hits and a clear upgrade path, where over-granting hands out
+    100,000 items of index on an unverified self-declaration.
+    """
+    return CATALOGUE_SIZE_INDEX_PLAN.get((value or "").strip(), DEFAULT_INDEX_PLAN)
+
+
 # ── Lookups ──────────────────────────────────────────────────────────────────
 
 def is_valid_platform(code: Optional[str]) -> bool:
@@ -555,6 +584,15 @@ def assert_plan_ladders_sane() -> None:
         raise RuntimeError(f"DEFAULT_MODULE_PLAN '{DEFAULT_MODULE_PLAN}' is not a MODULE_PLANS rung.")
     if TRIAL_MODULE_PLAN not in MODULE_PLANS:
         raise RuntimeError(f"TRIAL_MODULE_PLAN '{TRIAL_MODULE_PLAN}' is not a MODULE_PLANS rung.")
+
+    # A range mapping to a rung that does not exist would send every store that
+    # picked it to a KeyError inside signup instead of to a plan.
+    for size_range, code in CATALOGUE_SIZE_INDEX_PLAN.items():
+        if code not in INDEX_PLANS:
+            raise RuntimeError(
+                f"CATALOGUE_SIZE_INDEX_PLAN['{size_range}'] names '{code}', "
+                f"which INDEX_PLANS does not define."
+            )
 
 
 def assert_key_segments_unique() -> None:

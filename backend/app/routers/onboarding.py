@@ -17,16 +17,15 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from backend.app.services import catalog
-from backend.app.services.database import get_db
-from backend.app.services.license_service import (
-    create_client,
-    generate_license_key,
-    get_client_by_email,
+from backend.app.services import (
+    auth_cache,
+    catalog,
+    licensing_service,
+    tenancy_service,
 )
+from backend.app.services.database import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +36,13 @@ templates = Jinja2Templates(directory="backend/app/templates")
 
 class SignupResponse(BaseModel):
     success: bool
+    # None on the repeat path: only the hash is stored, so a key already issued
+    # cannot be shown again. key_prefix is what identifies it instead.
     license_key: Optional[str] = None
+    key_prefix: Optional[str] = None
     client_id: Optional[str] = None
+    site_id: Optional[str] = None
+    subscription_id: Optional[str] = None
     product: Optional[dict] = None
     platform: Optional[dict] = None
     domain: Optional[str] = None
@@ -81,6 +85,22 @@ def extract_domain(url: str) -> str:
             raise ValueError(f"'{host}' isn't a full domain. Use the address shoppers visit, like https://yourstore.com")
 
     return host
+
+
+def _evict(*results: dict) -> None:
+    """Drop the cached authorisation contexts the mutators just invalidated.
+
+    Every function in tenancy_service and licensing_service returns
+    "key_hashes" — the keys whose cached context its write made stale — so one
+    helper covers all of them and a caller never has to know which mutator owes
+    an eviction. Almost always empty on the signup path (a brand-new client,
+    site or subscription holds no licences yet); it is called anyway because
+    the one case where it is NOT empty is a repeat signup that refreshed a
+    site's metadata, and that is exactly the case nobody remembers to handle.
+    """
+    hashes = [h for result in results for h in (result.get("key_hashes") or [])]
+    if hashes:
+        auth_cache.invalidate_many(hashes)
 
 
 def _install_instructions(product: dict, platform: dict, license_key: str, domain: str) -> dict:
@@ -196,61 +216,107 @@ async def signup_client(
         if not catalog.is_valid_module_plan(plan):
             plan = catalog.DEFAULT_MODULE_PLAN
 
-        # Find-or-create. A customer buying their second product is the normal
-        # case now, not an error — the old code raised "email already exists"
-        # here and made multi-product impossible through the UI.
-        existing = get_client_by_email(db, email)
-        if existing:
-            if not existing["is_active"]:
-                return SignupResponse(
-                    success=False,
-                    error="That account is inactive. Get in touch and we'll sort it out.",
-                )
-            client_id = existing["id"]
-        else:
-            client_id = create_client(db, name, email, plan)["id"]
+        # Find-or-create down the whole chain: client, then the store, then the
+        # subscription for this product on that store. A customer buying their
+        # second module is the ordinary case, so every step is idempotent and
+        # none of them overwrite what a previous purchase established.
+        #
+        # Domain is validated here first so a typo fails before any row is
+        # written, but find_or_create_site normalises it again and site["domain"]
+        # is the canonical value — a licence is bound to what it stored, not to
+        # what this function computed.
+        extract_domain(store_url)
 
-        # Already licensed for this product on this store? Hand back the same
-        # key. Note this reads the row rather than trusting the JWT, so a key
-        # deactivated in the database isn't resurrected by a re-submit.
-        prior = db.execute(text("""
-            SELECT license_key
-            FROM license_keys
-            WHERE client_id      = :client_id
-              AND allowed_domain = :domain
-              AND product_code   = :product_code
-              AND is_active      = 1
-            ORDER BY created_at DESC
-            LIMIT 1
-        """), {
-            "client_id": client_id,
-            "domain": domain,
-            "product_code": product_code,
-        }).fetchone()
+        client = tenancy_service.find_or_create_client(db, name, email, company_name)
+        site = tenancy_service.find_or_create_site(
+            db,
+            client_id=client["id"],
+            domain=store_url,
+            platform=resolved_platform,
+            store_name=store_name,
+            platform_version=platform_version,
+            index_plan=catalog.index_plan_for_catalogue_size(estimated_products),
+        )
 
-        if prior:
-            license_key = prior.license_key
+        # create_subscription is find-or-create and deliberately ignores the
+        # plan it is passed, so the plan is applied in a second step below.
+        # Opening it here on its own defaults keeps the (plan, status) pair
+        # coherent: 'starter' with the default status='trial' is a pair the
+        # service layer refuses outright, which is what made every submission
+        # through this form fail.
+        subscription = licensing_service.create_subscription(
+            db,
+            site_id=site["id"],
+            product_code=product_code,
+        )
+
+        # Apply the purchased plan ONLY on a subscription this request opened.
+        # set_subscription_plan is an upsert and re-running onboarding is
+        # ordinary — a merchant reinstalls, or comes back for a second module
+        # and fills the same form again with the pricing page's default radio
+        # checked. Applying it unconditionally would drop a Pro customer to
+        # Starter on their own re-submit, which is the exact downgrade
+        # create_subscription's find-or-create exists to prevent; doing it here
+        # instead would just move the bug one line down.
+        if subscription.get("created") and plan != catalog.TRIAL_MODULE_PLAN:
+            subscription = licensing_service.set_subscription_plan(
+                db,
+                subscription_id=subscription["id"],
+                plan=plan,
+            )
+
+        domain = site["domain"]
+        client_id = client["id"]
+
+        # Already holding a live key for this subscription? There is nothing to
+        # hand back but the prefix — only the SHA-256 hash is stored, so the
+        # plaintext is genuinely unrecoverable. Minting a second key on a
+        # re-submit would leave two valid credentials for one install and make
+        # revocation ambiguous, so the repeat path issues nothing.
+        live = next(
+            (lic for lic in licensing_service.list_licences(db, subscription["id"])
+             if lic["is_active"]),
+            None,
+        )
+
+        if live:
+            license_key = None
+            key_prefix = live["key_prefix"]
             reissued = True
         else:
-            license_key = generate_license_key(
-                db=db,
-                client_id=client_id,
-                allowed_domain=domain,
-                plan=plan,
+            # environment comes off the site, not off the form. It decides
+            # whose inference spend the usage rows are stamped with, and a
+            # merchant must not be able to choose that for themselves.
+            licence = licensing_service.issue_licence(
+                db,
+                subscription_id=subscription["id"],
+                environment=site["environment"],
                 valid_days=365,
-                product_code=product_code,
             )
+            license_key = licence["key"]
+            key_prefix = licence["key_prefix"]
             reissued = False
+            _evict(licence)
+
+        # The mutators all report which cached authorisation contexts they
+        # invalidated; evicting them is the caller's job and one helper covers
+        # every shape.
+        _evict(client, site, subscription)
 
         logger.info(
-            "onboarding issued key client=%s domain=%s product=%s platform=%s plan=%s reissued=%s",
-            client_id, domain, product_code, resolved_platform, plan, reissued,
+            "onboarding issued key client=%s site=%s domain=%s product=%s "
+            "platform=%s plan=%s prefix=%s reissued=%s",
+            client_id, site["id"], domain, product_code, resolved_platform,
+            plan, key_prefix, reissued,
         )
 
         return SignupResponse(
             success=True,
             license_key=license_key,
+            key_prefix=key_prefix,
             client_id=client_id,
+            site_id=site["id"],
+            subscription_id=subscription["id"],
             product={
                 "code": product["code"],
                 "name": product["name"],
@@ -263,8 +329,8 @@ async def signup_client(
                 "accent": platform_meta["accent"],
             },
             domain=domain,
-            plan=catalog.MODULE_PLANS[plan],
-            install=_install_instructions(product, platform_meta, license_key, domain),
+            plan=catalog.MODULE_PLANS[subscription["plan"]],
+            install=_install_instructions(product, platform_meta, license_key or "", domain),
             reissued=reissued,
         )
 
