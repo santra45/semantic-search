@@ -48,9 +48,9 @@ def get_client(api_key: str = None):
 # than by a lookup table on call_type.
 #
 # Derived from task_type and NOT from query_type, deliberately. query_type is
-# free text chosen by the caller: embed_query() defaults it to 'embed_search'
-# but chat_retrieval_service passes 'chat_context', and any future caller can
-# pass anything at all. task_type is set by the two wrappers below and by
+# free text chosen by the caller: embed_query() defaults it to 'embed_search',
+# a since-deleted retrieval path passed 'chat_context', and any future caller
+# can pass anything at all. task_type is set by the two wrappers below and by
 # nothing else — RETRIEVAL_DOCUMENT is reachable only through embed_document(),
 # which is only ever called on an indexing path. Branching on the caller's
 # label instead would mean one novel query_type filing a catalogue sync under

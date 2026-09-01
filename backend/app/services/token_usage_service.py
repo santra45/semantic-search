@@ -90,7 +90,6 @@ raw SQL in five files this module does not own, and every one of them raises
     backend/app/routers/token_usage.py           5 SELECTs (its own raw SQL,
                                                  separate from the two here)
     backend/app/magento/chatbot/routers/usage.py 4 SELECTs
-    backend/app/services/chat_analytics_service.py  3 SELECTs
 
 Both routers are mounted in main.py. The same migration archived `usage_logs`,
 whose three writer functions in license_service.py are called UNGUARDED from ten
@@ -491,9 +490,8 @@ def track_usage(
 ) -> str:
     """RETIRED, exactly like create_usage_record(). Logs the spend, writes nothing.
 
-    The four shared services that call this - embedder, llm_completion_service,
-    llm_rerank_service, chat_response_service - hold no Session and no request
-    context, which is why this convenience function existed. Its replacement is
+    The three shared services that call this - embedder, llm_completion_service,
+    llm_rerank_service - hold no Session and no request context, which is why this convenience function existed. Its replacement is
     usage_service.track(), which has the same "open a short-lived session, close
     it in a finally" shape and gets the tenant from the request context instead
     of from a bare client_id.

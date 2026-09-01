@@ -4,10 +4,8 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.app.middleware.logging_middleware import APILoggingMiddleware
 from backend.app.routers import (
-    chatbot,
     dashboard,
     health,
-    ingest,
     magento,
     onboarding,
     operator,
@@ -44,7 +42,6 @@ templates = Jinja2Templates(directory="backend/app/templates")
 app.mount("/static", StaticFiles(directory="backend/app/static"), name="static")
 
 app.include_router(search.router, prefix="/api")
-app.include_router(ingest.router,   prefix="/api")
 app.include_router(webhooks.router, prefix="/api")
 app.include_router(sync.router,     prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
@@ -52,7 +49,6 @@ app.include_router(webhook_secret.router, prefix="/api")
 app.include_router(health.router,  prefix="/api")
 app.include_router(token_usage.router, prefix="/api")
 app.include_router(magento.router, prefix="/api")
-app.include_router(chatbot.router, prefix="/api")
 app.include_router(onboarding.router)
 # Operator analytics + cost console (Phase 4.4 + 4.5). Serves the HTML at
 # /operator (shell only, no data) and gated JSON at /api/operator/* behind

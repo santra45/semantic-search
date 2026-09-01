@@ -618,24 +618,22 @@ CLIENTS_DROP_COLUMNS: list[tuple[str, str]] = [
 # dropping them. It was wrong, so here is the actual situation.
 #
 # They are absent from init/01-schema.sql and absent from the currently
-# deployed database. That is not evidence that nothing uses them. It is
-# evidence of one thing only: /magento/chatbot/message has never been called
-# against THIS database. conversation_service.ensure_chat_tables() runs
-# CREATE TABLE IF NOT EXISTS for all three at the top of every one of its
-# public functions, and routers/chatbot.py calls start_or_get_conversation()
-# and append_turn() on the live chat route. So the tables come into existence
-# the first time a shopper sends a message, and from that moment every chat
-# turn the AI Chatbot has ever served is a row in them -
-# chat_analytics_service and operator.py already build reporting on top of
-# that. On a deployment where the chat route has been used, these three tables
-# hold the production conversation history and nothing else does.
+# deployed database, and they now have no writer at all: the route that filled
+# them, /magento/chatbot/message, turned out to be called by nothing and was
+# deleted along with conversation_service.ensure_chat_tables(), which was what
+# created them on demand. So on this database they will never appear.
 #
-# Which is why drop_legacy_tables refuses to drop ANY table that has rows,
-# with the row counts printed before the destructive phase runs rather than
-# after. MySQL cannot roll back DDL: there is no undo for getting this wrong
-# once. Dropping them where they ARE empty is still not sufficient on its own -
-# delete conversation_service.py in the same change or the next stray request
-# recreates them.
+# That is emphatically NOT the same as "safe to drop everywhere". Where the
+# chat route WAS used before it was retired, these three tables hold the entire
+# conversation history that deployment ever served, and nothing else holds a
+# copy of it. Deleting the writer froze that history; it did not make it
+# worthless, and operator.py still reports on it through _chat_quality().
+#
+# Which is why drop_legacy_tables refuses to drop ANY table that has rows, with
+# the row counts printed before the destructive phase runs rather than after.
+# MySQL cannot roll back DDL: there is no undo for getting this wrong once.
+# Dropping them where they are genuinely empty is now sufficient on its own -
+# with ensure_chat_tables() gone, no stray request can recreate them.
 #
 # security_logs and client_api_keys are referenced by domain_auth_service and
 # have never existed. _log_security_event swallows its own exception, so every

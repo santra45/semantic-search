@@ -34,9 +34,9 @@ named the product. Never accept a product_code from a request body here.
 
 HOW THAT CONTEXT REACHES A SERVICE THAT WAS NEVER GIVEN ONE
 -----------------------------------------------------------
-Four of the write sites are shared services - embedder, llm_completion_service,
-llm_rerank_service, chat_response_service - and every one of them receives a
-bare client_id and nothing else. client_id alone cannot name a site, a
+Three of the write sites are shared services - embedder, llm_completion_service,
+llm_rerank_service - and every one of them receives a bare client_id and
+nothing else. client_id alone cannot name a site, a
 subscription or a product, so it cannot produce a row this module will accept.
 
 The obvious fix is to thread a ctx parameter down to them. It is the wrong one:
@@ -1062,9 +1062,9 @@ def track(
 ) -> bool:
     """record(), for a call site that holds neither a Session nor a context.
 
-    This is the entry point the four shared services use - embedder,
-    llm_completion_service, llm_rerank_service, chat_response_service. Each of
-    them receives a client_id and nothing else: no Session, no request, no
+    This is the entry point the three shared services use - embedder,
+    llm_completion_service, llm_rerank_service. Each of them receives a
+    client_id and nothing else: no Session, no request, no
     context. They get the tenant from the request scope, and the transaction
     from here.
 

@@ -176,9 +176,12 @@ def _tables_exist(db: Session, *names: str) -> bool:
     answers are different: a swallowed 1146 and a genuine empty result look
     identical downstream, and this console has already shipped one dashboard
     that could not tell them apart. One information_schema lookup per call is
-    cheap and it is NOT cached — chat_conversations et al. are created lazily by
-    conversation_service.ensure_chat_tables() the first time a shopper sends a
-    message, so "absent" is a fact with a short shelf life.
+    cheap, and it stays uncached even though the answer can no longer change
+    under us: the only writer, conversation_service.ensure_chat_tables(), was
+    deleted along with the dead /magento/chatbot/message route, so no request
+    creates these tables any more. Absent now means permanently absent, and
+    present means a deployment that served chat before the route was retired
+    and still holds that history.
 
     Returns False on a lookup failure, which folds "I could not find out" into
     "not available" — the caller's contract is only that True means it is safe to

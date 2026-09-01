@@ -11,9 +11,9 @@ usage writers import.
 
 WHY THIS EXISTS
 ---------------
-Four of the eight places that write a usage row are shared services - embedder,
-llm_completion_service, llm_rerank_service, chat_response_service - and every
-one of them receives a bare client_id and nothing else. usage_service.record()
+Three of the seven places that write a usage row are shared services - embedder,
+llm_completion_service, llm_rerank_service - and every one of them receives a
+bare client_id and nothing else. usage_service.record()
 needs six identifiers off the resolved licence (client_id, site_id,
 subscription_id, product_code, platform, key_owner) plus the interaction_id
 that threads one turn together. embed_query() and embed_document() alone have

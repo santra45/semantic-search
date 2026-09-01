@@ -303,32 +303,3 @@ def cancel_sync(
         "message": "Sync cancellation request received"
     }
 
-
-@router.get("/sync/status")
-def sync_status(
-    request: Request,
-    authorization: Optional[str] = Header(None),
-    license_key: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
-):
-    token = extract_license_key_from_authorization(authorization) or license_key
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    try:
-        license_data = validate_license_key(token, db)
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-
-    # CRITICAL: Enforce secure domain authorization
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data)
-    
-    count = get_client_product_count(license_data["client_id"], license_data["domain"])
-
-    return {
-        "client_id":     license_data["client_id"],
-        "indexed_count": count,
-        "plan":          license_data["plan"],
-        "product_limit": license_data["product_limit"]
-    }
