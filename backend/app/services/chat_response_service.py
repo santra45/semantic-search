@@ -17,7 +17,7 @@ from backend.app.services.llm_rerank_service import (
     log_gemini_response,
     make_http_client,
 )
-from backend.app.services.token_usage_service import track_usage
+from backend.app.services import usage_service
 
 logger = logging.getLogger(__name__)
 
@@ -112,21 +112,46 @@ def _track_answer_usage(
     input_cost = usage["input"] * MODEL_PRICING.get(model, {}).get("input", 0)
     output_cost = usage["output"] * MODEL_PRICING.get(model, {}).get("output", 0)
 
+    # NOT billable, even though it writes 'chat_answer' — which IS the billable
+    # call_type for the Magento chatbot at
+    # backend/app/magento/chatbot/routers/retrieve.py.
+    #
+    # This is the second writer of that call_type, from a completely different
+    # endpoint: POST /magento/chatbot/message, reached only through
+    # generate_grounded_answer(). No shipped client calls it — a grep across
+    # every Magento module and both WooCommerce plugins finds no reference — and
+    # the handler behind it authenticates inline instead of going through
+    # authorize_request, so it has no chokepoint, no quota check and no
+    # resolved product. Flagging it billable would mean a revived or probed
+    # legacy endpoint minting billable rows against a subscription that no gate
+    # ever checked, and two billable rows for one product if it were ever wired
+    # alongside /retrieve/answer. Exactly one row per customer-visible action
+    # is the rule the quota is built on, and this is not the row.
+    #
+    # Because that endpoint has no chokepoint, nothing binds a request context
+    # here either, so this write logs NO CONTEXT and is refused. That is the
+    # correct outcome and the reason to leave the call in place rather than
+    # delete it: the WARNING is the only thing that will tell anyone the dead
+    # endpoint came back to life. Wire it behind a chokepoint or delete the
+    # endpoint; leaving an unwired writer of a billable call_type in the tree is
+    # the shape of the bug this rewrite exists to kill.
     try:
-        track_usage(
-            client_id=client_id,
-            query_type="chat_answer",
-            llm_provider=provider,
-            llm_model=model,
-            input_tokens=usage["input"],
-            output_tokens=usage["output"],
-            input_cost=input_cost,
-            output_cost=output_cost,
-            request_text_length=len(prompt),
-            response_text_length=len(response_text),
+        usage_service.track(
+            "chat_answer",
+            provider,
+            model,
+            usage["input"],
+            usage["output"],
+            input_cost,
+            output_cost,
+            usage_service.KIND_SERVE,
         )
     except Exception as exc:
-        logger.warning("Failed to track chat answer usage: %s", exc)
+        logger.warning(
+            "usage not recorded for chat_answer (client=%s %s/%s tokens in=%s "
+            "out=%s): %s",
+            client_id, provider, model, usage["input"], usage["output"], exc,
+        )
 
     return {
         "input_tokens": usage["input"],

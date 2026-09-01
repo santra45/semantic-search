@@ -37,7 +37,7 @@ from backend.app.services.qdrant_service import (
     search_content as qdrant_search_content,
     search_products as qdrant_search_products,
 )
-from backend.app.services.token_usage_service import TokenUsageTracker
+from backend.app.services import request_context, usage_service
 from backend.app.utils.llm_logger import log_llm_call, log_llm_interaction
 
 from backend.app.magento.chatbot.routers.common import (
@@ -1193,21 +1193,53 @@ def retrieve_answer(
             cost=float(cost),
             extra={"sources": len(req.sources or []), "active_retrieval_iterations": iterations},
         )
+    # THE ONE BILLABLE ROW FOR A NON-STREAMED MAGENTO TURN.
+    #
+    # This endpoint is the terminal step: the module has already called
+    # /agent/tool-call, /retrieve/products and /retrieve/content, and every one
+    # of those spent tokens. This is the row the shopper's question resolves to
+    # and the only one that fires exactly once per turn, so it is the one the
+    # monthly quota counts. The rest of the turn shares its interaction_id —
+    # minted once by the chokepoint and carried on license_data — and
+    # contributes cost without counting as a request.
+    #
+    # It is also the terminal row for BOTH magento_chatbot and
+    # magento_product_qa: the two modules call this same endpoint, and nothing
+    # on the wire tells them apart. They are separated by the product_code on
+    # the resolved licence, which is why record() takes the product off the ctx
+    # and never off the request.
+    #
+    # WORTH KNOWING WHEN A MERCHANT'S USAGE LOOKS TOO LOW: /retrieve/answer is
+    # admin-toggled Magento-side. A merchant who turns the RAG summary off
+    # serves turns that produce retrieval and rerank rows and no billable row at
+    # all — a metered product in an unmetered configuration.
+    #
+    # The bare `except Exception: pass` this replaces is why nobody noticed the
+    # v1 writer had been failing since the migration. Accounting still must not
+    # break the answer — the LLM call is paid for by here — but the swallow now
+    # names the tenant and the amounts so the spend survives in the log.
     try:
-        TokenUsageTracker(db).create_usage_record(
-            client_id=client_id,
-            query_type="chat_answer",
-            llm_provider=req.llm_provider or "google",
-            llm_model=req.llm_model or "gemini-2.5-flash-lite",
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            input_cost=float(input_cost),
-            output_cost=float(output_cost),
-            request_text_length=len(prompt),
-            response_text_length=len(final_answer),
+        usage_service.record(
+            db,
+            license_data,
+            "chat_answer",
+            req.llm_provider or "google",
+            req.llm_model or "gemini-2.5-flash-lite",
+            input_tokens,
+            output_tokens,
+            float(input_cost),
+            float(output_cost),
+            usage_service.KIND_SERVE,
+            billable=True,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "retrieve/answer usage not recorded for client %s (%s/%s tokens "
+            "in=%s out=%s): %s",
+            client_id, req.llm_provider or "google",
+            req.llm_model or "gemini-2.5-flash-lite",
+            input_tokens, output_tokens, exc,
+        )
 
     cards = _cards_from(found_products)
     # One line per answer, so "why were there no product cards?" is a log
@@ -1272,8 +1304,10 @@ def retrieve_answer_stream(
         chunk just means "wait for more bytes".
 
     Behaviour parity with /retrieve/answer: same auth, same prompt, same
-    cost computation, same TokenUsageTracker write at the end. The only
-    difference is the response shape.
+    cost computation, same billable usage_events row at the end. The only
+    difference is the response shape — and that the row has to carry its
+    tenant context explicitly, because the generator runs after this function
+    returns. See the pinned_stream() comment at the return statement.
     """
     license_data = authorize_request(
         request=request, db=db,
@@ -1503,21 +1537,55 @@ def retrieve_answer_stream(
         except Exception:
             pass
 
+        # THE ONE BILLABLE ROW FOR A STREAMED MAGENTO TURN — and the one write
+        # site in the system that must pass its context explicitly.
+        #
+        # This generator body runs AFTER the handler returned. starlette pulls
+        # it through iterate_in_threadpool, one anyio.to_thread.run_sync per
+        # item, and each of those dispatches takes a fresh copy_context() from
+        # the event-loop task — a task that never saw the chokepoint's binding,
+        # because the handler ran in its own copy and discarded it. Measured in
+        # the container: the bound context reads None in the first chunk, the
+        # second and this one. So license_data is captured from the enclosing
+        # handler's frame by closure and handed to record() directly; an
+        # explicit ctx always wins over the ambient one, precisely so this site
+        # works.
+        #
+        # Setting the ContextVar at the top of this generator is the fix that
+        # LOOKS right and is worse than none: the frame survives across yields
+        # but the Context does not, so it holds for chunk 1 and reads None from
+        # chunk 2 onwards. Anyone verifying by eyeballing the first token ships
+        # it, and this write — the LAST thing the generator does — silently
+        # loses the billable row for the whole turn. The streaming response is
+        # wrapped in request_context.pinned_stream() at the return statement
+        # below for the same reason, which is what keeps the embedding calls the
+        # active-retrieval tool loop makes inside this generator attributable.
+        #
+        # billable=True here and at /retrieve/answer is safe: the module calls
+        # one endpoint or the other per turn, never both.
+        #
+        # The bare `except Exception: pass` this replaces is why nobody noticed
+        # the v1 writer had been failing since the migration.
         try:
-            TokenUsageTracker(db).create_usage_record(
-                client_id=client_id,
-                query_type="chat_answer",
-                llm_provider=provider_name,
-                llm_model=model_name,
-                input_tokens=in_tokens,
-                output_tokens=out_tokens,
-                input_cost=float(input_cost),
-                output_cost=float(output_cost),
-                request_text_length=len(prompt),
-                response_text_length=len(answer_text),
+            usage_service.record(
+                db,
+                license_data,
+                "chat_answer",
+                provider_name,
+                model_name,
+                in_tokens,
+                out_tokens,
+                float(input_cost),
+                float(output_cost),
+                usage_service.KIND_SERVE,
+                billable=True,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "retrieve/answer/stream usage not recorded for client %s "
+                "(%s/%s tokens in=%s out=%s): %s",
+                client_id, provider_name, model_name, in_tokens, out_tokens, exc,
+            )
 
         yield json.dumps({
             "event":  "done",
@@ -1531,7 +1599,24 @@ def retrieve_answer_stream(
             },
         }) + "\n"
 
-    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+    # PINNED, not bare. Everything inside event_stream() runs after this
+    # function has returned, in a fresh copy of the event loop's context, so the
+    # tenant identity the chokepoint bound is provably absent there — measured
+    # in the container as None in the first chunk, the second and the terminal
+    # one. The chat_answer write at the end of the generator handles that by
+    # passing its ctx explicitly, but the active-retrieval tool loop also runs
+    # in here, and every embed_query() it fires writes usage through the shared
+    # embedder, which has no ctx to pass and can only read the ambient one.
+    # Without this wrapper those rows are refused as NO CONTEXT and a streamed
+    # turn is billed for its answer and nothing else.
+    #
+    # Pinned LAST, on purpose: copy_context() snapshots the variables as they
+    # stand right now, so anything bound after this call would be invisible
+    # inside the stream.
+    return StreamingResponse(
+        request_context.pinned_stream(event_stream(), license_data),
+        media_type="application/x-ndjson",
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

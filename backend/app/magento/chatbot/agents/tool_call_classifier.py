@@ -20,8 +20,8 @@ What stays unchanged:
     * Streaming pipeline (this runs before agent dispatch, never streamed)
     * Chip-driven structured actions (Chat.php's dispatchIntent path
       bypasses classification altogether)
-    * Cost-tracking contract (we write to `token_usage_tracking` with
-      `query_type='chat_tool_call'` so the admin dashboard sees the
+    * Cost-tracking contract (we write to `usage_events` with
+      `call_type='chat_tool_call'` so the admin dashboard sees the
       cost separately from the legacy `chat_intent`)
 """
 
@@ -36,7 +36,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 from backend.app.magento.chatbot.agents.llm_factory import build_llm
 from backend.app.magento.chatbot.agents.tools import ALL_TOOLS, TOOL_BY_NAME
-from backend.app.services.token_usage_service import track_usage
+from backend.app.services import usage_service
 from backend.app.utils.llm_logger import log_llm_interaction
 
 # Reuse the rerank-service pricing table — it's the canonical per-model
@@ -367,23 +367,41 @@ def select_tool(
             logger.debug("[tool_call] usage extraction failed: %s", exc)
 
     # Persist for the admin dashboard cost view + per-tenant analytics.
-    # Skipped silently on any DB hiccup (same posture as every other
-    # track_usage call site — never DOS a request on a metrics write).
+    #
+    # The tenant comes from the request context rather than from `client_id`.
+    # select_tool() is handed a bare client_id, which cannot name the site,
+    # subscription and product a usage_events row requires; its only caller is
+    # the sync /agent/tool-call handler, which runs authorize_request in its own
+    # body, so the context the chokepoint bound is live in this very call frame.
+    #
+    # kind is 'serve' and billable is False. This is the FIRST step of a turn,
+    # not the turn: the shopper's question then costs a retrieval embed, often a
+    # rerank, and finally the answer — which carries the single billable row.
+    # Flagging the router too would burn two of a merchant's monthly requests
+    # per question and make the advertised plan limit a lie. All of those rows
+    # share one interaction_id, minted by the chokepoint, so the true cost of
+    # this turn is still one indexed lookup away.
+    #
+    # Swallowed but never silent: the LLM call is already paid for by here, so
+    # a metrics write must not DOS the request, and the line carries the tenant,
+    # the model and the amounts so the spend survives in the log.
     try:
-        track_usage(
-            client_id=client_id,
-            query_type="chat_tool_call",
-            llm_provider=provider,
-            llm_model=model,
-            input_tokens=usage["input"],
-            output_tokens=usage["output"],
-            input_cost=usage["input"] * MODEL_PRICING.get(model, {}).get("input", 0.0),
-            output_cost=usage["output"] * MODEL_PRICING.get(model, {}).get("output", 0.0),
-            request_text_length=len(query),
-            response_text_length=0,
+        usage_service.track(
+            "chat_tool_call",
+            provider,
+            model,
+            usage["input"],
+            usage["output"],
+            usage["input"] * MODEL_PRICING.get(model, {}).get("input", 0.0),
+            usage["output"] * MODEL_PRICING.get(model, {}).get("output", 0.0),
+            usage_service.KIND_SERVE,
         )
     except Exception as exc:
-        logger.warning("[tool_call] usage tracking failed: %s", exc)
+        logger.warning(
+            "[tool_call] usage not recorded (client=%s %s/%s tokens in=%s "
+            "out=%s): %s",
+            client_id, provider, model, usage["input"], usage["output"], exc,
+        )
 
     # Single readable log line per call — pairs with the existing
     # `[rerank]` / chat-answer log lines so ops can grep one file to

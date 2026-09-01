@@ -3,8 +3,8 @@ import tiktoken
 from google import genai
 
 from backend.app.config import EMBED_MODEL
+from backend.app.services import usage_service
 from backend.app.services.cache_service import get_cached_embedding, set_cached_embedding
-from backend.app.services.token_usage_service import track_usage
 from backend.app.utils.llm_logger import log_llm_interaction
 
 logger = logging.getLogger("embed_logger")
@@ -39,6 +39,28 @@ def estimate_embed_cost(model: str, token_count: int) -> float:
 
 def get_client(api_key: str = None):
     return genai.Client(api_key=api_key)
+
+
+# ── Indexing spend vs serving spend ─────────────────────────────────────────
+#
+# usage_events.kind separates the two, and this is the only write site in the
+# system where both are possible, so the decision has to be made here rather
+# than by a lookup table on call_type.
+#
+# Derived from task_type and NOT from query_type, deliberately. query_type is
+# free text chosen by the caller: embed_query() defaults it to 'embed_search'
+# but chat_retrieval_service passes 'chat_context', and any future caller can
+# pass anything at all. task_type is set by the two wrappers below and by
+# nothing else — RETRIEVAL_DOCUMENT is reachable only through embed_document(),
+# which is only ever called on an indexing path. Branching on the caller's
+# label instead would mean one novel query_type filing a catalogue sync under
+# shopper traffic, which is exactly the mixing `kind` exists to prevent and
+# which no test would catch.
+_SYNC_TASK_TYPE = "RETRIEVAL_DOCUMENT"
+
+
+def _kind_for(task_type: str) -> str:
+    return usage_service.KIND_SYNC if task_type == _SYNC_TASK_TYPE else usage_service.KIND_SERVE
 
 
 # ── Embed ───────────────────────────────────────────────────────────────────
@@ -80,21 +102,44 @@ def _embed(
         extra={"task_type": task_type, "dims": dims},
     )
 
+    # The tenant comes from the request context, not from `client_id`.
+    #
+    # This function receives a bare client_id and nothing else, and a client_id
+    # cannot name a site, a subscription or a product — so it cannot produce a
+    # usage_events row at all. The alternative was threading a ctx argument down
+    # to embed_query()/embed_document(), which have 25 call sites between them;
+    # the sites that diff missed would go on writing unattributable rows with
+    # nothing to make them visible. usage_service.track() reads what the auth
+    # chokepoint bound for this request and opens its own short-lived session,
+    # so this call site keeps the signature it has always had.
+    #
+    # billable stays False on every embedding. Exactly one row per
+    # customer-visible action carries it — chat_answer for the Magento chatbot,
+    # wp_product_qa for the Woo widget — and a single turn embeds the query
+    # once for /retrieve/products and again for /retrieve/content, plus once
+    # more per active-retrieval tool call. Flagging them would bill a merchant
+    # three or four requests for one shopper question.
+    #
+    # Swallowed but never silent: an accounting failure must not be the reason
+    # an embedding call fails, since the vector is already paid for by here.
+    # The line carries the tenant, the model and the amount so the spend is
+    # recoverable from the log even when the row is not.
     try:
-        track_usage(
-            client_id=client_id,
-            query_type=query_type,
-            llm_provider="google",
-            llm_model=model,
-            input_tokens=token_count,
-            output_tokens=0,
-            input_cost=cost,
-            output_cost=0.0,
-            request_text_length=len(text),
-            response_text_length=0,
+        usage_service.track(
+            query_type,
+            "google",
+            model,
+            token_count,
+            0,
+            cost,
+            0.0,
+            _kind_for(task_type),
         )
     except Exception as e:
-        logger.warning(f"Failed to track token usage: {e}")
+        logger.warning(
+            "usage not recorded for %s (client=%s model=%s tokens=%d cost=%s): %s",
+            query_type, client_id, model, token_count, cost, e,
+        )
 
     return result.embeddings[0].values
 

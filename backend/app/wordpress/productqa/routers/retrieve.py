@@ -35,7 +35,7 @@ from backend.app.services.qdrant_service import (
     retrieve_content_by_entity_ids,
     search_content as qdrant_search_content,
 )
-from backend.app.services.token_usage_service import TokenUsageTracker
+from backend.app.services import usage_service
 from backend.app.utils.llm_logger import log_llm_call
 from backend.app.utils.stage_timer import StageTimer
 
@@ -335,28 +335,47 @@ def retrieve_answer(
             extra={"sources": len(req.sources or [])},
         )
 
+    # THE ONE BILLABLE ROW FOR woo_product_qa.
+    #
+    # This endpoint is the terminal step of a Q&A: the widget calls
+    # /retrieve/product and /retrieve/content first, and each of those spends an
+    # embedding, but this is the row the shopper actually asked for and the only
+    # one that fires exactly once per question. billable=True is what the
+    # monthly quota counts, so a second one anywhere in the same turn would
+    # halve every merchant's advertised allowance. The other rows of the turn
+    # share this row's interaction_id — minted once by the chokepoint and
+    # carried on license_data — and contribute their cost without counting as
+    # requests.
+    #
+    # license_data is passed explicitly even though record() would find the same
+    # dict in the request context: this handler is holding it, and an explicit
+    # ctx is one less thing that can be true only by accident.
+    #
     # Usage accounting must never be the reason an answer fails to reach the
     # shopper — the LLM call is already paid for by this point. Swallowed, but
     # not silently: a bare `except: pass` here is what hid `wp_product_qa`
     # being rejected as an unregistered query_type, and every answer went
-    # unrecorded for as long as nobody thought to check.
+    # unrecorded for as long as nobody thought to check. usage_events has no
+    # allowlist for exactly that reason, but the swallow still logs.
     try:
-        TokenUsageTracker(db).create_usage_record(
-            client_id=client_id,
-            query_type="wp_product_qa",
-            llm_provider=provider_name,
-            llm_model=model_name,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            input_cost=float(input_cost),
-            output_cost=float(output_cost),
-            request_text_length=len(prompt),
-            response_text_length=len(answer),
+        usage_service.record(
+            db,
+            license_data,
+            "wp_product_qa",
+            provider_name,
+            model_name,
+            input_tokens,
+            output_tokens,
+            float(input_cost),
+            float(output_cost),
+            usage_service.KIND_SERVE,
+            billable=True,
         )
     except Exception as exc:
         logger.warning(
-            "wp retrieve/answer usage not recorded for client %s (%s/%s): %s",
-            client_id, provider_name, model_name, exc,
+            "wp retrieve/answer usage not recorded for client %s (%s/%s "
+            "tokens in=%s out=%s): %s",
+            client_id, provider_name, model_name, input_tokens, output_tokens, exc,
         )
 
     return {

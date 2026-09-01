@@ -32,6 +32,31 @@ Magento modules call the identical endpoints, so the route cannot tell them
 apart; the licence resolved to exactly one subscription, and that subscription
 named the product. Never accept a product_code from a request body here.
 
+HOW THAT CONTEXT REACHES A SERVICE THAT WAS NEVER GIVEN ONE
+-----------------------------------------------------------
+Four of the write sites are shared services - embedder, llm_completion_service,
+llm_rerank_service, chat_response_service - and every one of them receives a
+bare client_id and nothing else. client_id alone cannot name a site, a
+subscription or a product, so it cannot produce a row this module will accept.
+
+The obvious fix is to thread a ctx parameter down to them. It is the wrong one:
+embed_query and embed_document have twenty-five call sites between them, that
+diff is beyond anyone's ability to review honestly, and every site it missed
+would go on writing rows that are unattributable in a way no test would catch.
+
+So record() reads the context implicitly when it is not passed one, from
+backend/app/services/request_context, which holds what the auth chokepoint
+resolved for the request currently being served. A shared service needs no new
+parameter and no new call sites; it needs to call this module instead of the v1
+one.
+
+Implicit is not a synonym for optional. An EXPLICIT ctx always wins, and there
+is one place that has to use it: a StreamingResponse generator runs after its
+handler has returned, in a fresh copy of the event loop's context, so the
+request-scoped value is provably absent there. That write site captures the ctx
+in its closure and passes it. Everywhere else the ambient value is the ctx, and
+a missing one is refused rather than guessed at - see NO CONTEXT below.
+
 ACCOUNTING MUST NEVER BE THE REASON AN ANSWER FAILS
 ---------------------------------------------------
 By the time record() is called the LLM call is already paid for and the shopper
@@ -47,9 +72,9 @@ the cost is recoverable from the log file even when the row is not.
 TELLING A CODE BUG FROM AN OUTAGE, IN THE LOG
 ---------------------------------------------
 Swallowing is right. Swallowing everything into one undifferentiated WARNING is
-not, because the two ways record() loses a row need opposite responses and the
-log line is the only place anyone will ever see either of them. So each carries
-a marker, and nothing else in this module emits either:
+not, because the three ways record() loses a row need three different responses
+and the log line is the only place anyone will ever see any of them. So each
+carries a marker, and nothing else in this module emits any of them:
 
   usage: CALLER BUG   The arguments are wrong - a ctx that is not the one
                       resolve_key() returned, or an empty call_type. NOT
@@ -57,10 +82,26 @@ a marker, and nothing else in this module emits either:
                       until somebody edits the code, and no amount of waiting or
                       retrying changes it. Logged at ERROR. One grep answers
                       "is this gap in the ledger a bad deploy or a bad network".
+  usage: NO CONTEXT   Nobody could say WHO the spend belongs to: no ctx was
+                      passed and the request scope was empty. Not a defect at
+                      the call site and not an outage - during the dual-read
+                      window it is the ordinary, correct state of a request that
+                      authenticated on a v1 JWT, because a v1 key resolves to no
+                      subscription. Logged at WARNING, with the amounts.
   usage: DATABASE     The statement failed - MySQL blinked, the connection
                       dropped, a deadlock, a disk full. Self-healing, and only
                       interesting by volume or by persistence. Logged at
                       WARNING, with the amounts, so the spend is recoverable.
+
+CALLER BUG and NO CONTEXT look alike from a distance and must not be merged:
+one means somebody reshaped a dict and every row from that site is lost until a
+human edits code, the other means this particular request had no v2 identity to
+copy. Merging them buries a release worth rolling back inside the migration's
+own background noise. NO CONTEXT is WARNING and not ERROR for the same reason -
+every key in the database is still a v1 key, so it fires on legitimate traffic
+until licences are issued, and an ERROR per embedding call would train everyone
+to filter the marker out before it ever carried signal. Its volume is the
+migration's progress bar: when it stops, the cutover is finished.
 
 The distinction used to be invisible: a renamed context field and a dropped
 connection produced the same shape of line, and the first is a release to roll
@@ -79,6 +120,14 @@ record() COMMITS the session it is handed. It has to: an accounting row that is
 never committed is a lost billing row, which is the entire class of bug this
 rewrite exists to kill. Call it once the request's own writes are final, not in
 the middle of a multi-statement unit of work you are not ready to commit.
+
+That rule is why track() exists next to it. A shared service holds no Session,
+and the tempting fix - reach for the router's - is the one that breaks: a
+catalogue push calls the embedder once per chunk, so record() would commit the
+sync router's transaction twenty-five thousand times, each commit taking
+whatever the router had half-written along with it. track() opens a short-lived
+session of its own and closes it, which is exactly the shape v1's track_usage()
+already had and the reason it was safe to call from anywhere.
 
 That is the same rule tenancy_service and licensing_service state in their own
 docstrings - a service commits its own writes and the caller does not own the
@@ -116,6 +165,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from backend.app.services import catalog
+# The session factory track() opens its own connection from. database.py imports
+# nothing from this package, so there is no cycle, and create_engine() does not
+# connect - importing this module still costs no round trip.
+from backend.app.services.database import SessionLocal
 # The authoritative key set of a resolved context, imported rather than
 # restated. See _TENANT_FIELDS below for what that buys and what it cost not to
 # have it. No cycle: licensing_service imports catalog and license_key and
@@ -125,6 +178,46 @@ from backend.app.services import catalog
 from backend.app.services.licensing_service import CONTEXT_FIELDS
 
 logger = logging.getLogger(__name__)
+
+
+# ── The request-scoped context ───────────────────────────────────────────────
+#
+# Holds the identity the auth chokepoint resolved for the request being served.
+# record() reads it whenever a caller passes no ctx - see the module docstring
+# for why the four shared services cannot pass one.
+#
+# The import is GUARDED, and that is a considered exception to this module's own
+# fail-at-boot rule rather than an oversight. _context_subset() below refuses to
+# import on a field RENAME, because that is a drift inside a module that exists
+# and a five-minute fix. This is a different failure: request_context.py is new,
+# and it is entirely possible for a deploy - or an rsync to the bind-mounted
+# mirror, which copies file by file - to land usage_service.py a moment before
+# it. A hard import there takes the entire API down, on a race nobody controls,
+# to protect a feature that degrades perfectly well without it: explicit-ctx
+# callers keep working, and implicit ones refuse their row and say so.
+#
+# So the absence is LOUD but not fatal - one ERROR here naming the module, and
+# one NO CONTEXT warning per write that needed it. Nothing is silent and nothing
+# is misattributed. Once request_context.py has shipped everywhere, make this a
+# plain import: by then a missing module really is a broken deploy and refusing
+# to boot is the correct response.
+#
+# Only get_context is imported. This module has no business setting or resetting
+# a scope it does not own, and importing the setter would invite exactly that.
+_CONTEXT_IMPORT_ERROR: Optional[str] = None
+try:
+    from backend.app.services.request_context import get_context as _get_request_context
+except (ImportError, AttributeError) as _import_exc:
+    _get_request_context = None
+    _CONTEXT_IMPORT_ERROR = f"{type(_import_exc).__name__}: {_import_exc}"
+    logger.error(
+        "usage: NO CONTEXT - backend/app/services/request_context.get_context "
+        "could not be imported (%s). Every write site that relies on the "
+        "implicit request context - the shared services that receive only a "
+        "client_id - will refuse its row and log NO CONTEXT until this "
+        "resolves. Callers passing ctx= explicitly are unaffected.",
+        _CONTEXT_IMPORT_ERROR,
+    )
 
 
 # ── Vocabulary ───────────────────────────────────────────────────────────────
@@ -454,6 +547,53 @@ def _money(value, field: str, where: str) -> Decimal:
     return amount.quantize(_COST_PLACES, rounding=ROUND_HALF_UP)
 
 
+def _implicit_ctx() -> Optional[dict]:
+    """The context resolved for the request being served, or None.
+
+    NEVER RAISES, and that is the whole contract. By the time anything here runs
+    the model call has been made and paid for and a shopper is waiting on the
+    answer; a bug in the context module turning into a 500 would make this
+    module the reason a request failed, which is the one thing the docstring
+    above forbids outright. An unreadable scope is treated as an absent one -
+    the row is refused, loudly, and the answer still goes out.
+
+    NEVER LOG THE RETURNED DICT WHOLE, and check that again before adding a
+    `%r` or a `%s` on it to any line in this module. request_context.get_context
+    hands back the chokepoint's own license_data, which carries the presented
+    licence key in PLAIN TEXT under "license_key" - and that key is the
+    key-encryption key every merchant-supplied LLM and embedding key is
+    encrypted under, so one interpolation of it here would write credentials
+    for every tenant into the log file this module is otherwise designed to
+    make people read. Everything below logs field NAMES, the six tenant
+    identifiers, and amounts. Nothing logs a value off the context it did not
+    name explicitly.
+    """
+    if _get_request_context is None:
+        return None
+    try:
+        return _get_request_context()
+    except Exception as exc:
+        logger.warning(
+            "usage: NO CONTEXT - reading the request-scoped context raised "
+            "(%s: %s). Treating it as absent; the row will be refused.",
+            type(exc).__name__, exc,
+        )
+        return None
+
+
+def _is_tenant_shaped(ctx) -> bool:
+    """True when *ctx* carries every identifier a usage row needs.
+
+    The one question worth asking before deciding a context is usable. A dict is
+    not evidence of identity: during the dual-read window a v1 JWT resolves to a
+    populated license_data with no site, subscription or product anywhere in it,
+    and that is a legitimate request rather than a broken one.
+    """
+    if not isinstance(ctx, dict):
+        return False
+    return all(ctx.get(field) for field in _TENANT_FIELDS)
+
+
 def _tenant_fields(ctx: dict) -> dict:
     """The six identifiers stamped onto every row, or ValueError naming the gaps.
 
@@ -545,6 +685,15 @@ def record(
     correctly years later when the site has been renamed and the subscription
     cancelled.
 
+    PASS None FOR *ctx* to use the context of the request being served. That is
+    how a shared service holding nothing but a client_id writes an attributable
+    row without growing a parameter and twenty-five call sites of plumbing. An
+    explicit ctx always wins over the ambient one; pass it explicitly from any
+    code that runs after its handler returned - a StreamingResponse generator -
+    because the request scope is provably empty there. When neither channel
+    produces a context the row is refused and logged as NO CONTEXT, never
+    written with null or invented tenant columns.
+
     *kind* has no default and is not derivable from *call_type*: an embedding
     call is 'sync' during a catalogue push and 'serve' when it embeds a
     shopper's question, and the same call_type covers both. Getting it wrong
@@ -556,8 +705,10 @@ def record(
     contribute their cost, but must not each count as a request; a chatbot turn
     would otherwise burn five requests of a merchant's allowance for one answer.
 
-    *interaction_id* is threaded by the caller. Mint it with new_interaction_id()
-    at the top of the turn. See that function for why None is left as NULL.
+    *interaction_id* defaults to the one on *ctx*, which the chokepoint minted
+    for the turn - so a write site normally passes nothing at all. Pass it only
+    to override that. See new_interaction_id() for why a missing one is left as
+    NULL rather than invented here.
 
     Returns True if the ledger row landed. THIS IS FOR TESTS AND LOGGING ONLY.
     Never turn a False into a customer-facing error, and never retry on it - the
@@ -571,6 +722,77 @@ def record(
         f"call_type={_brief(call_type)} provider={_brief(provider)} "
         f"model={_brief(model)}"
     )
+
+    # ── Which channel supplied the identity ──────────────────────────────────
+    #
+    # An explicit ctx always wins over the ambient one. That ordering is not a
+    # style preference, it is the only thing that makes the streaming answer
+    # path attributable: its generator body runs after the handler returned, in
+    # a fresh copy of the event loop's context, so the request-scoped value is
+    # provably empty there and that write site has to capture the ctx in its
+    # closure and pass it. Preferring the ambient value would overwrite a
+    # correctly captured context with nothing, on the busiest endpoint, and the
+    # only visible symptom would be billing rows that stopped appearing.
+    #
+    # Falsy rather than `is None`, deliberately. The request scope hands out a
+    # mutable box that is EMPTIED at the end of the request rather than
+    # replaced, precisely so every copy of the context expires at once. An
+    # expired or never-filled scope therefore reads as {}, not as None. Testing
+    # identity here would accept that empty dict as a real context and hand it
+    # to _tenant_fields(), turning a missing identity into a CALLER BUG at
+    # ERROR - the wrong diagnosis, at the wrong severity, naming an innocent
+    # call site.
+    ctx_source = "arg"
+    if not _is_tenant_shaped(ctx):
+        ctx = _implicit_ctx()
+        ctx_source = "scope"
+    if not _is_tenant_shaped(ctx):
+        # Shape, not truthiness. Defence in depth behind the chokepoint's own
+        # v2-only bind: a v1 JWT license_data is a truthy dict carrying none of
+        # the six tenant identifiers, and testing `if not ctx` let it through to
+        # _tenant_fields(), which raised and reported the loss as CALLER BUG at
+        # ERROR - blaming a call site whose arguments were fine for a request
+        # that simply had no v2 identity to copy. Reducing it to None here means
+        # the NO CONTEXT branch below sees it, which is the honest diagnosis.
+        ctx = None
+
+    where = f"{where} ctx={ctx_source}"
+
+    if not ctx:
+        # NO CONTEXT gets its own marker because neither of the other two would
+        # send whoever greps it anywhere useful. This is not a defect at this
+        # call site - the arguments are fine - and it is not an outage. The
+        # REQUEST carried no v2 identity, so there is nothing to copy onto the
+        # row, and refusing it is the only honest outcome: usage_events has six
+        # NOT NULL tenant columns and no defensible default for any of them, and
+        # a row that cannot say who spent the money is not a cheaper billing row
+        # but permanent noise in every aggregate that follows.
+        #
+        # The three things that cause it, in the order worth checking:
+        #   1. The request authenticated on the v1 JWT path. A v1 key resolves
+        #      to no subscription, so there is no v2 context to set. Expected,
+        #      and today it is every request - see the module docstring on why
+        #      this is a WARNING and not an ERROR.
+        #   2. The write happens outside the request scope - a StreamingResponse
+        #      generator, or anything else running after the handler returned.
+        #      Pass ctx= explicitly there. The ambient value cannot reach that
+        #      code and no amount of setting it harder will change that.
+        #   3. The endpoint has no chokepoint, so nothing set a context at all.
+        #
+        # The amounts go in the line so the spend stays recoverable from the log
+        # even though the row is refused - the same rule every swallow here
+        # follows.
+        logger.warning(
+            "usage: NO CONTEXT - refusing an unattributable row (%s). No ctx "
+            "argument and nothing in the request scope%s. Expected while a "
+            "tenant is still on a v1 key; otherwise this write site is outside "
+            "the request scope and must pass ctx= explicitly, or its endpoint "
+            "has no chokepoint. tokens in=%s out=%s cost in=%s out=%s",
+            where,
+            f" ({_CONTEXT_IMPORT_ERROR})" if _CONTEXT_IMPORT_ERROR else "",
+            input_tokens, output_tokens, input_cost, output_cost,
+        )
+        return False
 
     # Everything up to the first db.execute() is pure. A ctx that cannot name a
     # tenant fails here, before any statement has touched the caller's
@@ -607,6 +829,26 @@ def record(
         f"subscription={fields['subscription_id']} product={fields['product_code']} "
         f"{where}"
     )
+
+    # interaction_id rides in on the context, so no write site has to thread it.
+    # The chokepoint mints one per turn and puts it in the resolved context;
+    # every row of that turn then shares it at zero plumbing cost, which is what
+    # makes "show me everything the shopper's third question cost" one indexed
+    # lookup, and what makes the exactly-one-billable-row-per-interaction rule
+    # auditable at all.
+    #
+    # An explicit argument still wins, because a caller that genuinely knows
+    # better - stitching several requests into one unit of work - has to be able
+    # to say so, and because the streaming write site passes an explicit ctx and
+    # must be free to pass an explicit id with it.
+    #
+    # This is still NOT minting. new_interaction_id() explains why record()
+    # refuses to invent one: a NULL means a write site ran with no interaction
+    # to belong to, and that is a finding worth keeping. Reading a value the
+    # chokepoint already put on the context is not inventing one - if it did not
+    # put one there, this stays NULL and the finding survives intact.
+    if interaction_id is None:
+        interaction_id = ctx.get("interaction_id")
 
     if fields["key_owner"] not in KEY_OWNERS:
         # Written anyway. key_owner decides whether total_cost is the merchant's
@@ -791,7 +1033,97 @@ def record(
             )
         return False
 
+    # DEBUG, and it earns its place during the migration specifically: `ctx=arg`
+    # versus `ctx=scope` in this line is the only direct evidence that the
+    # request-scoped context actually reached a shared service. The alternative
+    # way to find out is to read usage_events afterwards and infer it, which
+    # cannot distinguish "the scope worked" from "the caller passed a ctx".
+    logger.debug(
+        "usage: recorded %s tokens=%d cost=%s billable=%d interaction=%s (%s)",
+        params["call_type"], total_tokens, total_cost, billable_flag,
+        params["interaction_id"], where,
+    )
     return event_written
+
+
+def track(
+    call_type: str,
+    provider: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    input_cost,
+    output_cost,
+    kind: str,
+    *,
+    ctx: Optional[dict] = None,
+    billable: bool = False,
+    interaction_id: Optional[str] = None,
+) -> bool:
+    """record(), for a call site that holds neither a Session nor a context.
+
+    This is the entry point the four shared services use - embedder,
+    llm_completion_service, llm_rerank_service, chat_response_service. Each of
+    them receives a client_id and nothing else: no Session, no request, no
+    context. They get the tenant from the request scope, and the transaction
+    from here.
+
+    IT OPENS ITS OWN SESSION, and that is the point rather than a convenience.
+    record() commits what it is handed, so the tempting alternative - reaching
+    for the router's session - is the one that breaks: a catalogue push calls
+    the embedder once per chunk, so a shared session would commit the sync
+    router's transaction once per embedded chunk, twenty-five thousand times on
+    a real catalogue, each commit taking whatever the router had half-written
+    with it. A short-lived session cannot do that to anybody. It is also exactly
+    the shape v1's track_usage() had - open, write, close in a finally - which
+    is why that function was safe to call from anywhere, and keeping the shape
+    keeps the diff at those four sites to the name being called.
+
+    It is one connection checkout per write, from a pool built with SQLAlchemy's
+    defaults (five plus ten overflow, database.py sets no size). That is the
+    honest cost of not threading a Session through twenty-five call sites, and
+    it is the same cost v1 paid; it is worth knowing about on the sync path,
+    where the write rate is highest.
+
+    *ctx* is keyword-only and normally omitted - the request scope supplies it.
+    Pass it from code running outside that scope, which in this tree means a
+    StreamingResponse generator and the callers reached from one. Everything
+    else behaves exactly as record() documents, including returning False rather
+    than raising: never turn this value into a customer-facing error.
+    """
+    try:
+        db = SessionLocal()
+    except Exception as exc:
+        # Pool exhausted, or the database is unreachable. DATABASE rather than
+        # CALLER BUG - nothing about the arguments is wrong - and the amounts go
+        # in the line so the spend is still recoverable from the log.
+        logger.warning(
+            "usage: DATABASE - could not open a session to record %s spend "
+            "(provider=%s model=%s): %s. tokens in=%s out=%s cost in=%s out=%s",
+            _brief(call_type), _brief(provider), _brief(model), exc,
+            input_tokens, output_tokens, input_cost, output_cost,
+        )
+        return False
+
+    try:
+        return record(
+            db, ctx, call_type, provider, model,
+            input_tokens, output_tokens, input_cost, output_cost,
+            kind, billable=billable, interaction_id=interaction_id,
+        )
+    finally:
+        try:
+            db.close()
+        except Exception:
+            # Returning the connection to the pool is best effort. Letting this
+            # propagate would convert a bookkeeping detail into the 500 that
+            # every swallow in record() exists to prevent - and it would do it
+            # from a finally, so it would replace record()'s return value on the
+            # way out and lose the outcome as well.
+            logger.warning(
+                "usage: DATABASE - closing the session opened for %s failed",
+                _brief(call_type),
+            )
 
 
 # ── The read paths ───────────────────────────────────────────────────────────
