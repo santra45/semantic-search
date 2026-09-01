@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import Optional
 
-from backend.app.services.license_service import validate_license_key, extract_license_key_from_authorization
+from backend.app.services.license_service import extract_license_key_from_authorization
+from backend.app.services import catalog, request_auth
 from backend.app.services.llm_key_service import decrypt_key
 from backend.app.services.database import get_db
 import time
@@ -63,9 +64,16 @@ class TestConnectionResponse(BaseModel):
     llm_configured: bool = False
     llm_working: bool = False
 
+# EVERY product: this is the diagnostic every module calls to prove its key and
+# URL are right, and all five would call it. Refusing one product here would
+# make the tool that tells a merchant what is wrong be the thing that is wrong.
+_ALL_PRODUCTS = frozenset(catalog.PRODUCTS)
+
+
 @router.post("/test-connection")
 async def test_connection(
     req: TestConnectionRequest,
+    request: Request,
     authorization: Optional[str] = Header(None),
     x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
     db: Session = Depends(get_db)
@@ -83,8 +91,19 @@ async def test_connection(
 
         llm_api_key_encrypted = x_llm_api_key_encrypted or req.llm_api_key_encrypted
 
-        # Validate license key (this doesn't count towards usage)
-        license_data = validate_license_key(license_key, db)
+        # Validate license key (this doesn't count towards usage).
+        # Through the shared chokepoint so a v2 key is actually resolved here —
+        # a merchant testing a new opaque key needs this endpoint to be the
+        # thing that says "your key works", not the one endpoint that still
+        # only understands the old format.
+        license_data = request_auth.authorize_request(
+            request=request,
+            db=db,
+            authorization=authorization,
+            x_api_key=None,
+            request_license=req.license_key,
+            allowed_products=_ALL_PRODUCTS,
+        )
         
         # Test LLM API key decryption and functionality if provided
         llm_configured = False
@@ -129,6 +148,20 @@ async def test_connection(
             llm_working=llm_working
         )
         
+    except HTTPException as e:
+        # A refusal from the chokepoint — 401 missing key, 403 bad key or wrong
+        # domain, 429 over quota. Reported as a 200 with success=false, exactly
+        # as a ValueError from the old validate_license_key was, because the
+        # plugin's Test Connection button renders `message` and a bare HTTP
+        # error would replace a diagnosis with a status code.
+        return TestConnectionResponse(
+            success=False,
+            message=f"License validation failed: {e.detail}",
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            llm_configured=False,
+            llm_working=False
+        )
+
     except ValueError as e:
         # License validation failed
         return TestConnectionResponse(

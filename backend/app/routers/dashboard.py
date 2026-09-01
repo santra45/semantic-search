@@ -1,8 +1,8 @@
-from fastapi import APIRouter, HTTPException, Depends, Header, Query
+from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from backend.app.services.database import get_db
-from backend.app.services.license_service import validate_license_key, extract_license_key_from_authorization
+from backend.app.services import request_auth
 from backend.app.services.qdrant_service import get_client_product_count
 from datetime import datetime
 from typing import Optional
@@ -10,24 +10,37 @@ from typing import Optional
 router = APIRouter()
 
 
-def get_client(license_key: str, db: Session) -> dict:
-    """Shared helper — validate license and return client data."""
-    try:
-        return validate_license_key(license_key, db)
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+# Derived from the plugins, not invented: `semantic-search-woo` and
+# Czargroup/AISearch are the only things that build /api/dashboard/stats,
+# /api/analytics/* and /api/status. Neither Q&A module reports through here —
+# their admin screens read /api/token-usage/me/*, which has its own gate.
+#
+# A module that starts calling these endpoints 403s until it is added, which is
+# the loud direction of failure and the one this gate exists to produce.
+_REPORTING_PRODUCTS = frozenset({"woo_search", "magento_search"})
 
 
-def get_license_key(
+def get_client(
+    request: Request,
+    db: Session,
     authorization: Optional[str],
-    license_key: Optional[str]
-) -> str:
-    header_token = extract_license_key_from_authorization(authorization)
-    if header_token:
-        return header_token
+    license_key: Optional[str],
+) -> dict:
+    """Authenticate a reporting caller and return their license_data.
 
-    if license_key:
-        return license_key
+    Was a bare validate_license_key plus a separate header-or-query helper,
+    which resolved no v2 key, applied no domain gate and bound no tenant
+    context. request_auth does all three and resolves header-then-query itself,
+    so the second helper had nothing left to do.
+    """
+    return request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=authorization,
+        x_api_key=None,
+        request_license=license_key,
+        allowed_products=_REPORTING_PRODUCTS,
+    )
 
     raise HTTPException(status_code=401, detail="Missing Authorization header")
 
@@ -36,6 +49,7 @@ def get_license_key(
 
 @router.get("/dashboard/stats")
 def dashboard_stats(
+    request: Request,
     authorization: Optional[str] = Header(None),
     license_key: Optional[str] = Query(None),
     db: Session = Depends(get_db)
@@ -43,7 +57,7 @@ def dashboard_stats(
     """
     Returns everything the dashboard overview needs in one call.
     """
-    client = get_client(get_license_key(authorization, license_key), db)
+    client = get_client(request, db, authorization, license_key)
 
     client_id = client["client_id"]
     domain    = client["domain"]
@@ -118,6 +132,7 @@ def dashboard_stats(
 
 @router.get("/analytics/top-queries")
 def top_queries(
+    request: Request,
     authorization: Optional[str] = Header(None),
     license_key: Optional[str] = Query(None),
     days: int = 7,
@@ -125,7 +140,7 @@ def top_queries(
     db: Session = Depends(get_db)
 ):
     """Most searched queries in the last N days."""
-    client    = get_client(get_license_key(authorization, license_key), db)
+    client    = get_client(request, db, authorization, license_key)
 
     client_id = client["client_id"]
 
@@ -157,6 +172,7 @@ def top_queries(
 
 @router.get("/analytics/zero-results")
 def zero_results(
+    request: Request,
     authorization: Optional[str] = Header(None),
     license_key: Optional[str] = Query(None),
     days: int = 7,
@@ -164,7 +180,7 @@ def zero_results(
     db: Session = Depends(get_db)
 ):
     """Queries that returned zero results — shows gaps in catalog."""
-    client    = get_client(get_license_key(authorization, license_key), db)
+    client    = get_client(request, db, authorization, license_key)
 
     client_id = client["client_id"]
 
@@ -190,13 +206,14 @@ def zero_results(
 
 @router.get("/analytics/summary")
 def analytics_summary(
+    request: Request,
     authorization: Optional[str] = Header(None),
     license_key: Optional[str] = Query(None),
     days: int = 7,
     db: Session = Depends(get_db)
 ):
     """Cache hit rate, avg response time, daily volume for charts."""
-    client    = get_client(get_license_key(authorization, license_key), db)
+    client    = get_client(request, db, authorization, license_key)
 
     client_id = client["client_id"]
 
@@ -253,12 +270,13 @@ def analytics_summary(
 
 @router.get("/status")
 def status_check(
+    request: Request,
     authorization: Optional[str] = Header(None),
     license_key: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
     """Full status check — used by the Status tab in the plugin."""
-    client    = get_client(get_license_key(authorization, license_key), db)
+    client    = get_client(request, db, authorization, license_key)
 
     client_id = client["client_id"]
     domain    = client["domain"]

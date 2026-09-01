@@ -5,9 +5,9 @@ from sqlalchemy.orm import Session
 
 from backend.app.services.cache_service import get_cached_embedding, get_cached_results, set_cached_embedding, set_cached_results, invalidate_client_results
 from backend.app.services.database import get_db
-from backend.app.services.domain_auth_service import DomainAuthorizer
 from backend.app.services.embedder import embed_query, embed_document
-from backend.app.services.license_service import validate_license_key, check_search_quota, increment_search_count, log_search, increment_ingest_count, extract_license_key_from_authorization
+from backend.app.services.license_service import increment_search_count, log_search, increment_ingest_count, extract_license_key_from_authorization
+from backend.app.services import catalog, request_auth
 from backend.app.services.llm_key_service import decrypt_key
 from backend.app.services.embedding_key_service import (
     resolve_embedding_key,
@@ -25,6 +25,28 @@ from backend.app.magento.chatbot.services.product_formatter import format_produc
 import json
 import logging
 import time
+
+# ── Which product may call which endpoint ────────────────────────────────────
+#
+# Derived from the modules, not invented: only Czargroup/AISearch builds
+# POST /api/magento/search. The Magento chatbot chokepoint says the same thing
+# from the other side — its _ANSWERING_PRODUCTS set deliberately omits
+# magento_search because "its read path is POST /api/magento/search ... which
+# authenticates inline and never reaches this chokepoint at all". It does now.
+_SEARCH_PRODUCTS = frozenset({"magento_search"})
+
+# The quota endpoint gets the WHOLE platform, matching the reasoning the
+# chatbot chokepoint applies to its own /agent/sync/* family: every Magento
+# module writes into the one Qdrant collection its store shares, and
+# AISearch/Helper/IndexOwnership.php hands that family to whichever module wins
+# the ownership contest. A quota reading of that shared collection is a sync
+# question, so granting only the two modules whose ApiClient happens to build
+# this URL today would 403 a store the moment ownership moved. Over-granting
+# inside the family costs nothing that matters: the reply is a count of a
+# collection all three already share.
+_SYNC_QUOTA_PRODUCTS = frozenset(
+    product["code"] for product in catalog.products_for_platform("magento")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -382,19 +404,29 @@ async def magento_search(
     if not headers["license_key"]:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-    try:
-        license_data = validate_license_key(headers["license_key"], db)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+    # One chokepoint: dual-read v2/v1, domain gate, product gate, quota, and
+    # the tenant context every usage write site reads. Replaces an inline
+    # validate_license_key + DomainAuthorizer + check_search_quota sequence
+    # that resolved no v2 key and bound no context, so a v2 licence presented
+    # here produced usage rows nothing could attribute.
+    #
+    # The quota check changes hands with it. check_search_quota() reads
+    # usage_logs_archive_v1, a table the v2 migration froze — so it has been
+    # measuring a count that can no longer grow, which enforces nothing and
+    # would permanently lock out any tenant whose archived count already
+    # exceeded their limit. request_auth meters usage_counters per
+    # subscription instead, behind AICHATBOT_QUOTA_ENFORCEMENT.
+    license_data = request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=None,          # resolve_headers already folded it in
+        x_api_key=headers["api_key"],
+        request_license=headers["license_key"],
+        allowed_products=_SEARCH_PRODUCTS,
+    )
 
     client_id = license_data["client_id"]
     domain = license_data["domain"]
-
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data, api_key=headers["api_key"])
-
-    if not check_search_quota(db, client_id, license_data["search_limit"]):
-        raise HTTPException(status_code=429, detail="Monthly search limit reached. Please upgrade your plan.")
 
     # Structured filters (attribute_filters / category_id / price / sort / stock)
     # arrive pre-extracted from the Magento-side vocab matchers and are applied
@@ -696,16 +728,17 @@ def magento_sync_quota(
     if not headers["license_key"]:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-    try:
-        license_data = validate_license_key(headers["license_key"], db)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+    license_data = request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=None,          # resolve_headers already folded it in
+        x_api_key=headers["api_key"],
+        request_license=headers["license_key"],
+        allowed_products=_SYNC_QUOTA_PRODUCTS,
+    )
 
     client_id = license_data["client_id"]
     domain = license_data["domain"]
-
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data, api_key=headers["api_key"])
 
     current_count = get_client_product_count(client_id, domain)
     product_limit = license_data["product_limit"]

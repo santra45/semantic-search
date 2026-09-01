@@ -7,11 +7,11 @@ from collections import defaultdict
 from backend.app.services.embedder import embed_document
 from backend.app.services.sparse_embedder import embed_sparse_document
 from backend.app.services.qdrant_service import upsert_content_item, upsert_page, upsert_post, get_client_product_count
-from backend.app.services.license_service import validate_license_key, increment_ingest_count, extract_license_key_from_authorization
+from backend.app.services.license_service import increment_ingest_count
+from backend.app.services import request_auth
 from backend.app.services.database import get_db
 from backend.app.services.cache_service import invalidate_client_results
 from backend.app.services.product_service import build_page_text, extract_page_payload, build_post_text, extract_post_payload
-from backend.app.services.domain_auth_service import DomainAuthorizer
 from backend.app.services.llm_key_service import decrypt_key
 from backend.app.services.embedding_key_service import (
     resolve_embedding_key,
@@ -32,6 +32,12 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Derived from the plugins, not invented: `semantic-search-woo` is the only
+# thing that builds /api/sync/batch and /api/sync/cancel. The WooCommerce Q&A
+# plugin syncs through /api/wordpress/productqa/sync/*, a different package
+# with its own gate, and neither Magento module reaches here at all.
+_SYNC_PRODUCTS = frozenset({"woo_search"})
 
 
 class SyncProduct(BaseModel):
@@ -125,10 +131,19 @@ class SyncBatchResponse(BaseModel):
 
 @router.post("/sync/batch", response_model=SyncBatchResponse)
 def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(get_db)):
-    try:
-        license_data = validate_license_key(req.license_key, db)
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+    # Auth, domain gate, product gate and tenant context in one call. The
+    # DomainAuthorizer that used to run twenty lines below now runs inside it —
+    # and runs BEFORE the embedding key is resolved rather than after, so a
+    # request that fails the domain check no longer decrypts a merchant key on
+    # its way to being refused.
+    license_data = request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=None,          # this endpoint takes the key in the body
+        x_api_key=None,
+        request_license=req.license_key,
+        allowed_products=_SYNC_PRODUCTS,
+    )
 
     client_id   = license_data["client_id"]
     domain      = license_data["domain"]
@@ -141,11 +156,7 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
         license_key,
     )
     embedding_model = resolve_embedding_model(req.embedding_model, req.embedding_provider)
-    
-    # CRITICAL: Enforce secure domain authorization
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data)
-    
+
     # CRITICAL: Check total indexed count + incoming count against plan limit
     current_count = get_client_product_count(client_id, domain)
     incoming_count = len(req.products) + len(req.pages) + len(req.posts)
@@ -277,19 +288,18 @@ def cancel_sync(
     license_key: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
-    token = extract_license_key_from_authorization(authorization) or license_key
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    # No pre-check for a missing key: authorize_request resolves header-then-
+    # body itself and raises the same 401, so doing it here as well would be
+    # two places to keep in agreement about what counts as "no key".
+    license_data = request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=authorization,
+        x_api_key=None,
+        request_license=license_key,
+        allowed_products=_SYNC_PRODUCTS,
+    )
 
-    try:
-        license_data = validate_license_key(token, db)
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-
-    # CRITICAL: Enforce secure domain authorization
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data)
-    
     # In a real implementation, you might want to:
     # 1. Set a flag in database/cache to indicate cancellation
     # 2. Signal any running batch processes to stop

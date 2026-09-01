@@ -14,11 +14,17 @@ from backend.app.services.embedding_key_service import (
     resolve_embedding_model,
 )
 import time
-from backend.app.services.license_service import (validate_license_key, increment_search_count, check_search_quota, log_search)
+from backend.app.services.license_service import (increment_search_count, log_search)
+from backend.app.services import request_auth
 from backend.app.services.database import get_db
-from urllib.parse import urlparse
 
 router = APIRouter()
+
+# Derived from the plugins, not invented: `semantic-search-woo` is the only
+# thing that builds POST /api/search. Its Magento counterpart is a separate
+# route (/api/magento/search, guarded by magento.py's own _SEARCH_PRODUCTS),
+# which is why this set names one product rather than both search modules.
+_SEARCH_PRODUCTS = frozenset({"woo_search"})
 
 
 class SearchRequest(BaseModel):
@@ -44,35 +50,31 @@ async def search(req: SearchRequest, request: Request, db: Session = Depends(get
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-    # Step 1 — validate license key
-    try:
-        license_data = validate_license_key(req.license_key, db)
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+    # Step 1 — authenticate, authorise, and bind the tenant context.
+    #
+    # This one call replaces three things that used to sit inline here: a
+    # validate_license_key that resolved no v2 key, a hand-rolled Origin check,
+    # and a check_search_quota reading usage_logs_archive_v1 — a table the v2
+    # migration froze, so it metered a count that can no longer grow.
+    #
+    # The hand-rolled domain check is not merely duplicated by DomainAuthorizer,
+    # it was weaker than it: it compared the Origin hostname against the licensed
+    # domain alone, where _get_all_valid_domains() also accepts the www/apex
+    # counterpart and the configured subdomains. Every caller is server-to-server
+    # PHP with no Origin header, so both versions pass the same traffic today;
+    # the difference only shows up the day a browser calls this endpoint.
+    license_data = request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=None,          # this endpoint takes the key in the body
+        x_api_key=None,
+        request_license=req.license_key,
+        allowed_products=_SEARCH_PRODUCTS,
+    )
 
     client_id = license_data["client_id"]
     domain = license_data["domain"]
     license_key = req.license_key
-
-    # CRITICAL: Enforce domain authorization
-    origin = request.headers.get("origin") or request.headers.get("referer")
-    allowed_domain = license_data.get("domain")
-
-    if allowed_domain and origin:
-        hostname = urlparse(origin).hostname
-
-        if allowed_domain and hostname not in [allowed_domain, "127.0.0.1"]:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Domain not authorized. License valid for: {allowed_domain}",
-            )
-    print(f"domain validation took: {time.time() - start_time}")
-    # Step 2 — check monthly quota
-    if not check_search_quota(db, client_id, license_data["search_limit"]):
-        raise HTTPException(
-            status_code=429,
-            detail="Monthly search limit reached. Please upgrade your plan.",
-        )
 
     query = req.query.strip().lower()
     print(f"Search quota took: {time.time() - start_time}")

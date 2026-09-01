@@ -44,7 +44,7 @@ TWO THINGS IN THIS FILE THAT ARE STILL WRONG AND WERE NOT FIXED HERE
    and it does not belong inside a fix for a renamed table. It does need doing.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Optional, List
@@ -52,7 +52,7 @@ from datetime import datetime, timedelta
 
 from backend.app.services.database import get_db
 from backend.app.services.token_usage_service import TokenUsageTracker
-from backend.app.services.license_service import validate_license_key, extract_license_key_from_authorization
+from backend.app.services import catalog, request_auth
 from backend.app.services.usage_ledger_read import LEDGER, provenance
 # Reused, not reimplemented: operator.py's gate is locked by default - with no
 # AICHATBOT_OPERATOR_KEY configured it 403s rather than falling open, which is
@@ -61,24 +61,50 @@ from backend.app.routers.operator import require_operator
 
 router = APIRouter(prefix="/token-usage", tags=["token-usage"])
 
-def _get_client_from_auth(authorization: Optional[str], db: Session) -> dict:
-    token = extract_license_key_from_authorization(authorization)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    try:
-        return validate_license_key(token, db)
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+# EVERY product, and that is the correct answer rather than a shortcut. These
+# four endpoints report a tenant's own spend, scoped by the subscription the
+# presented key resolves to — so the product gate has nothing to protect here:
+# a key can only ever read itself, and refusing one product's key would 403 a
+# paying merchant looking at their own usage panel. All four modules that have
+# a usage screen call these (AIProductQA, AISearch, and both Woo plugins), and
+# AIChatbot reads /api/magento/chatbot/usage/stats instead.
+#
+# Stated as the whole catalogue rather than as None: None means "no mapping"
+# and fails closed, which is right for a route nobody has classified and wrong
+# for one deliberately open to every product.
+_ALL_PRODUCTS = frozenset(catalog.PRODUCTS)
+
+
+def _get_client_from_auth(
+    request: Request,
+    db: Session,
+    authorization: Optional[str],
+) -> dict:
+    """Authenticate a tenant reading their own usage.
+
+    Was a bare validate_license_key, which resolved no v2 key and bound no
+    tenant context — so a v2 licence presented here reported against the v1
+    contract only.
+    """
+    return request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=authorization,
+        x_api_key=None,
+        request_license=None,        # header only; these are GETs with no body
+        allowed_products=_ALL_PRODUCTS,
+    )
 
 
 @router.get("/me/stats")
 def get_my_usage_stats(
+    request: Request,
     authorization: Optional[str] = Header(None),
     start_date: Optional[datetime] = Query(None, description="Start date for filtering"),
     end_date: Optional[datetime] = Query(None, description="End date for filtering"),
     db: Session = Depends(get_db),
 ):
-    client = _get_client_from_auth(authorization, db)
+    client = _get_client_from_auth(request, db, authorization)
     tracker = TokenUsageTracker(db)
     try:
         stats = tracker.get_client_usage_stats(
@@ -93,12 +119,13 @@ def get_my_usage_stats(
 
 @router.get("/me/summary")
 def get_my_usage_summary(
+    request: Request,
     authorization: Optional[str] = Header(None),
     start_date: Optional[datetime] = Query(None, description="Start date for filtering"),
     end_date: Optional[datetime] = Query(None, description="End date for filtering"),
     db: Session = Depends(get_db),
 ):
-    client = _get_client_from_auth(authorization, db)
+    client = _get_client_from_auth(request, db, authorization)
     tracker = TokenUsageTracker(db)
     stats = tracker.get_client_usage_stats(
         client_id=client["client_id"],
@@ -125,12 +152,13 @@ def get_my_usage_summary(
 
 @router.get("/me/models")
 def get_my_model_usage(
+    request: Request,
     authorization: Optional[str] = Header(None),
     start_date: Optional[datetime] = Query(None, description="Start date for filtering"),
     end_date: Optional[datetime] = Query(None, description="End date for filtering"),
     db: Session = Depends(get_db),
 ):
-    client = _get_client_from_auth(authorization, db)
+    client = _get_client_from_auth(request, db, authorization)
     try:
         where_clause = "WHERE client_id = :client_id"
         params = {"client_id": client["client_id"]}
@@ -194,11 +222,12 @@ def get_my_model_usage(
 
 @router.get("/me/hourly")
 def get_my_hourly_usage(
+    request: Request,
     authorization: Optional[str] = Header(None),
     hours_back: int = Query(24, description="Number of hours to look back"),
     db: Session = Depends(get_db),
 ):
-    client = _get_client_from_auth(authorization, db)
+    client = _get_client_from_auth(request, db, authorization)
     start_date = datetime.utcnow() - timedelta(hours=hours_back)
 
     where_clause = "WHERE created_at >= :start_date AND client_id = :client_id"
