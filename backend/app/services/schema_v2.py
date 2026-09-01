@@ -170,7 +170,7 @@ CREATE TABLE `sites` (
   `catalogue_limit`  INT UNSIGNED NOT NULL
                      COMMENT 'Ceiling in logical entities. Comes from this row index_plan, NEVER from a subscription.',
   `indexed_items`    INT UNSIGNED NOT NULL DEFAULT 0
-                     COMMENT 'Logical entities in the collection. Maintained at the Qdrant boundary; needs periodic reconcile.',
+                     COMMENT 'Logical entities of every content type. Written by the 11 sync/webhook paths; reseed with scripts/backfill_indexed_items.py.',
   `webhook_secret`   VARCHAR(255) COLLATE utf8mb4_general_ci DEFAULT NULL
                      COMMENT 'HMAC secret for this store WooCommerce webhooks. Moved off clients: webhooks are per store.',
   `is_active`        TINYINT(1) NOT NULL DEFAULT 1,

@@ -36,12 +36,12 @@ from backend.app.services.embedding_key_service import (
     resolve_embedding_model,
 )
 from backend.app.services.license_service import increment_ingest_count
+from backend.app.services import tenancy_service
 from backend.app.services.qdrant_service import (
     CHUNKABLE_CONTENT_TYPES,
     delete_by_content_type,
     delete_content_item,
     get_client_content_counts,
-    get_client_product_count,
     upsert_chunked_content_item,
     upsert_content_item,
 )
@@ -189,19 +189,34 @@ def sync_batch(
         request_license=req.license_key,
     )
 
-    # Quota is counted against products only. FAQ entries, pages and posts are
-    # free: the plan limit is `get_client_product_count`, and folding a store's
-    # own help content into that total would stop a merchant sitting near their
-    # limit from indexing the delivery page that answers half their questions.
-    incoming_products = sum(1 for item in req.items if item.content_type == "product")
-    if incoming_products:
-        current = get_client_product_count(license_data["client_id"], license_data["domain"])
-        if current + incoming_products > license_data["product_limit"]:
+    # THE "PAGES AND POSTS ARE FREE" RULE IS GONE. It read well — a merchant
+    # near their limit should still be able to index the delivery page that
+    # answers half their questions — but it was never what the plans said they
+    # were selling, and it made the ceiling unenforceable: content that costs
+    # the same to embed and store as a product consumed none of the allowance,
+    # so a store could hold any amount of it. catalogue_limit is a ceiling in
+    # logical entities and now counts them all. Nobody was refused for the
+    # change; backfill_indexed_items.py grandfathered every store the wider
+    # count put over onto a rung that fits.
+    # Baseline for the catalogue counter, over only the types this batch
+    # touches, taken before anything is written. See apply_index_delta().
+    _touched_types = {item.content_type for item in req.items}
+    _index_baseline = tenancy_service.index_baseline(license_data, _touched_types)
+
+    # Every entity this batch carries counts, not products alone — see the
+    # matching note in the Magento sync router.
+    if req.items:
+        _ok, _current, _limit = tenancy_service.check_catalogue_headroom(
+            db, license_data, len(req.items)
+        )
+        if not _ok:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Product limit exceeded. Current: {current}, "
-                    f"Incoming: {incoming_products}, Limit: {license_data['product_limit']}"
+                    f"Catalogue limit reached. This store holds {_current:,} of "
+                    f"{_limit:,} indexed items and this batch adds "
+                    f"{len(req.items):,}. Remove content you no longer need, or "
+                    f"move to a larger plan."
                 ),
             )
 
@@ -319,6 +334,8 @@ def sync_batch(
         except Exception:
             pass
 
+    tenancy_service.apply_index_delta(db, license_data, _touched_types, _index_baseline)
+
     if success_by_type.get("product"):
         increment_ingest_count(db, license_data["client_id"], count=success_by_type["product"])
 
@@ -435,6 +452,9 @@ def sync_delete(
         request_license=req.license_key,
     )
 
+    _touched_types = {item.content_type for item in req.items}
+    _index_baseline = tenancy_service.index_baseline(license_data, _touched_types)
+
     deleted = 0
     for item in req.items:
         if item.content_type not in SUPPORTED_TYPES:
@@ -452,6 +472,8 @@ def sync_delete(
             logger.warning(
                 "wp delete failed for %s/%s: %s", item.content_type, item.entity_id, exc
             )
+
+    tenancy_service.apply_index_delta(db, license_data, _touched_types, _index_baseline)
 
     try:
         invalidate_client_results(license_data["client_id"])
@@ -491,11 +513,14 @@ def sync_status(
         sorted(SUPPORTED_TYPES),
     )
 
-    # Counts the WHOLE tenant's products, not just this plugin's — the plan
-    # limit applies to the collection, and a merchant syncing from two places
-    # needs to see the total they're actually consuming.
-    product_count = get_client_product_count(license_data["client_id"], license_data["domain"])
-    product_limit = int(license_data.get("product_limit") or 0)
+    # Counts the WHOLE tenant's indexed entities, not just this plugin's and no
+    # longer just products — the plan limit applies to the collection, and a
+    # merchant syncing from two places needs to see the total they are actually
+    # consuming. Same source as the ceiling, so the panel cannot disagree with
+    # the refusal a sync just got.
+    _, product_count, product_limit = tenancy_service.check_catalogue_headroom(
+        db, license_data, 0
+    )
 
     return {
         "counts": counts,
@@ -544,6 +569,7 @@ def sync_purge_content_type(
         }
 
     try:
+        _index_baseline = tenancy_service.index_baseline(license_data, {content_type})
         deleted = delete_by_content_type(
             client_id=license_data["client_id"],
             domain=license_data["domain"],
@@ -553,6 +579,8 @@ def sync_purge_content_type(
     except Exception as exc:
         logger.exception("[wp sync/purge] failed for %s: %s", content_type, exc)
         return {"success": False, "deleted_count": 0, "message": f"Purge failed: {exc}"}
+
+    tenancy_service.apply_index_delta(db, license_data, {content_type}, _index_baseline)
 
     try:
         invalidate_client_results(license_data["client_id"])

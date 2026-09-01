@@ -104,7 +104,7 @@ from backend.app.services.embedding_key_service import (
     resolve_embedding_model,
 )
 from backend.app.wordpress.services.product_formatter import LEGACY_MANAGED_BY, MANAGED_BY
-from backend.app.services import request_context, usage_service
+from backend.app.services import request_context, tenancy_service, usage_service
 # _context_from_row is private and imported anyway. That is deliberate and it is
 # the lesser of the two evils available: it is the function that DEFINES the
 # resolved-context shape — licensing_service.CONTEXT_FIELDS is built by running
@@ -571,15 +571,22 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session, lice
         # semantic-search-woo deliberately stands down for a non-published
         # product on the stated grounds that "removal is the product-updated
         # webhook's job". It was not doing that job. The same two-argument call
-        # is still live at routers/ingest.py and routers/magento.py, which are
-        # somebody else's files.
+        # The same two-argument call was live at routers/ingest.py and
+        # routers/magento.py; ingest.py has since been deleted as dead code and
+        # magento.py's copy is somebody else's file.
+        # Asked BEFORE the delete: delete_product() reports nothing about
+        # whether it removed anything, and an unpublish webhook for a product
+        # that was never indexed is ordinary. Decrementing on that would walk
+        # the counter down every time one arrived.
+        _was_indexed = product_exists(client_id, license_data["domain"], product_id)
         delete_product(client_id, license_data["domain"], product_id)
         invalidate_client_results(client_id)
+        if _was_indexed:
+            tenancy_service.adjust_indexed_items_for(
+                db, {"client_id": client_id, "domain": license_data["domain"]}, -1
+            )
         print(f"🗑️  Webhook [{action}]: removed product {product_id}")
         return {"status": "removed", "product_id": product_id}
-
-    # CRITICAL: Check product limit before indexing
-    current_count = get_client_product_count(client_id, license_data["domain"])
 
     exists = product_exists(client_id, license_data["domain"], product_id)
 
@@ -590,12 +597,22 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session, lice
         print(f"⏭️  Webhook [{action}]: {product_id} holds the full payload — not overwriting")
         return {"status": "skipped", "reason": "full_payload_present", "product_id": product_id}
 
-    # Only block NEW products
-    if not exists and current_count >= license_data["product_limit"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Product limit exceeded. Current: {current_count}, Limit: {license_data['product_limit']}"
+    # Only block NEW products — an update to something already indexed adds
+    # nothing to the count and must never be refused for capacity.
+    if not exists:
+        _ok, _current, _limit = tenancy_service.check_catalogue_headroom(
+            db, {"client_id": client_id, "domain": license_data["domain"],
+                 "catalogue_limit": license_data.get("product_limit")}, 1
         )
+        if not _ok:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Catalogue limit reached. This store holds {_current:,} of "
+                    f"{_limit:,} indexed items. Remove content you no longer "
+                    f"need, or move to a larger plan."
+                ),
+            )
     # For updates, check if we're adding a new product or updating existing
     # If product doesn't exist in vector store, count it as new
     # if current_count >= license_data["product_limit"]:
@@ -675,6 +692,12 @@ def process_upsert(product: dict, action: str, client_id: str, db: Session, lice
         invalidate_client_results(client_id)
         if not exists:
             increment_ingest_count(db, client_id, count=1)
+            # Exact, not recounted: this path already knows whether the point
+            # was new, so a webhook costs no extra Qdrant round trip the way a
+            # batch does.
+            tenancy_service.adjust_indexed_items_for(
+                db, {"client_id": client_id, "domain": license_data["domain"]}, +1
+            )
         print(f"✅ Webhook [{action}]: indexed {product_id} - {product.get('name')}")
 
         return {"status": action, "product_id": product_id}
@@ -872,8 +895,13 @@ def product_deleted(
         # presents a key. It cannot simply be repointed at the new schema while
         # the caller is WooCommerce, because WooCommerce presents no key.
         license_data = get_client_license(db, client_id)
+        _was_indexed = product_exists(client_id, license_data["domain"], product_id)
         delete_product(client_id, license_data["domain"], product_id)
         invalidate_client_results(client_id)
+        if _was_indexed:
+            tenancy_service.adjust_indexed_items_for(
+                db, {"client_id": client_id, "domain": license_data["domain"]}, -1
+            )
         print(f"🗑️  Webhook [deleted]: removed product {product_id}")
         return {"status": "deleted", "product_id": product_id}
     except Exception as e:

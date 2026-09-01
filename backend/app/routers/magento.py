@@ -7,7 +7,7 @@ from backend.app.services.cache_service import get_cached_embedding, get_cached_
 from backend.app.services.database import get_db
 from backend.app.services.embedder import embed_query, embed_document
 from backend.app.services.license_service import increment_search_count, log_search, increment_ingest_count, extract_license_key_from_authorization
-from backend.app.services import catalog, request_auth
+from backend.app.services import catalog, request_auth, tenancy_service
 from backend.app.services.llm_key_service import decrypt_key
 from backend.app.services.embedding_key_service import (
     resolve_embedding_key,
@@ -15,7 +15,7 @@ from backend.app.services.embedding_key_service import (
 )
 from backend.app.services.llm_rerank_service import llm_rerank_products
 from backend.app.services.mmr import apply_mmr, strip_vector
-from backend.app.services.qdrant_service import search_products, upsert_product, delete_product, get_client_product_count
+from backend.app.services.qdrant_service import search_products, upsert_product, delete_product
 from backend.app.utils.slug import slug as _slug
 # Magento has richer product structure (configurables, variants, super-attrs)
 # than the generic WooCommerce format. Reuse the chatbot's Magento-aware
@@ -740,8 +740,12 @@ def magento_sync_quota(
     client_id = license_data["client_id"]
     domain = license_data["domain"]
 
-    current_count = get_client_product_count(client_id, domain)
-    product_limit = license_data["product_limit"]
+    # Reads the maintained site counter, so the number a merchant sees here
+    # is the number the ceiling enforces. Counting Qdrant separately is how
+    # a dashboard ends up disagreeing with the refusal a sync just got.
+    _, current_count, product_limit = tenancy_service.check_catalogue_headroom(
+        db, license_data, 0
+    )
 
     return {
         "current_count": current_count,

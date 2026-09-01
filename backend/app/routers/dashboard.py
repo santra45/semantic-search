@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from backend.app.services.database import get_db
-from backend.app.services import request_auth
+from backend.app.services import request_auth, tenancy_service
 from backend.app.services.qdrant_service import get_client_product_count
 from datetime import datetime
 from typing import Optional
@@ -76,8 +76,11 @@ def dashboard_stats(
     search_count = usage.search_count if usage else 0
     ingest_count = usage.ingest_count if usage else 0
 
-    # Products indexed in Qdrant
-    indexed_count = get_client_product_count(client_id, domain)
+    # Entities indexed for this store, read from the maintained site counter so
+    # the dashboard and the sync ceiling quote the same number.
+    _, indexed_count, _site_limit = tenancy_service.check_catalogue_headroom(
+        db, client, 0
+    )
 
     # Search quota percentage
     search_limit   = client["search_limit"]
@@ -281,7 +284,7 @@ def status_check(
     client_id = client["client_id"]
     domain    = client["domain"]
 
-    indexed_count = get_client_product_count(client_id, domain)
+    _, indexed_count, _ = tenancy_service.check_catalogue_headroom(db, client, 0)
 
     # Check webhooks registered in WooCommerce
     # (We store webhook IDs in license_keys table — added later)

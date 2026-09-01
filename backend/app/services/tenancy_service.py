@@ -885,6 +885,189 @@ def set_index_plan(db: Session, site_id: str, index_plan: str) -> dict:
     return {**site, "key_hashes": hashes}
 
 
+def check_catalogue_headroom(
+    db: Session,
+    license_data: dict,
+    adding: int,
+) -> tuple[bool, int, int]:
+    """Can this store hold *adding* more entities? Returns (ok, current, limit).
+
+    THE ONE PLACE THE CEILING IS DECIDED, so that the four sync entry points
+    stop each having their own arithmetic. They did not agree: the WooCommerce
+    batch compared a products-only current against a products-plus-pages-plus-
+    posts incoming, so pages could be re-synced past a full catalogue forever,
+    while the two Q&A batches counted products on both sides and let every
+    other content type in free.
+
+    Reads sites.indexed_items, which is maintained at the write boundary and
+    seeded by scripts/backfill_indexed_items.py. One indexed MySQL read per
+    batch instead of a Qdrant count per batch.
+
+    FALLS BACK TO COUNTING QDRANT when the site cannot be resolved — a v1
+    licence whose domain has drifted from sites.domain. Slower and exact,
+    rather than fast and absent: the alternative is a store with no row to read
+    silently getting no ceiling at all.
+
+    A limit of 0 means no ceiling is configured and everything fits. That is
+    the pre-existing convention at every call site this replaces, and changing
+    it here would refuse every sync from a tenant whose plan row is incomplete.
+    """
+    adding = max(0, int(adding))
+
+    site_id = site_id_for(db, license_data)
+    if site_id:
+        try:
+            return has_catalogue_headroom(db, site_id, adding)
+        except LookupError:
+            pass  # row vanished under us; fall through to the Qdrant count
+
+    from backend.app.services import qdrant_service
+
+    current = qdrant_service.count_indexed_entities(
+        str(license_data.get("client_id") or ""),
+        str(license_data.get("domain") or ""),
+    )
+    limit = int(license_data.get("catalogue_limit") or license_data.get("product_limit") or 0)
+    if limit <= 0:
+        return True, current, limit
+    return (current + adding <= limit), current, limit
+
+
+def adjust_indexed_items_for(db: Session, license_data: dict, delta: int) -> None:
+    """Move a site's catalogue counter by a delta the caller already knows.
+
+    The exact-delta counterpart to apply_index_delta(). A webhook handles one
+    product and has already established whether the point existed, so it can
+    say +1 or -1 outright — no baseline, no recount, no Qdrant round trip. A
+    batch cannot, because it does not know which of its items were new.
+
+    Fail-soft for the same reason apply_index_delta() is: it runs after the
+    write it describes has succeeded, and a webhook that reports failure gets
+    retried by WooCommerce, which would re-embed a product that is already
+    indexed.
+    """
+    try:
+        site_id = site_id_for(db, license_data)
+        if not site_id:
+            return
+        adjust_indexed_items(db, site_id, delta)
+    except Exception:
+        logger.warning(
+            "could not move sites.indexed_items by %+d for client=%s domain=%r; "
+            "the catalogue counter is now stale for this site and will need a "
+            "reconcile. The write itself is unaffected.",
+            delta,
+            license_data.get("client_id"),
+            license_data.get("domain"),
+            exc_info=True,
+        )
+
+
+def index_baseline(license_data: dict, content_types) -> int:
+    """Entities of *content_types* in this store's collection, right now.
+
+    Half of a matched pair: call this before a sync writes, call
+    apply_index_delta() with the result after it has. See that function for
+    why the difference is measured rather than assumed.
+    """
+    from backend.app.services import qdrant_service
+
+    return qdrant_service.count_entities_of_types(
+        str(license_data.get("client_id") or ""),
+        str(license_data.get("domain") or ""),
+        content_types,
+    )
+
+
+def apply_index_delta(
+    db: Session,
+    license_data: dict,
+    content_types,
+    baseline: int,
+) -> None:
+    """Fold what a completed write changed into sites.indexed_items.
+
+    Recounts the types the caller touched and moves the column by the
+    difference. Measuring rather than counting the request body is what makes
+    a re-sync a no-op: upserting a product that already exists produces a
+    delta of zero, where adding len(req.items) would add the whole catalogue
+    again every time a merchant pressed Resync and eventually refuse them
+    their own products.
+
+    FAIL-SOFT, AND DELIBERATELY SO. This runs AFTER the write it is describing
+    has already succeeded and been committed. A merchant's products are in the
+    index; raising here would report a failed sync that in fact worked, and
+    the plugin would retry it. A counter that is momentarily wrong is a
+    reconcile away from right, which is why the column is documented as
+    needing one. Every failure is logged at WARNING with the site id, because
+    a counter drifting silently is how a ceiling stops meaning anything.
+
+    No-ops when the site cannot be resolved — a v1 licence whose domain has
+    drifted from sites.domain. The caller's enforcement falls back to counting
+    Qdrant in that case, so the store is still gated, just not from here.
+    """
+    try:
+        site_id = site_id_for(db, license_data)
+        if not site_id:
+            return
+
+        after = index_baseline(license_data, content_types)
+        delta = after - int(baseline)
+        if delta:
+            adjust_indexed_items(db, site_id, delta)
+    except Exception:
+        logger.warning(
+            "could not update sites.indexed_items for client=%s domain=%r after a "
+            "sync that succeeded; the catalogue counter is now stale for this site "
+            "and will need a reconcile. The write itself is unaffected.",
+            license_data.get("client_id"),
+            license_data.get("domain"),
+            exc_info=True,
+        )
+
+
+def site_id_for(db: Session, license_data: dict) -> Optional[str]:
+    """The site a request belongs to, whichever auth path resolved it.
+
+    THE v1 BRIDGE, and the reason the catalogue counter can be maintained
+    before the cutover finishes. A v2 context carries site_id already. A v1
+    JWT carries client_id and domain and nothing else — but the migration
+    backfilled a `sites` row for every v1 licence, so the pair still
+    identifies a store install through uq_sites_client_domain.
+
+    Without this, adjust_indexed_items() could only run on v2 traffic, which
+    is currently near zero — so sites.indexed_items would stay at 0 for every
+    real store, and any enforcement reading it would hand each of them a fresh
+    full allowance.
+
+    Returns None rather than raising when the pair matches nothing, because a
+    caller's correct response is to fall back to counting Qdrant, not to
+    refuse a sync. That happens for a tenant whose licensed domain has drifted
+    from sites.domain: v1 took `domain` from a JWT claim frozen at issue time,
+    while sites.domain is normalise_domain()'d — lowercased, no www, no port.
+    The normalise call below closes most of that gap; a genuine rename does
+    not, and should not be papered over here.
+    """
+    site_id = license_data.get("site_id")
+    if site_id:
+        return str(site_id)
+
+    client_id = license_data.get("client_id")
+    domain = license_data.get("domain")
+    if not client_id or not domain:
+        return None
+
+    try:
+        host = normalise_domain(str(domain))
+    except ValueError:
+        # A stored domain this module would refuse to create today. Not worth
+        # a 500 on a sync path — the caller falls back to the Qdrant count.
+        return None
+
+    site = _site_by_client_domain(db, str(client_id), host)
+    return site["id"] if site else None
+
+
 def adjust_indexed_items(db: Session, site_id: str, delta: int) -> int:
     """Move the site's indexed-entity count by *delta*, and return the new total.
 

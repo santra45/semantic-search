@@ -6,8 +6,9 @@ import logging
 from collections import defaultdict
 from backend.app.services.embedder import embed_document
 from backend.app.services.sparse_embedder import embed_sparse_document
-from backend.app.services.qdrant_service import upsert_content_item, upsert_page, upsert_post, get_client_product_count
+from backend.app.services.qdrant_service import upsert_content_item, upsert_page, upsert_post, count_entities_of_types
 from backend.app.services.license_service import increment_ingest_count
+from backend.app.services import tenancy_service
 from backend.app.services import request_auth
 from backend.app.services.database import get_db
 from backend.app.services.cache_service import invalidate_client_results
@@ -157,15 +158,39 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
     )
     embedding_model = resolve_embedding_model(req.embedding_model, req.embedding_provider)
 
-    # CRITICAL: Check total indexed count + incoming count against plan limit
-    current_count = get_client_product_count(client_id, domain)
+    # THE COUNTS BEING COMPARED HERE DID NOT MATCH, and that is why pages and
+    # posts could be re-synced past a full ceiling indefinitely: `current` was
+    # products only, while `incoming` was products + pages + posts. A store
+    # holding 400 products and 300 pages reported 400, so another 100 pages
+    # read as 500 against a 500 limit and passed — every time, forever.
+    #
+    # Both sides now count the same thing: every logical entity of the types
+    # this request actually carries.
+    # Baseline for the catalogue counter: only the types this batch writes,
+    # measured from Qdrant before anything lands, so apply_index_delta() can
+    # move sites.indexed_items by what actually changed.
+    _touched_types = {"product", "page", "post"}
+    _index_baseline = count_entities_of_types(client_id, domain, _touched_types)
+
+    # The ceiling is a separate question and reads a different source: the
+    # site's maintained total across ALL content types, not just the three
+    # this request carries. The two were previously the same number, and that
+    # was the bug — `current` counted products while `incoming` counted
+    # products plus pages plus posts, so a store holding 400 products and 300
+    # pages reported 400 and could take another 100 pages against a 500 limit.
+    # Every time. Both sides now count logical entities.
     incoming_count = len(req.products) + len(req.pages) + len(req.posts)
-    total_after_ingest = current_count + incoming_count
-    
-    if total_after_ingest > license_data["product_limit"]:
+    _ok, _current, _limit = tenancy_service.check_catalogue_headroom(
+        db, license_data, incoming_count
+    )
+    if not _ok:
         raise HTTPException(
             status_code=400,
-            detail=f"Content limit exceeded. Current: {current_count}, Incoming: {incoming_count}, Limit: {license_data['product_limit']}"
+            detail=(
+                f"Catalogue limit reached. This store holds {_current:,} of "
+                f"{_limit:,} indexed items and this batch adds {incoming_count:,}. "
+                f"Remove content you no longer need, or move to a larger plan."
+            ),
         )
     
     success_ids = []
@@ -266,6 +291,8 @@ def sync_batch(req: SyncBatchRequest, request: Request, db: Session = Depends(ge
 
     if success_ids:
         increment_ingest_count(db, client_id, count=len(success_ids))
+
+    tenancy_service.apply_index_delta(db, license_data, _touched_types, _index_baseline)
 
     is_last_batch = req.batch_number >= req.total_batches
     if is_last_batch:
