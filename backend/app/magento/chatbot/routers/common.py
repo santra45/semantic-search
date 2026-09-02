@@ -115,6 +115,15 @@ _ANSWERING_PRODUCTS = frozenset({"magento_chatbot", "magento_product_qa"})
 # reads /api/token-usage/me/*, not this package).
 _CHATBOT_ONLY = frozenset({"magento_chatbot"})
 
+# Web-search grounding, which today only the per-product widget has any use for:
+# it warms one PRODUCT's grounding when a shopper opens that product's chat card,
+# and AIChatbot is not on a product page when it answers. Deliberately narrower
+# than _ANSWERING_PRODUCTS, following this table's own rule — every entry is the
+# set of modules that actually builds the URL, not the set that plausibly might.
+# If AIChatbot grows a use for it, it 403s until it is added here, which is the
+# loud direction of failure this table exists to provide.
+_PRODUCT_QA_ONLY = frozenset({"magento_product_qa"})
+
 _ROUTE_PRODUCTS: dict[str, frozenset[str]] = {
     "/magento/chatbot/agent/sync/batch": _SYNC_FAMILY,
     "/magento/chatbot/agent/sync/delete": _SYNC_FAMILY,
@@ -124,6 +133,7 @@ _ROUTE_PRODUCTS: dict[str, frozenset[str]] = {
     "/magento/chatbot/retrieve/products": _ANSWERING_PRODUCTS,
     "/magento/chatbot/retrieve/content": _ANSWERING_PRODUCTS,
     "/magento/chatbot/retrieve/answer": _ANSWERING_PRODUCTS,
+    "/magento/chatbot/retrieve/websearch/prime": _PRODUCT_QA_ONLY,
     "/magento/chatbot/retrieve/content_by_ids": _CHATBOT_ONLY,
     "/magento/chatbot/retrieve/answer/stream": _CHATBOT_ONLY,
     "/magento/chatbot/classify": _CHATBOT_ONLY,

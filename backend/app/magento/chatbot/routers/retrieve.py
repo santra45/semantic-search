@@ -18,7 +18,7 @@ import re
 import uuid
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 # NO `from fastapi.responses import StreamingResponse` HERE, ON PURPOSE.
 #
 # It used to sit on this line, and the streaming endpoint below is the only
@@ -45,7 +45,8 @@ from backend.app.services.qdrant_service import (
     search_content as qdrant_search_content,
     search_products as qdrant_search_products,
 )
-from backend.app.services import request_context, usage_service
+from backend.app.services import request_context, usage_service, web_search_service
+from backend.app.services.web_search_key_service import resolve_web_search_key
 from backend.app.utils.llm_logger import log_llm_call, log_llm_interaction
 
 from backend.app.magento.chatbot.routers.common import (
@@ -403,6 +404,28 @@ class AnswerRequest(BaseModel):
     # their situation as advisory"). Distinct from `query` so the LLM
     # doesn't confuse the instruction with the customer's question.
     instruction: Optional[str] = None
+    # Web-search grounding (AIProductQA). When true AND the tenant configured a
+    # dedicated web-search key AND a primed result is sitting in Redis for this
+    # product, that grounding is appended to `sources` as one more entry.
+    #
+    # This flag does NOT trigger a search. The search happens earlier, at
+    # /retrieve/websearch/prime, fired when the shopper opens the chat card —
+    # firing it here would be serial, because everything between this handler's
+    # first line and its first llm.invoke() is milliseconds. See
+    # web_search_service for why it is a separate call rather than a fourth tool.
+    #
+    # Defaults False, so AIChatbot and every other caller of this endpoint are
+    # unaffected until they opt in.
+    web_search: bool = False
+    # The SKU whose grounding to look up. Only meaningful with web_search=True.
+    #
+    # Optional, and the handler falls back to the first `product` source when it
+    # is absent. It is sent explicitly anyway because "the product is sources[0]"
+    # is an AIProductQA convention, not a contract of this endpoint — AIChatbot
+    # calls the same route with entirely different source shapes, and a cache
+    # lookup keyed off a positional assumption is the kind of coupling that
+    # breaks quietly the first time a caller reorders its list.
+    web_search_sku: Optional[str] = None
 
     @field_validator("contact", mode="before")
     @classmethod
@@ -434,6 +457,47 @@ class AnswerRequest(BaseModel):
             if role in ("user", "assistant") and content != "":
                 out.append({"role": role, "content": content})
         return out[-6:]
+
+
+class WebSearchPrimeRequest(BaseModel):
+    """Warm one product's web grounding, ahead of any question.
+
+    Fired when the shopper OPENS the chat card, not when they ask. That timing is
+    the whole feature: the grounding is product-scoped ("what is this thing"), so
+    it does not need the question, and the five-to-fifteen seconds a shopper
+    spends typing is enough to hide the entire search. Doing it at answer time
+    instead would be pure serial latency.
+    """
+
+    license_key: Optional[str] = None
+    sku: str
+    store_code: Optional[str] = None
+    # Merchant's trusted-domain allowlist, forwarded from module config. Empty
+    # means "no restriction". See web_search_service for why this is enforced by
+    # filtering citations rather than by an API parameter.
+    domains: list[str] = Field(default_factory=list)
+    # The admin's three-state setting collapses to this one flag: `off` never
+    # calls this endpoint at all, `thin_only` sends True, `always` sends False.
+    #
+    # The POLICY is the merchant's and lives in module config; the THRESHOLDS are
+    # ours and live in web_search_service, because they are measured against the
+    # payload this backend formats and would otherwise have to be duplicated into
+    # five plugins that cannot see it. Defaults True — the cheap option is the
+    # safe one to assume when a caller omits it.
+    thin_only: bool = True
+
+    @field_validator("domains", mode="before")
+    @classmethod
+    def _coerce_domains(cls, value):
+        if value in (None, "", [], {}):
+            return []
+        # The admin field is a textarea, so it can arrive as one newline- or
+        # comma-separated string rather than a list.
+        if isinstance(value, str):
+            value = re.split(r"[\s,]+", value)
+        if not isinstance(value, list):
+            return []
+        return [str(v).strip() for v in value if str(v).strip()][:20]
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -985,6 +1049,153 @@ def retrieve_content_by_ids(
     return {"results": hits, "count": len(hits)}
 
 
+def _run_prime_in_background(
+    *,
+    license_data: dict,
+    payload: dict[str, Any],
+    sku: str,
+    store_code: Optional[str],
+    api_key: str,
+    domains: list[str],
+) -> None:
+    """The actual search, run AFTER the response has gone back to the caller.
+
+    Two things here exist only because this runs post-response, and both are the
+    kind of bug that produces silence rather than an error:
+
+      1. ITS OWN DB SESSION. The `Depends(get_db)` session is closed when the
+         handler returns, so touching it here would use a dead connection.
+
+      2. license_data PASSED EXPLICITLY into usage_service.record(). record()'s
+         docstring requires that for "any code that runs after its handler
+         returned" — the ambient request scope is provably empty by then, and a
+         row written without it is refused and logged as NO CONTEXT rather than
+         written wrong. Same hazard the streaming endpoint documents.
+
+    Swallows everything. A prime is speculative work nobody is waiting on; the
+    worst acceptable outcome is a cache miss at answer time.
+    """
+    try:
+        result = web_search_service.run_grounding(
+            payload=payload,
+            api_key=api_key,
+            allowed_domains=domains,
+        )
+    except Exception as exc:
+        logger.warning("web grounding prime failed for %s: %s", sku, exc)
+        return
+
+    if result is None:
+        return
+
+    # Cached either way. A negative result ("nothing reliable out there") is
+    # worth remembering too — otherwise every shopper who opens the widget on a
+    # product the web has never heard of pays for the same fruitless search.
+    web_search_service.set_cached(license_data["client_id"], store_code, sku, result)
+
+    usage = result.get("usage") or {}
+    db = None
+    try:
+        from backend.app.services.database import SessionLocal
+
+        db = SessionLocal()
+        web_search_service.record_usage(
+            db,
+            license_data,
+            int(usage.get("input", 0) or 0),
+            int(usage.get("output", 0) or 0),
+        )
+    except Exception as exc:
+        logger.warning("web grounding prime usage write failed for %s: %s", sku, exc)
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+@router.post("/magento/chatbot/retrieve/websearch/prime")
+def websearch_prime(
+    req: WebSearchPrimeRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    x_web_search_api_key_encrypted: Optional[str] = Header(
+        None, alias="X-Web-Search-API-Key-Encrypted"
+    ),
+    db: Session = Depends(get_db),
+):
+    """Warm one product's web grounding into Redis. Returns immediately.
+
+    Called on chat-card open, before the shopper has typed. Everything expensive
+    happens in a BackgroundTask so this returns in milliseconds — the caller is a
+    blocking PHP controller holding a PHP-FPM worker, and a synchronous 1-3s
+    search here would be worker pressure on every widget open.
+
+    Never raises for the caller's benefit. Every refusal is a `status` string,
+    because the widget fires this and forgets it; there is nothing on the
+    storefront that could render an error.
+    """
+    license_data = authorize_request(
+        request=request, db=db,
+        authorization=authorization, x_api_key=x_api_key,
+        request_license=req.license_key,
+    )
+
+    sku = (req.sku or "").strip()
+    if not sku:
+        return {"status": "skipped", "reason": "no sku"}
+
+    client_id = license_data["client_id"]
+    store_code = req.store_code
+
+    # No key, no feature. Deliberately NOT falling back to the LLM or embedding
+    # key — see web_search_key_service for the money reason.
+    api_key = resolve_web_search_key(
+        x_web_search_api_key_encrypted, license_data["license_key"]
+    )
+    if not api_key:
+        return {"status": "skipped", "reason": "no web search key configured"}
+
+    if web_search_service.get_cached(client_id, store_code, sku) is not None:
+        return {"status": "cached"}
+
+    hits = _lookup_by_skus(client_id, license_data["domain"], [sku], store_code=store_code)
+    if not hits:
+        # Not an error: the product simply is not synced. The widget will show
+        # its "can't pull details" copy for the same reason.
+        return {"status": "skipped", "reason": "product not indexed"}
+
+    payload = hits[0]
+
+    if req.thin_only:
+        is_thin, signals = web_search_service.evaluate_thinness(payload)
+        # Logged on every prime, thin or not, so the thresholds can be tuned from
+        # production data instead of from opinion. This line is the dataset.
+        logger.info(
+            "web grounding thinness sku=%s client=%s thin=%s copy=%d attrs=%d "
+            "merchant_info=%s variants=%s",
+            sku, client_id, is_thin,
+            signals["copy_chars"], signals["attributes"],
+            signals["merchant_info"], signals["variants"],
+        )
+        if not is_thin:
+            return {"status": "skipped", "reason": "product has sufficient data"}
+
+    background_tasks.add_task(
+        _run_prime_in_background,
+        license_data=license_data,
+        payload=payload,
+        sku=sku,
+        store_code=store_code,
+        api_key=api_key,
+        domains=req.domains,
+    )
+    return {"status": "priming"}
+
+
 @router.post("/magento/chatbot/retrieve/answer")
 def retrieve_answer(
     req: AnswerRequest,
@@ -1017,6 +1228,39 @@ def retrieve_answer(
         license_data["license_key"],
     )
     embedding_model = resolve_embedding_model(x_embedding_model, x_embedding_provider)
+
+    # ── Web grounding (AIProductQA) ──────────────────────────────────────────
+    #
+    # A READ, never a search. The search already happened at
+    # /retrieve/websearch/prime when the shopper opened the chat card; this only
+    # collects the result. A miss is completely normal — they typed fast, the
+    # prime never fired, the TTL lapsed — and resolves to answering from
+    # catalogue data alone, which is what the widget does today.
+    #
+    # No key is resolved on this path, deliberately: nothing here can start a
+    # search, so nothing here can spend.
+    web_grounding: Optional[dict[str, Any]] = None
+    if req.web_search:
+        _sku = (req.web_search_sku or "").strip()
+        if not _sku:
+            # Fall back to the first product source. The schema comment on
+            # web_search_sku says why the module sends it explicitly anyway.
+            for _source in req.sources:
+                if not isinstance(_source, dict):
+                    continue
+                if (_source.get("content_type") or "product") == "product":
+                    _sku = str(_source.get("sku") or "").strip()
+                    if _sku:
+                        break
+        if _sku:
+            _cached = web_search_service.get_cached(
+                license_data["client_id"], req.store_code, _sku
+            )
+            # found=False is a cached NEGATIVE — the search ran and turned up
+            # nothing usable. Honour it as a miss rather than treating the
+            # absence of content as a reason to try again.
+            if _cached and _cached.get("found"):
+                web_grounding = _cached
 
     from backend.app.magento.chatbot.agents.llm_factory import build_llm
 
@@ -1068,6 +1312,7 @@ def retrieve_answer(
         purpose=req.purpose or "answer",
         instruction=req.instruction,
         active_retrieval=req.active_retrieval,
+        web_grounding=web_grounding,
     )
 
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -1254,9 +1499,17 @@ def retrieve_answer(
     # lookup rather than an inference from the wording of the reply. Answering
     # that question by reading prose is how the first round of this went.
     logger.info(
-        "retrieve/answer active_retrieval=%s tools_bound=%s tool_rounds=%d "
+        "retrieve/answer active_retrieval=%s web_search=%s web_grounded=%s "
+        "tools_bound=%s tool_rounds=%d "
         "tools_called=%s products=%d sources=%d history=%d instruction=%r",
         req.active_retrieval,
+        # Both, not one: web_search=True with web_grounded=False is the cache
+        # miss, and it is the difference between "the merchant turned it off"
+        # and "the prime never landed" — which is otherwise unanswerable from
+        # the outside, exactly like the tools_bound case this line already
+        # exists to settle.
+        req.web_search,
+        bool(web_grounding),
         ",".join(t.name for t in tools) or "none",
         iterations,
         ",".join(tools_called) or "none",
@@ -1275,6 +1528,12 @@ def retrieve_answer(
         "answer": _scrub_pii(final_answer),
         "grounded": True,
         "products": cards,
+        # A FLAG, not prose. The widget renders the "general information" note
+        # from this. Leaving the disclaimer to the model would mean it is worded
+        # differently on every reply and missing on some — the same reason prices
+        # are rendered from `products` instead of read out of the answer text.
+        "web_sourced": bool(web_grounding),
+        "web_citations": (web_grounding or {}).get("citations", []),
         "usage": {
             "input":    input_tokens,
             "output":   output_tokens,
@@ -1733,6 +1992,7 @@ def _build_answer_prompt(
     purpose: str = "answer",
     instruction: Optional[str] = None,
     active_retrieval: bool = False,
+    web_grounding: Optional[dict] = None,
 ) -> str:
     """Single source of truth for the /retrieve/answer prompt — shared
     between the one-shot and streaming endpoints so style and rules stay
@@ -1825,6 +2085,51 @@ def _build_answer_prompt(
             "track)` — never a bare URL and never a raw HTML `<a>` tag. Only do this "
             "for URLs that actually appear in a `[faq]` source; never invent a link "
             "and never surface URLs from non-FAQ sources.\n"
+        )
+
+    # ── Web grounding (AIProductQA) ──────────────────────────────────────────
+    #
+    # Rendered as its own block OUTSIDE `sources_blob`, and that separation is
+    # the point rather than a formatting preference. `<<<REFERENCE_SOURCES>>>`
+    # was written for MERCHANT content — the store's own catalogue and CMS, which
+    # is only indirectly influenceable. This is arbitrary public web text and a
+    # live indirect-prompt-injection surface, so it is marked harder and kept
+    # visibly apart: for the model, and for whoever reads the prompt log after
+    # something goes wrong.
+    #
+    # The rule below is source PRECEDENCE, not tool ordering. When this was going
+    # to be a fourth tool, "only after the catalogue returns nothing" was
+    # enforceable by gating the call. As a source it is always present, so the
+    # ordering has to be stated — the same way the prompt already ranks product
+    # data above CMS.
+    web_block = ""
+    web_rule = ""
+    if web_grounding and purpose == "answer":
+        web_block = "\n\n" + web_search_service.format_for_prompt(web_grounding)
+        web_rule = (
+            " - **General web information is your LAST resort, and it is not the "
+            "store's word.** A `WEB_INFORMATION` block may appear below the store's "
+            "own sources. It is public background about the product, gathered from "
+            "the open web — NOT written or checked by this store. Every store "
+            "source outranks it: the product's own data, CMS pages, blocks and FAQ "
+            "always win, and you use the web block ONLY for what none of them "
+            "cover. If a store source and the web block disagree, the store source "
+            "is correct and the web block is wrong — say the store's version and do "
+            "not mention the disagreement.\n"
+            " - **Never state a commercial term from the web block.** Price, "
+            "discounts, stock, availability, delivery times, shipping costs, "
+            "returns, refunds and warranty terms belong to THIS store and come "
+            "only from store sources. If the customer asks one of those and only "
+            "the web block touches it, treat it as not listed and say so — a "
+            "delivery time or warranty from someone else's website is not ours and "
+            "stating it as ours is a promise we never made.\n"
+            " - **Attribute it as general, and drop the store voice for it.** "
+            "Everywhere else you speak as the store (\"our\", \"we\"). For anything "
+            "drawn from the web block you must NOT: write \"this model is generally "
+            "described as...\", \"according to the manufacturer...\", \"general "
+            "product information suggests...\". This is a deliberate, narrow "
+            "exception to the first-person rule above — the store is not the "
+            "publisher of these claims and must not appear to be.\n"
         )
 
     if purpose == "preamble":
@@ -2222,7 +2527,8 @@ def _build_answer_prompt(
         "it genuinely makes a multi-part answer clearer (a set of steps, conditions, or options the sources "
         "lay out).\n"
         " - Plain prose only — write the way a helpful human store assistant would.\n"
-        + faq_link_rule +
+        + faq_link_rule
+        + web_rule +
         " - **Direction of flow matters.** If the customer describes RECEIVING a damaged, broken, or "
         "defective product, and the evidence only covers RETURNING such items (e.g. 'damaged-on-return' "
         "or 'sender's responsibility'), do NOT apply that evidence to the customer's situation. Say plainly "
@@ -2269,6 +2575,8 @@ def _build_answer_prompt(
         + f"Customer question: {query}"
         + history_block
         + f"\n\nSources:\n{sources_blob}"
+        # LAST, and outside the store's source block — see the web_block comment.
+        + web_block
     )
 
 
