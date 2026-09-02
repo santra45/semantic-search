@@ -29,6 +29,8 @@ SENSITIVE_HEADERS = {
     "x-api-key",
     "x-llm-api-key-encrypted",
     "x-magento-admin-creds-encrypted",
+    "x-embedding-api-key-encrypted",
+    "x-web-search-api-key-encrypted",
 }
 
 SKIP_PATHS: tuple[str, ...] = (
