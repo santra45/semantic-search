@@ -3,12 +3,26 @@ import json
 import hashlib
 import os
 
-# Connect to Redis
+# Connect to Redis.
+#
+# The timeouts are not tuning, they are the thing that makes auth_cache's
+# "fail open, always" promise true. redis-py defaults socket_timeout and
+# socket_connect_timeout to None, meaning block forever, and auth_cache reuses
+# this client by design. A Redis that is TCP-connected but unresponsive — a
+# BGSAVE fork stall, the box swapping — would therefore hang the authentication
+# path indefinitely rather than degrading to a database lookup. Every request
+# would stall on a cache whose entire purpose is to be optional.
+#
+# 250ms is far above a healthy local round trip and far below anything a
+# shopper would notice, so a stalled Redis costs one quarter-second per request
+# and then gets out of the way.
 r = redis.Redis(
     host=os.getenv("REDIS_HOST", "localhost"),
     port=int(os.getenv("REDIS_PORT", 6379)),
     db=0,
-    decode_responses=True    # returns strings not bytes
+    decode_responses=True,   # returns strings not bytes
+    socket_timeout=0.25,
+    socket_connect_timeout=0.25,
 )
 
 def make_key(prefix: str, text: str, namespace: str = "") -> str:

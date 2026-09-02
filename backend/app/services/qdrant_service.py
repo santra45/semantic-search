@@ -1358,6 +1358,63 @@ def get_client_product_count(client_id: str, domain: str) -> int:
     return count_content_type(client_id, domain, "product")
 
 
+def count_entities_of_types(client_id: str, domain: str, content_types) -> int:
+    """Logical entities of just *content_types*, summed.
+
+    The narrow form of count_indexed_entities(), and the one the write paths
+    use. A sync batch measures only the types it is about to touch, before and
+    after, and folds the difference into sites.indexed_items — so an upsert
+    that REPLACES an entity moves the counter by zero without anyone having to
+    ask Qdrant whether each id already existed.
+
+    That is what makes a full re-sync safe. Counting items-in-the-request
+    instead would add the whole catalogue again every time a merchant hits
+    "resync", and the ceiling would start refusing a store its own products.
+
+    Cost is one count per type, so a product-only batch pays exactly what the
+    old quota check paid.
+    """
+    if not _collection_exists(client_id, domain):
+        return 0
+
+    return sum(
+        count_content_type(client_id, domain, content_type)
+        for content_type in set(content_types)
+    )
+
+
+def count_indexed_entities(client_id: str, domain: str) -> int:
+    """Every logical entity in this store's collection, across all types.
+
+    THE RECONCILE SOURCE, not a request-path call. sites.indexed_items is
+    maintained incrementally at the write boundary by
+    tenancy_service.adjust_indexed_items(); this is the ground truth that
+    seeds it and that a periodic reconcile compares it against. Enforcement
+    reads the column, never this — twelve exact counts per sync batch would
+    cost more than the check is worth.
+
+    Counted in ENTITIES, which is what a catalogue plan is sold in.
+    count_content_type() already does that conversion per type: a chunkable
+    entity split into six points is counted once, via chunk_index == 0 (plus
+    the `chunk_index is empty` arm for points written before chunking
+    shipped). Summing raw point counts instead would report a store with 50
+    long CMS pages as having 300 items and refuse syncs it has room for.
+
+    Iterates KNOWN_CONTENT_TYPES rather than a list of its own, so a type
+    added there starts counting here without a second edit. A type present in
+    the collection but absent from that list is invisible to this function —
+    which is the argument for adding new types to KNOWN_CONTENT_TYPES rather
+    than only to the formatter that writes them.
+    """
+    if not _collection_exists(client_id, domain):
+        return 0
+
+    return sum(
+        count_content_type(client_id, domain, content_type)
+        for content_type in KNOWN_CONTENT_TYPES
+    )
+
+
 def get_total_collection_count(client_id: str, domain: str) -> int:
     if not _collection_exists(client_id, domain):
         return 0

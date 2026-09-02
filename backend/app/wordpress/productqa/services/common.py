@@ -5,34 +5,83 @@ client_id + licensed domain, and the Origin/Referer of the incoming request
 must belong to that domain. What's absent is deliberate: WordPress has no
 equivalent of `magento_creds_service` / `admin_token_service`, because this
 module never calls back into the store's REST API. It reads Qdrant and it
-answers. That makes this file a third the size of its Magento twin, and the
-smaller surface is the point — there is no admin credential to leak here.
+answers. There is no admin credential to leak here.
+
+This file used to carry its own copy of the entire dual-read window — ten
+functions that were byte-identical to the Magento twin's once docstrings were
+stripped, with a comment at the top of each file telling the reader to change
+one whenever they changed the other. That copy is gone; the implementation
+lives in backend/app/services/request_auth.py and this module supplies only the
+one thing that is genuinely local: which product may call these endpoints.
 """
 
 from __future__ import annotations
 
-import os
+import logging
 from typing import Optional
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 from sqlalchemy.orm import Session
 
-from backend.app.services.domain_auth_service import DomainAuthorizer
-from backend.app.services.license_service import (
-    check_search_quota,
-    extract_license_key_from_authorization,
-    validate_license_key,
+from backend.app.services import catalog, request_auth
+
+# Re-exported so this package's routers keep importing their auth helpers from
+# one place. They do not need to know the implementation moved.
+from backend.app.services.request_auth import (  # noqa: F401
+    AUTH_PATH_V1,
+    AUTH_PATH_V2,
+    decrypt_llm_key,
+    resolve_license_key,
 )
-from backend.app.services.llm_key_service import decrypt_key
+
+logger = logging.getLogger(__name__)
 
 
-def resolve_license_key(
-    authorization: Optional[str],
-    request_license: Optional[str],
-) -> Optional[str]:
-    """Header wins over body. The plugin always sends the header; the body
-    field exists so a merchant debugging with curl doesn't have to."""
-    return extract_license_key_from_authorization(authorization) or request_license
+# ── Which product may call these endpoints ───────────────────────────────────
+#
+# THE BYPASS THIS CLOSES, AND IT WAS MEASURED THROUGH THIS EXACT FILE. A licence
+# names exactly one product, and until this check existed nothing compared that
+# product against the endpoint being called. A real v2 licence for
+# product_code=magento_chatbot was presented HERE and answered HTTP 200 with
+# auth_path=v2, and the usage_events row it produced read
+# product_code=magento_chatbot, platform=magento — written from a WordPress
+# request. usage_service.record() takes product_code and subscription_id
+# straight off the resolved context and never off the request, so a merchant
+# holding the cheapest module's key could drive every other module, book its
+# cost against the wrong product, and draw billable requests out of the wrong
+# subscription's usage_counters row.
+#
+# ONE PRODUCT, NOT A TABLE. Unlike the Magento twin — which fronts three
+# products through shared /magento/chatbot/* endpoints and therefore needs a
+# per-route mapping — every route in this package belongs to the same product.
+# The `ai-product-qa-woo` plugin is the only thing that builds these URLs
+# (grep -rno "api/wordpress/productqa/[a-zA-Z0-9_/-]*" ai-product-qa-woo/ lists
+# all seven of them, and no other plugin lists any). The other WooCommerce
+# product, `woo_search` / semantic-search-woo, talks to /api/search,
+# /api/sync/* and /api/webhook/* — different routers, which now authorise
+# through the same shared chokepoint and state `woo_search` for themselves.
+#
+# Stating it as one constant rather than a table of identical values is the
+# point: a route added to this package tomorrow is still woo_product_qa by
+# construction, so there is no table to forget to update and no route that can
+# slip outside the gate.
+WOO_PRODUCTQA_PRODUCTS = frozenset({"woo_product_qa"})
+
+# Proof at IMPORT that the code above is one the catalogue actually sells, in
+# the same spirit as request_auth's _V2_TO_V1_KEYS guard. A code that no longer
+# exists would not raise anywhere: it would simply never match
+# license_data['product_code'], and this gate would 403 the one plugin it was
+# written to allow. PRODUCT CODES ARE PERMANENT (catalog.py says so), so this
+# can only fire on a typo or on a rename made against that rule.
+_UNKNOWN_PRODUCT_CODES = sorted(WOO_PRODUCTQA_PRODUCTS - set(catalog.PRODUCTS))
+if _UNKNOWN_PRODUCT_CODES:
+    raise ImportError(
+        "The WordPress chokepoint authorises "
+        + ", ".join(_UNKNOWN_PRODUCT_CODES) + ", which catalog.PRODUCTS does "
+        "not define. Product codes are permanent by contract — do not rename "
+        "one to match this module; fix this module. The catalogue sells: "
+        + ", ".join(sorted(catalog.PRODUCTS)) + "."
+    )
 
 
 def authorize_request(
@@ -43,64 +92,21 @@ def authorize_request(
     x_api_key: Optional[str],
     request_license: Optional[str],
 ) -> dict:
-    """Validate the caller and return their license data (client_id, domain,
-    product_limit, …) with the resolved key folded back in.
+    """Authenticate a WordPress Q&A caller. See request_auth.authorize_request.
 
-    Raises 401 (no key), 403 (bad key / wrong domain) or 429 (over quota).
+    Deliberately takes no allowed-products argument. Every route in this
+    package is woo_product_qa, so there is nothing for a caller to decide and
+    nothing for a caller to get wrong — which is the same reason the constant
+    above is a constant and not a table.
+
+    MUST STAY A PLAIN CALL INSIDE THE HANDLER BODY, not a Depends(). See the
+    request_auth module docstring for the measurement.
     """
-    license_key = resolve_license_key(authorization, request_license)
-    if not license_key:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    try:
-        license_data = validate_license_key(license_key, db)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-
-    DomainAuthorizer(db).validate_request(request, license_data, api_key=x_api_key)
-    _enforce_search_quota(db, license_data)
-
-    license_data["license_key"] = license_key
-    return license_data
-
-
-def _enforce_search_quota(db: Session, license_data: dict) -> None:
-    """Reject over-quota tenants with 429.
-
-    Shares the Magento side's env gate (AICHATBOT_QUOTA_ENFORCEMENT) on
-    purpose: one switch should arm or disarm quota enforcement for the whole
-    deployment, not one per platform. Off by default, and fails OPEN on any
-    lookup error — a quota check must never be why a paying merchant's
-    product pages stop answering.
-    """
-    if os.getenv("AICHATBOT_QUOTA_ENFORCEMENT", "0") != "1":
-        return
-    try:
-        client_id = license_data.get("client_id")
-        search_limit = int(
-            license_data.get("search_limit_per_month")
-            or license_data.get("search_limit")
-            or 0
-        )
-        if not client_id or search_limit <= 0:
-            return  # no usable limit configured → don't block
-        within_quota = check_search_quota(db, str(client_id), search_limit)
-    except Exception:
-        return  # fail open — never block on a lookup/DB error
-    if not within_quota:
-        raise HTTPException(
-            status_code=429,
-            detail="Monthly usage limit reached. Please contact the store.",
-        )
-
-
-def decrypt_llm_key(encrypted: Optional[str], license_key: str) -> Optional[str]:
-    """The plugin ships the merchant's LLM key still encrypted; the license key
-    is the secret. Returns None on any failure so the caller falls back to the
-    server's own key rather than 500ing on a corrupted option value."""
-    if not encrypted:
-        return None
-    try:
-        return decrypt_key(encrypted, license_key)
-    except Exception:
-        return None
+    return request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=authorization,
+        x_api_key=x_api_key,
+        request_license=request_license,
+        allowed_products=WOO_PRODUCTQA_PRODUCTS,
+    )

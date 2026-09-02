@@ -26,7 +26,7 @@ from backend.app.services.llm_rerank_service import (
     log_gemini_response,
     make_http_client,
 )
-from backend.app.services.token_usage_service import track_usage
+from backend.app.services import usage_service
 from backend.app.utils.llm_logger import log_llm_interaction
 
 logger = logging.getLogger("llm_completion")
@@ -55,8 +55,8 @@ def complete(
     Single-shot completion. Returns ``(text, usage)`` where ``usage`` is
     ``{"input": int, "output": int, "cost": float, "provider": str, "model": str}``.
 
-    Tracks one row per call in token_usage_tracking with the supplied
-    query_type so cost rolls up alongside the other LLM operations. Callers
+    Writes one usage_events row per call with the supplied query_type as its
+    call_type, so cost rolls up alongside the other LLM operations. Callers
     that want to surface per-call cost to a downstream client (e.g. the
     Magento chatbot's per-message billing column) can use the returned
     ``usage`` dict directly.
@@ -162,21 +162,44 @@ def complete(
         client_id=client_id,
     )
 
+    # The tenant comes from the request context, not from `client_id`: this
+    # service is handed a bare client_id, which cannot name the site,
+    # subscription and product a usage_events row requires. track() reads what
+    # the auth chokepoint bound for the request and opens its own short-lived
+    # session, so nothing here grows a parameter.
+    #
+    # kind is always 'serve'. All three call_types that reach this function —
+    # chat_intent and chat_rewrite from /magento/chatbot/classify, and
+    # chat_query_decompose from query_decomposer — run while a shopper waits.
+    # Nothing on an indexing path calls complete().
+    #
+    # billable stays False. This is one step of a turn, not the turn: the
+    # answer that follows carries the single billable row, and flagging the
+    # classification too would spend two of a merchant's monthly requests on
+    # one question. Note that the query_decomposer path is reached from
+    # /magento/search, which has no chokepoint at all, so those rows will log
+    # NO CONTEXT and be refused until AI Search gets one.
+    #
+    # Swallowed but logged with the tenant and the amount: the completion is
+    # already paid for by this point, so accounting must not be what fails the
+    # request, and the log line is what keeps the spend recoverable.
     try:
-        track_usage(
-            client_id=client_id,
-            query_type=query_type,
-            llm_provider=provider,
-            llm_model=model,
-            input_tokens=usage["input"],
-            output_tokens=usage["output"],
-            input_cost=usage["input"]  * MODEL_PRICING.get(model, {}).get("input",  0),
-            output_cost=usage["output"] * MODEL_PRICING.get(model, {}).get("output", 0),
-            request_text_length=len(prompt),
-            response_text_length=len(response_text),
+        usage_service.track(
+            query_type,
+            provider,
+            model,
+            usage["input"],
+            usage["output"],
+            usage["input"]  * MODEL_PRICING.get(model, {}).get("input",  0),
+            usage["output"] * MODEL_PRICING.get(model, {}).get("output", 0),
+            usage_service.KIND_SERVE,
         )
     except Exception as e:
-        logger.warning(f"⚠️ Failed to track usage for {query_type}: {e}")
+        logger.warning(
+            "usage not recorded for %s (client=%s %s/%s tokens in=%s out=%s): %s",
+            query_type, client_id, provider, model,
+            usage["input"], usage["output"], e,
+        )
 
     return response_text, {
         "input":    int(usage["input"]),

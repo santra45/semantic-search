@@ -5,9 +5,9 @@ from sqlalchemy.orm import Session
 
 from backend.app.services.cache_service import get_cached_embedding, get_cached_results, set_cached_embedding, set_cached_results, invalidate_client_results
 from backend.app.services.database import get_db
-from backend.app.services.domain_auth_service import DomainAuthorizer
 from backend.app.services.embedder import embed_query, embed_document
-from backend.app.services.license_service import validate_license_key, check_search_quota, increment_search_count, log_search, increment_ingest_count, extract_license_key_from_authorization
+from backend.app.services.license_service import increment_search_count, log_search, increment_ingest_count, extract_license_key_from_authorization
+from backend.app.services import catalog, request_auth, tenancy_service
 from backend.app.services.llm_key_service import decrypt_key
 from backend.app.services.embedding_key_service import (
     resolve_embedding_key,
@@ -15,7 +15,7 @@ from backend.app.services.embedding_key_service import (
 )
 from backend.app.services.llm_rerank_service import llm_rerank_products
 from backend.app.services.mmr import apply_mmr, strip_vector
-from backend.app.services.qdrant_service import search_products, upsert_product, delete_product, get_client_product_count
+from backend.app.services.qdrant_service import search_products, upsert_product, delete_product
 from backend.app.utils.slug import slug as _slug
 # Magento has richer product structure (configurables, variants, super-attrs)
 # than the generic WooCommerce format. Reuse the chatbot's Magento-aware
@@ -25,6 +25,28 @@ from backend.app.magento.chatbot.services.product_formatter import format_produc
 import json
 import logging
 import time
+
+# ── Which product may call which endpoint ────────────────────────────────────
+#
+# Derived from the modules, not invented: only Czargroup/AISearch builds
+# POST /api/magento/search. The Magento chatbot chokepoint says the same thing
+# from the other side — its _ANSWERING_PRODUCTS set deliberately omits
+# magento_search because "its read path is POST /api/magento/search ... which
+# authenticates inline and never reaches this chokepoint at all". It does now.
+_SEARCH_PRODUCTS = frozenset({"magento_search"})
+
+# The quota endpoint gets the WHOLE platform, matching the reasoning the
+# chatbot chokepoint applies to its own /agent/sync/* family: every Magento
+# module writes into the one Qdrant collection its store shares, and
+# AISearch/Helper/IndexOwnership.php hands that family to whichever module wins
+# the ownership contest. A quota reading of that shared collection is a sync
+# question, so granting only the two modules whose ApiClient happens to build
+# this URL today would 403 a store the moment ownership moved. Over-granting
+# inside the family costs nothing that matters: the reply is a count of a
+# collection all three already share.
+_SYNC_QUOTA_PRODUCTS = frozenset(
+    product["code"] for product in catalog.products_for_platform("magento")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -382,19 +404,29 @@ async def magento_search(
     if not headers["license_key"]:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-    try:
-        license_data = validate_license_key(headers["license_key"], db)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+    # One chokepoint: dual-read v2/v1, domain gate, product gate, quota, and
+    # the tenant context every usage write site reads. Replaces an inline
+    # validate_license_key + DomainAuthorizer + check_search_quota sequence
+    # that resolved no v2 key and bound no context, so a v2 licence presented
+    # here produced usage rows nothing could attribute.
+    #
+    # The quota check changes hands with it. check_search_quota() reads
+    # usage_logs_archive_v1, a table the v2 migration froze — so it has been
+    # measuring a count that can no longer grow, which enforces nothing and
+    # would permanently lock out any tenant whose archived count already
+    # exceeded their limit. request_auth meters usage_counters per
+    # subscription instead, behind AICHATBOT_QUOTA_ENFORCEMENT.
+    license_data = request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=None,          # resolve_headers already folded it in
+        x_api_key=headers["api_key"],
+        request_license=headers["license_key"],
+        allowed_products=_SEARCH_PRODUCTS,
+    )
 
     client_id = license_data["client_id"]
     domain = license_data["domain"]
-
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data, api_key=headers["api_key"])
-
-    if not check_search_quota(db, client_id, license_data["search_limit"]):
-        raise HTTPException(status_code=429, detail="Monthly search limit reached. Please upgrade your plan.")
 
     # Structured filters (attribute_filters / category_id / price / sort / stock)
     # arrive pre-extracted from the Magento-side vocab matchers and are applied
@@ -685,94 +717,6 @@ async def magento_search(
     }
 
 
-@router.post("/magento/sync/batch")
-def magento_sync_batch(
-    req: MagentoSyncBatchRequest,
-    request: Request,
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    x_llm_api_key_encrypted: Optional[str] = Header(None, alias="X-LLM-API-Key-Encrypted"),
-    x_embedding_api_key_encrypted: Optional[str] = Header(None, alias="X-Embedding-API-Key-Encrypted"),
-    x_embedding_provider: Optional[str] = Header(None, alias="X-Embedding-Provider"),
-    x_embedding_model: Optional[str] = Header(None, alias="X-Embedding-Model"),
-    db: Session = Depends(get_db)
-):
-    headers = resolve_headers(
-        authorization,
-        x_api_key,
-        x_llm_api_key_encrypted,
-        req.license_key,
-        req.llm_api_key_encrypted,
-        x_embedding_api_key_encrypted,
-        req.embedding_api_key_encrypted,
-        x_embedding_provider,
-        req.embedding_provider,
-        x_embedding_model,
-        req.embedding_model,
-    )
-    if not headers["license_key"]:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    try:
-        license_data = validate_license_key(headers["license_key"], db)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-
-    client_id = license_data["client_id"]
-    domain = license_data["domain"]
-
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data, api_key=headers["api_key"])
-
-    current_count = get_client_product_count(client_id, domain)
-    incoming_count = len(req.products)
-    if current_count + incoming_count > license_data["product_limit"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Product limit exceeded. Current: {current_count}, Incoming: {incoming_count}, Limit: {license_data['product_limit']}",
-        )
-
-    embedding_api_key = resolve_embedding_key(
-        headers["embedding_api_key_encrypted"],
-        headers["llm_api_key_encrypted"],
-        headers["license_key"],
-    )
-    embedding_model = resolve_embedding_model(headers["embedding_model"], headers["embedding_provider"])
-
-    success_ids = []
-    failed_ids = []
-
-    for product in req.products:
-        try:
-            p = product.model_dump()
-            # format_product returns (embedding_text, qdrant_payload). The
-            # payload includes attr_{code}_{value}=True, cat_{id}=True, and
-            # rollups (variant_attributes, children, child_skus) the search
-            # filters and the popup rely on.
-            text, payload = format_product(p)
-            vector = embed_document(text, embedding_api_key, client_id, model=embedding_model)
-            payload["embedded_text"] = text
-            upsert_product(client_id, domain, product.product_id, vector, payload)
-            success_ids.append(product.product_id)
-        except Exception:
-            failed_ids.append(product.product_id)
-
-    if success_ids:
-        increment_ingest_count(db, client_id, count=len(success_ids))
-
-    if req.batch_number >= req.total_batches:
-        invalidate_client_results(client_id)
-
-    return {
-        "success_count": len(success_ids),
-        "failed_count": len(failed_ids),
-        "failed_ids": failed_ids,
-        "batch_number": req.batch_number,
-        "total_batches": req.total_batches,
-        "is_last_batch": req.batch_number >= req.total_batches,
-    }
-
-
 @router.get("/magento/sync/quota")
 def magento_sync_quota(
     request: Request,
@@ -784,19 +728,24 @@ def magento_sync_quota(
     if not headers["license_key"]:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-    try:
-        license_data = validate_license_key(headers["license_key"], db)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+    license_data = request_auth.authorize_request(
+        request=request,
+        db=db,
+        authorization=None,          # resolve_headers already folded it in
+        x_api_key=headers["api_key"],
+        request_license=headers["license_key"],
+        allowed_products=_SYNC_QUOTA_PRODUCTS,
+    )
 
     client_id = license_data["client_id"]
     domain = license_data["domain"]
 
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data, api_key=headers["api_key"])
-
-    current_count = get_client_product_count(client_id, domain)
-    product_limit = license_data["product_limit"]
+    # Reads the maintained site counter, so the number a merchant sees here
+    # is the number the ceiling enforces. Counting Qdrant separately is how
+    # a dashboard ends up disagreeing with the refusal a sync just got.
+    _, current_count, product_limit = tenancy_service.check_catalogue_headroom(
+        db, license_data, 0
+    )
 
     return {
         "current_count": current_count,
@@ -806,27 +755,3 @@ def magento_sync_quota(
     }
 
 
-@router.post("/magento/sync/delete")
-def magento_sync_delete(
-    req: MagentoDeleteRequest,
-    request: Request,
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    db: Session = Depends(get_db)
-):
-    headers = resolve_headers(authorization, x_api_key, None, req.license_key, None)
-    if not headers["license_key"]:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    try:
-        license_data = validate_license_key(headers["license_key"], db)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-
-    authorizer = DomainAuthorizer(db)
-    authorizer.validate_request(request, license_data, api_key=headers["api_key"])
-
-    delete_product(license_data["client_id"], req.product_id)
-    invalidate_client_results(license_data["client_id"])
-
-    return {"deleted": True, "product_id": req.product_id}

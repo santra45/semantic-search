@@ -12,7 +12,7 @@ from google import genai
 from openai import OpenAI
 from groq import Groq
 import anthropic
-from backend.app.services.token_usage_service import track_usage
+from backend.app.services import usage_service
 from backend.app.utils.llm_logger import log_llm_interaction
 
 # ---------------------------
@@ -654,22 +654,46 @@ def llm_rerank_content(
             },
         )
 
-        # Track token usage
+        # Track token usage.
+        #
+        # The tenant comes from the request context, not from `client_id`: this
+        # function is handed a bare client_id, which cannot name the site,
+        # subscription and product a usage_events row requires. track() reads
+        # what the auth chokepoint bound for the request and opens its own
+        # short-lived session, so this call site keeps its signature.
+        #
+        # kind is 'serve' — all three callers (the Magento chatbot's
+        # _llm_rerank, /magento/search and /search) rerank while a shopper
+        # waits. Nothing reranks during a catalogue sync.
+        #
+        # billable stays False: a rerank is one step of a turn and is skipped
+        # entirely on an LRU cache hit, so it is neither exactly-once nor
+        # terminal. The answer endpoint carries the turn's single billable row.
+        #
+        # The call_type is still the hard-coded 'product_rerank' this function
+        # has always written, even though it lives in llm_rerank_content() and
+        # reranks CMS content as readily as products. Renaming it here would
+        # split one metric across two labels halfway through the migration and
+        # make every historical comparison wrong; 'content_rerank' exists in
+        # v1's vocabulary and nothing has ever written it. Fix the label as its
+        # own change, with the dashboard, not as a side effect of this one.
         try:
-            track_usage(
-                client_id=client_id,
-                query_type="product_rerank",
-                llm_provider=provider,
-                llm_model=model,
-                input_tokens=usage["input"],
-                output_tokens=usage["output"],
-                input_cost=usage["input"] * MODEL_PRICING.get(model, {}).get("input", 0),
-                output_cost=usage["output"] * MODEL_PRICING.get(model, {}).get("output", 0),
-                request_text_length=len(prompt),
-                response_text_length=len(response_text)
+            usage_service.track(
+                "product_rerank",
+                provider,
+                model,
+                usage["input"],
+                usage["output"],
+                usage["input"] * MODEL_PRICING.get(model, {}).get("input", 0),
+                usage["output"] * MODEL_PRICING.get(model, {}).get("output", 0),
+                usage_service.KIND_SERVE,
             )
         except Exception as e:
-            logger.warning(f"⚠️ Failed to track token usage: {e}")
+            logger.warning(
+                "usage not recorded for product_rerank (client=%s %s/%s "
+                "tokens in=%s out=%s): %s",
+                client_id, provider, model, usage["input"], usage["output"], e,
+            )
 
         # ---------------------------
         # Parse & Return

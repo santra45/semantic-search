@@ -31,13 +31,14 @@ from backend.app.services.embedding_key_service import (
     resolve_embedding_model,
 )
 from backend.app.services.license_service import increment_ingest_count
+from backend.app.services import tenancy_service
 from backend.app.services.qdrant_service import (
     CHUNKABLE_CONTENT_TYPES,
+    KNOWN_CONTENT_TYPES,
     delete_by_content_type,
     delete_client_collection,
     delete_content_item,
     get_client_content_counts,
-    get_client_product_count,
     upsert_chunked_content_item,
     upsert_content_item,
 )
@@ -292,16 +293,31 @@ def sync_batch(
         encrypted_creds_header=x_magento_creds,
     )
 
-    # Quota check against the *product* limit — non-product content is free.
-    incoming_products = sum(1 for it in req.items if it.content_type == "product")
-    if incoming_products:
-        current = get_client_product_count(license_data["client_id"], license_data["domain"])
-        if current + incoming_products > license_data["product_limit"]:
+    # Baseline for the catalogue counter, taken BEFORE anything is written and
+    # over only the types this batch touches. apply_index_delta() recounts the
+    # same set afterwards and moves sites.indexed_items by the difference, so a
+    # re-sync of an unchanged catalogue moves it by zero.
+    _touched_types = {it.content_type for it in req.items}
+    _index_baseline = tenancy_service.index_baseline(license_data, _touched_types)
+
+    # Ceiling check over EVERY entity this batch carries, not products alone.
+    # "Non-product content is free" was this endpoint's rule and it is no longer
+    # the product's: catalogue_limit is a ceiling in logical entities, and
+    # sites.indexed_items now counts them all. Stores that were inside the old
+    # products-only reading and outside this one were grandfathered onto a
+    # bigger rung by scripts/backfill_indexed_items.py rather than refused.
+    if req.items:
+        _ok, _current, _limit = tenancy_service.check_catalogue_headroom(
+            db, license_data, len(req.items)
+        )
+        if not _ok:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Product limit exceeded. Current: {current}, Incoming: {incoming_products}, "
-                    f"Limit: {license_data['product_limit']}"
+                    f"Catalogue limit reached. This store holds {_current:,} of "
+                    f"{_limit:,} indexed items and this batch adds "
+                    f"{len(req.items):,}. Remove content you no longer need, or "
+                    f"move to a larger plan."
                 ),
             )
 
@@ -443,6 +459,8 @@ def sync_batch(
         except Exception:
             pass
 
+    tenancy_service.apply_index_delta(db, license_data, _touched_types, _index_baseline)
+
     if success_by_type.get("product"):
         increment_ingest_count(db, license_data["client_id"], count=success_by_type["product"])
 
@@ -477,6 +495,9 @@ def sync_delete(
         request_license=req.license_key,
     )
 
+    _touched_types = {it.content_type for it in req.items} & set(SUPPORTED_TYPES)
+    _index_baseline = tenancy_service.index_baseline(license_data, _touched_types)
+
     deleted = 0
     for item in req.items:
         if item.content_type not in SUPPORTED_TYPES:
@@ -492,6 +513,8 @@ def sync_delete(
             deleted += 1
         except Exception:
             pass
+
+    tenancy_service.apply_index_delta(db, license_data, _touched_types, _index_baseline)
 
     try:
         invalidate_client_results(license_data["client_id"])
@@ -583,6 +606,8 @@ def sync_purge_content_type(
             ),
         }
 
+    _index_baseline = tenancy_service.index_baseline(license_data, {content_type})
+
     try:
         deleted = delete_by_content_type(
             client_id=license_data["client_id"],
@@ -604,6 +629,8 @@ def sync_purge_content_type(
         invalidate_client_results(license_data["client_id"])
     except Exception:
         pass
+
+    tenancy_service.apply_index_delta(db, license_data, {content_type}, _index_baseline)
 
     scope_note = f" (store_code={req.store_code})" if req.store_code else ""
     return {
@@ -635,6 +662,12 @@ def sync_purge_collection(
         request_license=None,
     )
 
+    # Baseline over EVERY type: this drops the whole collection, so the delta
+    # is the store's entire entity count going to zero. Nothing narrower would
+    # do — a per-type baseline would leave the counter holding the types this
+    # request did not happen to name.
+    _index_baseline = tenancy_service.index_baseline(license_data, KNOWN_CONTENT_TYPES)
+
     try:
         dropped = delete_client_collection(
             client_id=license_data["client_id"],
@@ -647,6 +680,10 @@ def sync_purge_collection(
             "dropped": False,
             "message": f"Collection drop failed: {exc}",
         }
+
+    tenancy_service.apply_index_delta(
+        db, license_data, KNOWN_CONTENT_TYPES, _index_baseline
+    )
 
     try:
         invalidate_client_results(license_data["client_id"])

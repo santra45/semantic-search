@@ -26,10 +26,15 @@ PLAN_LIMITS = {
     }
 }
 
-# The onboarding page advertises these same numbers from catalog.PLANS. Check at
-# import time that the two agree, so the process refuses to start rather than
-# quietly selling a 5,000-product plan and issuing a 500-product key.
-catalog.assert_plans_match(PLAN_LIMITS)
+# PLAN_LIMITS above is v1's single ladder and is now frozen: it feeds only the
+# JWT path in this module, which the v2 schema replaces. It is deliberately no
+# longer cross-checked against catalog, because there is nothing left to check
+# it against - catalog.PLANS split into INDEX_PLANS (per site) and MODULE_PLANS
+# (per subscription), and neither is the shape assert_plans_match compared.
+#
+# Nothing new should read these numbers. New allowances come from
+# catalog.catalogue_limit_for() and catalog.request_limit_for(), which the v2
+# services already use.
 
 
 # ─── Generate ──────────────────────────────────────────────────────────────────
@@ -220,21 +225,30 @@ def validate_license_key(token: str, db: Session) -> dict:
 
 # ─── Usage Tracking ────────────────────────────────────────────────────────────
 
+# v1's per-client counters. The v2 migration renamed `usage_logs` to
+# `usage_logs_archive_v1`, so every statement here was raising 1146 and taking
+# two live endpoints (/api/dashboard/stats and /api/magento/search) to HTTP 500
+# with it.
+#
+# The WRITES are retired rather than repointed. usage_counters, written by
+# usage_service.record(), is the v2 replacement and is keyed per SUBSCRIPTION
+# rather than per client - which is the whole point, since v1's counter was
+# incremented by two endpoints out of fifteen and therefore metered AI Search
+# traffic and nothing else. Writing into a frozen archive would corrupt the one
+# historical record we kept.
+#
+# The READS point at the archive, so a dashboard still shows the history it
+# always showed rather than dropping to a zero it would present as a
+# measurement.
+
+
 def increment_search_count(db: Session, client_id: str):
-    """Increment search count for current month."""
-    month = datetime.utcnow().strftime("%Y-%m")
+    """Retired. v2 counts billable requests in usage_counters.
 
-    db.execute(text("""
-        INSERT INTO usage_logs (id, client_id, month, search_count)
-        VALUES (:id, :client_id, :month, 1)
-        ON DUPLICATE KEY UPDATE search_count = search_count + 1
-    """), {
-        "id":        str(uuid.uuid4()),
-        "client_id": client_id,
-        "month":     month
-    })
-
-    db.commit()
+    Kept as a no-op because eleven call sites still reach it and deleting the
+    function would turn a dead counter into eleven import errors.
+    """
+    return None
 
 
 def get_monthly_usage(db: Session, client_id: str) -> dict:
@@ -243,7 +257,7 @@ def get_monthly_usage(db: Session, client_id: str) -> dict:
 
     result = db.execute(text("""
         SELECT search_count, ingest_count
-        FROM usage_logs
+        FROM usage_logs_archive_v1
         WHERE client_id = :client_id AND month = :month
     """), {"client_id": client_id, "month": month}).fetchone()
 
@@ -309,6 +323,69 @@ def log_search(
 
 def get_client_license(db: Session, client_id: str) -> dict:
     """
+    DEPRECATED. Cannot be ported to the v2 schema. Do not add callers.
+
+    WHY IT CANNOT SURVIVE
+    ---------------------
+    This is the only function in the tree that reads a customer's PLAINTEXT
+    licence key back out of the database (`lk.license_key`), and the field it
+    returns it in is load-bearing rather than incidental: `llm_key_service.
+    decrypt_key` derives its AES key as sha256(license_key), so the licence key
+    is the key-encryption key for every merchant-supplied LLM and embedding key
+    on that store. webhooks.py feeds `license_data["license_key"]` straight
+    into `resolve_embedding_key`, and that is the only reason it calls this at
+    all.
+
+    schema_v2 stores `licences.key_hash` — a SHA-256 hex digest — and has no
+    plaintext column anywhere. A hash cannot be un-hashed, so after the
+    migration this SELECT has nothing left to select. There is no version of
+    this function that works against v2; it is not a rewrite, it is a removal.
+
+    WHAT REPLACED IT
+    ----------------
+    The push method ai-product-qa-woo already uses. Its plugin hooks
+    WordPress actions directly (`woocommerce_update_product`,
+    `woocommerce_delete_product`, `save_post_page`, ...), defers the work to a
+    scheduled single event, and calls the API itself with
+    `Authorization: Bearer <license_key>` on every request — see
+    AIPQA_API_Client::build_headers() in ai-product-qa-woo/includes/
+    class-api-client.php. The plaintext key is therefore always in scope FROM
+    THE REQUEST, so the KEK is available without any database lookup and the
+    server never needs to be able to read a key back.
+
+    semantic-search-woo is being switched to the same shape, which removes the
+    last two callers. docs/webhook-migration.md is the plan, file by file.
+
+    THE OTHER HALF: IT IS ALSO WRONG UNDER PER-PRODUCT LICENSING
+    ------------------------------------------------------------
+    Even a caller that only wants the domain or the limits — never the key —
+    must not be moved onto this. `ORDER BY lk.expires_at DESC LIMIT 1` assumes
+    one active licence per client. v2 makes that false by design: a client
+    holds one subscription per module per site, each with its own licence, so
+    "the newest one" is an arbitrary pick between two products that may sit on
+    different plans with different quotas. It also folds every liveness gate
+    into the WHERE clause, which collapses five distinct denial reasons into
+    "no row" — the exact failure licensing_service's docstring calls out, where
+    a deactivated site, a lapsed subscription and a key from the wrong store
+    are indistinguishable to support.
+
+    The v2 answer to "who is this caller" is
+    `licensing_service.resolve_key(db, presented_key)`: it takes the key the
+    caller actually presented, hashes it, and returns client_id, site_id,
+    subscription_id, collection_name and both limits from their own levels,
+    with a separate log line per denial reason.
+
+    CALLERS AS OF 2026-08-27 (both die with webhooks.py)
+    ---------------------------------------------------
+      * backend/app/routers/webhooks.py:20   import
+      * backend/app/routers/webhooks.py      process_upsert() — for the KEK
+      * backend/app/routers/webhooks.py      product_deleted() — for the domain
+
+    Nothing else in the backend imports it. The same two live on the deployed
+    checkout at C:/xampp/htdocs/semantic-search. Prose references (not
+    callers): ADMIN_CONSOLE_PLAN.md:162, licensing_service.py's docstring, and
+    the migration report in scripts/migrate_v2_schema.py.
+
     Get active license data for a client by client_id.
     Raises ValueError if no active license found.
     """
@@ -346,18 +423,5 @@ def get_client_license(db: Session, client_id: str) -> dict:
 # ─── Ingest Logging ────────────────────────────────────────────────────────────
 
 def increment_ingest_count(db: Session, client_id: str, count: int = 1):
-    """Increment ingest count for current month."""
-    month = datetime.utcnow().strftime("%Y-%m")
-
-    db.execute(text("""
-        INSERT INTO usage_logs (id, client_id, month, ingest_count)
-        VALUES (:id, :client_id, :month, :count)
-        ON DUPLICATE KEY UPDATE ingest_count = ingest_count + :count
-    """), {
-        "id":        str(uuid.uuid4()),
-        "client_id": client_id,
-        "month":     month,
-        "count":     count
-    })
-
-    db.commit()
+    """Retired alongside increment_search_count - see the note above it."""
+    return None
