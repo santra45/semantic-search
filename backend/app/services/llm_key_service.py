@@ -134,8 +134,10 @@ def licence_for_log(license_key: Optional[str]) -> str:
 
     parsed = license_key_format.parse_for_logging(license_key)
     if parsed:
-        # display_prefix is issuer_env_product_first4 — the same string stored
-        # in licences.key_prefix precisely because it is safe to display.
+        # display_prefix is issuer_env_product_first4 — the same shape
+        # license_key.prefix_of() derives, and safe to display. Note the
+        # database now stores the WHOLE key in licences.licence_key; this line
+        # must keep going through the parser and never read that column.
         shape = f"v2 {parsed['display_prefix']}"
     elif license_key.strip().startswith(_JWT_PREFIX):
         # No part of a JWT goes in the line. The whole token is the credential,

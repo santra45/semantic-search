@@ -36,8 +36,11 @@ templates = Jinja2Templates(directory="backend/app/templates")
 
 class SignupResponse(BaseModel):
     success: bool
-    # None on the repeat path: only the hash is stored, so a key already issued
-    # cannot be shown again. key_prefix is what identifies it instead.
+    # Populated on the repeat path too, since 2026-09-03 — the plaintext is
+    # stored now, so a returning customer gets the key they already have back
+    # instead of a rotation they did not ask for. Still None for a licence
+    # minted before that date, whose plaintext was never kept; key_prefix
+    # identifies it in that case.
     license_key: Optional[str] = None
     key_prefix: Optional[str] = None
     client_id: Optional[str] = None
@@ -280,7 +283,12 @@ async def signup_client(
         )
 
         if live:
-            license_key = None
+            # Hand back the existing key rather than None. This is the whole
+            # reason the plaintext is stored: the repeat path used to be a dead
+            # end that told a customer their key existed and refused to show it.
+            # Still None for a pre-2026-09-03 licence — those cannot be
+            # recovered and the only fix for one is a rotation.
+            license_key = live["key"]
             key_prefix = live["key_prefix"]
             reissued = True
         else:

@@ -125,9 +125,11 @@ def _checksum(body: str) -> str:
 def mint(environment: str, product_segment: str) -> dict:
     """Create a new licence key.
 
-    Returns the plaintext key, the hash to store, and the displayable prefix.
-    The plaintext is returned exactly once and is never persisted — see
-    hash_key() for why.
+    Returns the plaintext key, the hash to look it up by, and the displayable
+    prefix. Since 2026-09-03 the plaintext IS persisted, in `licences.licence_key`
+    — see the note above LICENCES_TABLE in schema_v2.py for the trade that was
+    made and what it costs. `key_hash` is still what resolution matches on, so
+    nothing on the hot path changed.
     """
     if environment not in ENVIRONMENTS:
         raise ValueError(
@@ -150,6 +152,31 @@ def mint(environment: str, product_segment: str) -> dict:
             (ISSUER, environment, product_segment, secret[:PREFIX_SECRET_CHARS])
         ),
     }
+
+
+def prefix_of(key: Optional[str]) -> Optional[str]:
+    """The displayable head of a stored key: `czg_live_mchat_7Kq2`.
+
+    Exists because the database now holds the whole key (see mint()). Every log
+    line and list view that used to read a `key_prefix` COLUMN must run the
+    plaintext through here instead — otherwise the change from storing a prefix
+    to storing a key silently turns every one of those call sites into a
+    credential dump, and log files are the one place a leaked key is least
+    likely to be noticed and most likely to be shipped somewhere else.
+
+    Truncates rather than parsing: a malformed or legacy value still yields
+    something safe to print, which a parse would not.
+    """
+    if not key:
+        return None
+    parts = key.split(SEPARATOR)
+    if len(parts) < 4:
+        # Not our format. Show enough to correlate, never enough to use.
+        return key[:12] + "…"
+    issuer, environment, product_segment, secret = parts[0], parts[1], parts[2], parts[3]
+    return SEPARATOR.join(
+        (issuer, environment, product_segment, secret[:PREFIX_SECRET_CHARS])
+    )
 
 
 # ── Hashing ──────────────────────────────────────────────────────────────────
@@ -236,8 +263,10 @@ def parse_for_logging(key: str) -> Optional[dict]:
         "unverified_environment": environment,
         "unverified_product": product_segment,
         "unverified_checksum_ok": secrets.compare_digest(checksum, _checksum(body)),
-        # Safe to log and to show: no part of the secret beyond the same few
-        # characters already stored as key_prefix.
+        # Safe to log and to show: PREFIX_SECRET_CHARS of the secret and no
+        # more — the same cut prefix_of() makes. Identical output, different
+        # input: this one parses a presented key, prefix_of() truncates a stored
+        # one without trusting its shape.
         "display_prefix": SEPARATOR.join(
             (issuer, environment, product_segment, secret[:PREFIX_SECRET_CHARS])
         ),

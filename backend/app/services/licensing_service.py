@@ -1068,15 +1068,18 @@ def issue_licence(
     db.execute(
         text("""
             INSERT INTO licences
-                (id, subscription_id, key_hash, key_prefix, is_active, expires_at)
+                (id, subscription_id, key_hash, licence_key, is_active, expires_at)
             VALUES
-                (:id, :subscription_id, :key_hash, :key_prefix, 1, :expires_at)
+                (:id, :subscription_id, :key_hash, :licence_key, 1, :expires_at)
         """),
         {
             "id": licence_id,
             "subscription_id": subscription_id,
             "key_hash": minted["key_hash"],
-            "key_prefix": minted["key_prefix"],
+            # The plaintext, stored on purpose since 2026-09-03 so a key can be
+            # shown again without rotating a working install. See the note above
+            # LICENCES_TABLE for what that costs.
+            "licence_key": minted["key"],
             "expires_at": expires_at,
         },
     )
@@ -1135,7 +1138,7 @@ def revoke_licence(db: Session, licence_id: str) -> dict:
     """
     row = db.execute(
         text("""
-            SELECT id, subscription_id, key_hash, key_prefix, is_active, revoked_at
+            SELECT id, subscription_id, key_hash, licence_key, is_active, revoked_at
             FROM licences
             WHERE id = :id
         """),
@@ -1156,12 +1159,17 @@ def revoke_licence(db: Session, licence_id: str) -> dict:
             {"id": licence_id, "now": _utcnow()},
         )
         db.commit()
-        logger.info("licence %s revoked (prefix %s)", licence_id, row.key_prefix)
+        # prefix_of(), never the raw column: this table holds plaintext now and
+        # a revocation is exactly the moment nobody wants the dead key printed.
+        logger.info(
+            "licence %s revoked (prefix %s)",
+            licence_id, license_key.prefix_of(row.licence_key),
+        )
 
     return {
         "id": row.id,
         "subscription_id": row.subscription_id,
-        "key_prefix": row.key_prefix,
+        "key_prefix": license_key.prefix_of(row.licence_key),
         "already_revoked": already_revoked,
         # Singular list, under the same name every other mutator here uses.
         # Three different shapes for "things to evict" is how one of them gets
@@ -1174,13 +1182,20 @@ def revoke_licence(db: Session, licence_id: str) -> dict:
 def list_licences(db: Session, subscription_id: str) -> list[dict]:
     """Every licence ever issued for a subscription, newest first.
 
-    Prefixes only — there is no plaintext to list. This exists because
-    revoke_licence() takes a licence id and nothing else in the system hands one
-    out, so without it the operator console has no way to reach a specific key.
+    This exists because revoke_licence() takes a licence id and nothing else in
+    the system hands one out, so without it the operator console has no way to
+    reach a specific key.
+
+    RETURNS PLAINTEXT KEYS in `key` since 2026-09-03 — that is the point of the
+    column, and it is why nothing may render this straight to a merchant. `key`
+    is None for the seven pre-2026-09-03 licences, whose plaintext was never
+    stored; `key_prefix` is always populated and is what a list view should
+    show. A caller that wants a safe listing should read `key_prefix` and ignore
+    `key` rather than assume this function redacts anything.
     """
     rows = db.execute(
         text("""
-            SELECT id, key_prefix, is_active, issued_at, expires_at, revoked_at
+            SELECT id, licence_key, is_active, issued_at, expires_at, revoked_at
             FROM licences
             WHERE subscription_id = :subscription_id
             ORDER BY issued_at DESC, id DESC
@@ -1191,7 +1206,8 @@ def list_licences(db: Session, subscription_id: str) -> list[dict]:
     return [
         {
             "id": row.id,
-            "key_prefix": row.key_prefix,
+            "key": row.licence_key,
+            "key_prefix": license_key.prefix_of(row.licence_key),
             "is_active": bool(row.is_active),
             "issued_at": _iso(row.issued_at),
             "expires_at": _iso(row.expires_at),
@@ -1260,7 +1276,12 @@ def _context_from_row(row) -> dict:
 
         # ── Provenance
         "client_name": row.client_name,
-        "key_prefix": row.key_prefix,
+        # DERIVED, not the stored column. The context is cached in Redis, logged
+        # by auth_cache's fingerprinter, and stamped onto usage rows — putting a
+        # usable key in it would spread the plaintext to three more places that
+        # have no business holding one. The field keeps its name so nothing
+        # downstream (auth_cache's required-field tuples included) has to change.
+        "key_prefix": license_key.prefix_of(row.licence_key),
         # Lets the cache layer name its own entry without re-hashing, and lets
         # any caller invalidate the context it is holding.
         "key_hash": row.key_hash,
@@ -1351,7 +1372,7 @@ def resolve_key(db: Session, presented_key: str) -> Optional[dict]:
             SELECT
                 l.id               AS licence_id,
                 l.key_hash         AS key_hash,
-                l.key_prefix       AS key_prefix,
+                l.licence_key      AS licence_key,
                 l.is_active        AS licence_active,
                 l.revoked_at       AS revoked_at,
                 l.expires_at       AS licence_expires_at,

@@ -267,7 +267,7 @@ _STORE_SUBSCRIPTIONS_SQL = text("""
     SELECT
         NULL               AS licence_id,
         NULL               AS key_hash,
-        NULL               AS key_prefix,
+        NULL               AS licence_key,
         NULL               AS licence_expires_at,
 
         s.id               AS subscription_id,

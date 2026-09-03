@@ -280,24 +280,53 @@ CREATE TABLE `subscriptions` (
 
 # ── licences ─────────────────────────────────────────────────────────────────
 #
-# One row per issued key. Stores the SHA-256 hash and a displayable prefix, and
-# never the key itself. v1 stored the whole plaintext JWT in a TEXT column,
-# which made a database dump a handover of every customer's working credential.
+# One row per issued key. Stores the SHA-256 hash AND the plaintext key.
 #
-# Consequence to understand before you touch anything downstream: the plaintext
-# cannot be read back. Anything that used to recover a key from the database -
-# onboarding handing a returning customer their existing key, the WooCommerce
-# webhook path deriving the AES KEK for a merchant's wrapped LLM key - has to
-# be redesigned, not reimplemented. See the migration's report.
+# REVERSED 2026-09-03, deliberately, and the reasoning that argued the other way
+# is kept below because it is still true - it was outweighed, not refuted.
+#
+# The original design stored only `key_hash` plus a short displayable prefix,
+# because v1 had stored the whole plaintext JWT in a TEXT column and that made a
+# database dump a handover of every customer's working credential. That is a
+# real cost and it is now being paid again, knowingly:
+#
+#   * anyone with SELECT on this table has every live key, in usable form
+#   * a mysqldump, a phpMyAdmin session, a leaked backup, or a read-only replica
+#     credential is now a full credential compromise, not an inconvenience
+#   * it cannot be undone for keys already issued - once a plaintext exists in a
+#     backup, deleting the column later does not recall the backups
+#
+# What bought it: a hash is one-way, so NOTHING could ever show a merchant their
+# own key again. Every "resend my licence key" support ticket ended in a
+# rotation, onboarding could not hand a returning customer the key they already
+# had, and the operator console being built now could not display the one field
+# an operator most often needs to read out loud. Rotation-as-the-only-recovery
+# is not a neutral fallback either: it invalidates a working install to answer a
+# question.
+#
+# So the trade is: this table is now a secrets table and must be treated as one.
+# Restrict SELECT, keep it out of dumps that leave the building, and never join
+# it into anything that renders to a merchant.
+#
+# `key_hash` STAYS and remains the only thing resolution matches on. Do not
+# "simplify" by looking up on the plaintext: the hash column is ascii_bin and
+# UNIQUE and is the hottest index in the system, and matching on a VARCHAR with
+# a case-insensitive collation would both slow it down and match keys that are
+# not byte-identical. The plaintext column is for display and recovery, never
+# for authorisation.
+#
+# Anything reading this column for a LOG LINE or a LIST VIEW must pass it
+# through license_key.prefix_of() first. The column swap turns every call site
+# that used to read a safe prefix into a credential dump otherwise.
 
 LICENCES_TABLE = """
 CREATE TABLE `licences` (
   `id`              VARCHAR(36) COLLATE utf8mb4_general_ci NOT NULL,
   `subscription_id` VARCHAR(36) COLLATE utf8mb4_general_ci NOT NULL,
   `key_hash`        CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL
-                    COMMENT 'SHA-256 hex of the presented key, lowercase. The plaintext is never stored.',
-  `key_prefix`      VARCHAR(32) COLLATE utf8mb4_general_ci NOT NULL
-                    COMMENT 'czg_live_mchat_7Kq2 - enough to identify a key in a list, useless for guessing it.',
+                    COMMENT 'SHA-256 hex of the presented key, lowercase. The ONLY thing resolution matches on.',
+  `licence_key`     VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL
+                    COMMENT 'SECRET. The full plaintext key, for display and recovery only - never authorise on it. NULL for the seven keys minted before 2026-09-03, whose plaintext was never kept and cannot be recovered.',
   `is_active`       TINYINT(1) NOT NULL DEFAULT 1,
   `issued_at`       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   -- DATETIME, not TIMESTAMP. See the note above SUBSCRIPTIONS_TABLE: this
