@@ -1,10 +1,13 @@
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.middleware.logging_middleware import APILoggingMiddleware
+from backend.app.services.licence_errors import LicenceDenied
 from backend.app.routers import (
     dashboard,
+    licence_status,
     health,
     magento,
     onboarding,
@@ -50,6 +53,11 @@ app.include_router(health.router,  prefix="/api")
 app.include_router(token_usage.router, prefix="/api")
 app.include_router(magento.router, prefix="/api")
 app.include_router(onboarding.router)
+# Licence heartbeat + chat-quality telemetry. Absolute paths, no prefix.
+# Neither writes a usage_events row: a merchant must not pay for a 15-minute
+# poll telling them their subscription is paused, nor for reporting on
+# themselves. See the note at the top of routers/licence_status.py.
+app.include_router(licence_status.router)
 # Operator analytics + cost console (Phase 4.4 + 4.5). Serves the HTML at
 # /operator (shell only, no data) and gated JSON at /api/operator/* behind
 # the X-Operator-Key header. No prefix — paths are absolute in the router.
@@ -107,6 +115,22 @@ app.include_router(magento_chatbot_agent.router, prefix="/api")
 # (Qdrant, embeddings, licensing, token accounting) is still shared.
 app.include_router(wordpress_productqa_retrieve.router, prefix="/api")
 app.include_router(wordpress_productqa_sync.router, prefix="/api")
+
+# ── Structured licence refusals (ADMIN_CONSOLE_PLAN.md §8.1) ────────────────
+#
+# LicenceDenied is an HTTPException subclass, so without this handler FastAPI's
+# built-in one would render only {"detail": ...} and silently drop error_code,
+# license_status and merchant_message — the fields the client-side kill switch
+# is built on. Registered for the subclass specifically; every other
+# HTTPException keeps FastAPI's default behaviour untouched.
+@app.exception_handler(LicenceDenied)
+async def _licence_denied_handler(request, exc: LicenceDenied):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.body(),
+        headers=exc.headers,
+    )
+
 
 @app.get("/")
 def root():

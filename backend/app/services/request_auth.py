@@ -53,6 +53,8 @@ import os
 from typing import Optional, Union
 
 from fastapi import HTTPException, Request
+
+from backend.app.services import licence_errors
 from sqlalchemy.orm import Session
 
 from backend.app.services import (
@@ -325,24 +327,18 @@ def _assert_product_allowed(
             request.url.path,
             product_code,
         )
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"This license key is for {product_label(str(product_code))} "
-                f"and is not authorised for {request.url.path}."
-            ),
+        raise licence_errors.not_entitled(
+            f"This license key is for {product_label(str(product_code))} "
+            f"and is not authorised for {request.url.path}."
         )
 
     if product_code not in allowed:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"This license key is for {product_label(str(product_code))}, "
-                f"which does not include {request.url.path}. That "
-                "endpoint is served by: "
-                + ", ".join(product_label(code) for code in sorted(allowed))
-                + ". Use the license key issued for that module."
-            ),
+        raise licence_errors.not_entitled(
+            f"This license key is for {product_label(str(product_code))}, "
+            f"which does not include {request.url.path}. That "
+            "endpoint is served by: "
+            + ", ".join(product_label(code) for code in sorted(allowed))
+            + ". Use the license key issued for that module.",
         )
 
 
@@ -381,12 +377,9 @@ def _enforce_search_quota(db: Session, license_data: dict) -> None:
         except Exception:
             return  # fail open — never block on a lookup/DB error
         if not ok:
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Monthly usage limit reached ({used}/{limit}). "
-                    "Please contact the store."
-                ),
+            raise licence_errors.quota_exceeded(
+                f"Monthly usage limit reached ({used}/{limit}). "
+                "Please contact the store."
             )
         return
 
@@ -404,9 +397,8 @@ def _enforce_search_quota(db: Session, license_data: dict) -> None:
         return  # fail open — never block on a lookup/DB error
 
     if not within_quota:
-        raise HTTPException(
-            status_code=429,
-            detail="Monthly usage limit reached. Please contact the store.",
+        raise licence_errors.quota_exceeded(
+            "Monthly usage limit reached. Please contact the store."
         )
 
 
@@ -471,7 +463,10 @@ def authorize_request(
         try:
             license_data = validate_license_key(license_key, db)
         except ValueError as exc:
-            raise HTTPException(status_code=403, detail=str(exc))
+            # str(exc) reproduced verbatim: every shipped plugin renders this
+            # string, and the structured fields ride alongside it rather than
+            # replacing it. See services/licence_errors.py.
+            raise licence_errors.denied_for_key(db, license_key, detail=str(exc))
         license_data["auth_path"] = AUTH_PATH_V1
 
     DomainAuthorizer(db).validate_request(request, license_data, api_key=x_api_key)

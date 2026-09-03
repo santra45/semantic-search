@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from backend.app.services import (
@@ -175,13 +176,45 @@ async def onboarding_page(request: Request):
 
 
 @router.get("/api/onboarding/catalog")
-async def get_catalog():
+async def get_catalog(db: Session = Depends(get_db)):
     """Platforms, their products, and the plan tiers.
 
     The page renders its pickers entirely from this, so adding a product to
     catalog.PRODUCTS puts it on the site with no template change.
+
+    WITHDRAWN PRODUCTS ARE FILTERED OUT HERE, not in catalog.public_catalog().
+    That function is deliberately DB-free — it is the pure authority for what a
+    product IS — while `products.is_sellable` is operator state that lives in
+    the database and changes without a deploy. Reading it here keeps the two
+    apart and puts the query where a session already exists.
+
+    is_sellable means "cannot be BOUGHT", never "cannot be used": existing
+    subscriptions on a withdrawn product keep resolving and keep working, which
+    is the contract stated in schema_v2.py. Nothing on the request chokepoint
+    reads this column and nothing should — wiring it there would break every
+    live subscription on the product the moment it was withdrawn.
     """
-    return catalog.public_catalog()
+    data = catalog.public_catalog()
+    try:
+        withdrawn = {
+            row[0] for row in db.execute(
+                text("SELECT code FROM products WHERE is_sellable = 0")
+            ).fetchall()
+        }
+    except Exception:
+        # Fail OPEN, and this direction is deliberate. Failing closed would
+        # empty the pricing page on a database blip; the worst case here is
+        # that a withdrawn product stays on sale a little longer, which is a
+        # commercial annoyance rather than an outage.
+        logger.exception("onboarding: could not read products.is_sellable; showing all")
+        withdrawn = set()
+
+    if withdrawn:
+        for platform in data.get("platforms", []):
+            platform["products"] = [
+                p for p in platform.get("products", []) if p["code"] not in withdrawn
+            ]
+    return data
 
 
 @router.post("/api/onboarding/signup")
