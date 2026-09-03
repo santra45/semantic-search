@@ -55,6 +55,28 @@ app.include_router(onboarding.router)
 # the X-Operator-Key header. No prefix — paths are absolute in the router.
 app.include_router(operator.router)
 
+# Admin console — real accounts, roles, audit (ADMIN_CONSOLE_PLAN.md §6).
+# Carries its own /api/admin/auth prefix. Runs alongside /operator rather than
+# replacing it; /api/operator/* is retired only once the SPA is live.
+#
+# Imported HERE and not at the top with the rest, inside a try. This package is
+# new, touches no storefront path, and the API must run identically without it —
+# so an ImportError from it has no business taking down uvicorn for every
+# tenant, which at module scope is exactly what it would do. Admin routes go
+# missing (404); merchants notice nothing.
+try:
+    from backend.app.admin import router_auth as admin_router_auth
+
+    app.include_router(admin_router_auth.router)
+except Exception as _admin_exc:  # pragma: no cover
+    import logging
+
+    logging.getLogger(__name__).error(
+        "admin console routes NOT mounted (%s: %s). Storefront traffic is "
+        "unaffected; /api/admin/* will 404 until this is fixed.",
+        type(_admin_exc).__name__, _admin_exc,
+    )
+
 # Magento chatbot backend — now pure retrieval.
 # All routing / agent dispatch happens on the Magento side; this backend only
 # answers three questions: "give me matching products", "give me matching
