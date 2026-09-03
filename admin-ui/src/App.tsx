@@ -11,6 +11,7 @@ import { Tenants } from "./screens/Tenants";
 import { TenantDetail } from "./screens/TenantDetail";
 import { Licences } from "./screens/Licences";
 import { Audit } from "./screens/Audit";
+import { Usage } from "./screens/Usage";
 
 /**
  * The shell. Auth gate first, then providers, then routes.
@@ -49,7 +50,7 @@ export function App() {
                 <Route path="licences/:licenceId" element={<Placeholder title="Licence detail" />} />
                 <Route path="products" element={<Placeholder title="Products" />} />
                 <Route path="plans" element={<Placeholder title="Plans" />} />
-                <Route path="usage" element={<Placeholder title="Usage explorer" />} />
+                <Route path="usage" element={<Usage />} />
                 <Route path="audit" element={<Audit />} />
                 <Route path="system" element={<Placeholder title="System health" />} />
                 {/* The server hands index.html to ANY /admin/* path — it cannot

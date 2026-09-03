@@ -1,0 +1,130 @@
+/* Usage explorer. Prefixed .us-.
+ *
+ * One hue throughout. --signal means MEASURED across this console, and a
+ * categorical palette here would hand that meaning out to six arbitrary
+ * buckets that change every time the dimension does. A single-hue ramp encodes
+ * magnitude instead, which is what the bar is sorted by. */
+
+.us { display: flex; flex-direction: column; gap: 14px; }
+
+/* ── Dimension switcher ──────────────────────────────────────────────────── */
+
+.us-dims {
+  display: flex; gap: 2px; flex-wrap: wrap;
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; padding: 6px;
+}
+.us-dim {
+  width: auto; margin: 0; padding: 7px 13px; border-radius: 6px;
+  background: transparent; border: 1px solid transparent; cursor: pointer;
+  color: var(--ash); font-family: var(--mono); font-size: 11px;
+  letter-spacing: .04em; text-transform: uppercase; font-weight: 500;
+}
+.us-dim:hover { color: var(--ink); }
+.us-dim.is-on { color: var(--ink); background: var(--slate2); border-color: var(--rule); }
+
+.us-body { display: flex; flex-direction: column; gap: 14px; transition: opacity .12s ease; }
+.us-body.is-stale { opacity: .55; }
+
+/* ── Composition ─────────────────────────────────────────────────────────── */
+
+.us-comp {
+  background: linear-gradient(180deg, var(--slate) 0%, var(--void) 100%);
+  border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px 18px;
+}
+.us-comp-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 16px; margin-bottom: 12px; flex-wrap: wrap;
+}
+.us-comp-total {
+  font-family: var(--mono); font-size: 24px; color: var(--signal);
+  letter-spacing: -.02em; line-height: 1;
+}
+
+.us-bar {
+  display: flex; height: 34px; border-radius: 5px; overflow: hidden;
+  background: rgba(255,255,255,.04); gap: 1px;
+}
+.us-seg { background: var(--signal); min-width: 2px; transition: opacity .15s ease; }
+.us-seg:hover { opacity: 1 !important; }
+
+.us-legend {
+  list-style: none; margin: 12px 0 0; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 6px 18px;
+  font-size: 12px; color: var(--ash);
+}
+.us-legend li { display: flex; align-items: center; gap: 7px; }
+.us-legend em {
+  font-family: var(--mono); font-style: normal; color: var(--ink); font-size: 11.5px;
+}
+.us-swatch {
+  width: 9px; height: 9px; border-radius: 2px; background: var(--signal); flex-shrink: 0;
+}
+.us-legend-more { opacity: .7; }
+
+.us-comp.is-empty { padding-bottom: 16px; }
+.us-empty { margin: 10px 0 0; font-size: 13px; color: var(--ash); max-width: 72ch; }
+
+/* ── Table ───────────────────────────────────────────────────────────────── */
+
+.us-table {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; overflow: hidden;
+}
+.us-head, .us-row, .us-total {
+  display: grid;
+  grid-template-columns:
+    minmax(150px, 2fr) 110px 70px 92px 100px 110px 100px;
+  gap: 12px; align-items: center; padding: 0 16px;
+}
+.us-head { padding-top: 11px; padding-bottom: 11px; border-bottom: 1px solid var(--rule); }
+.us-head .eyebrow { font-size: 9.5px; }
+
+.us-row {
+  min-height: 42px; border-bottom: 1px solid var(--rule); position: relative;
+}
+.us-row:last-of-type { border-bottom: 0; }
+.us-row:hover { background: var(--slate2); }
+
+/* The share bar sits BEHIND the label. In its own column it would compete with
+   the numbers; behind the name it reads as context for the row. */
+.us-name { position: relative; min-width: 0; padding: 8px 0; }
+.us-rowbar {
+  position: absolute; left: -16px; top: 0; bottom: 0;
+  background: rgba(94,234,212,.10); border-right: 1px solid rgba(94,234,212,.28);
+  pointer-events: none;
+}
+.us-name-text {
+  position: relative; font-size: 12.5px; color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block;
+}
+
+.us-num { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+.us-dim-text { color: var(--ash); }
+.us-r { text-align: right; }
+
+.us-total {
+  padding-top: 11px; padding-bottom: 11px;
+  border-top: 1px solid var(--rule); background: var(--void);
+  font-family: var(--mono); font-size: 11px;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--ash);
+}
+.us-total .us-num { text-transform: none; letter-spacing: 0; font-size: 12.5px; }
+
+@media (max-width: 1150px) {
+  .us-head, .us-row, .us-total { grid-template-columns: minmax(140px,2fr) 100px 64px 84px 92px 96px; }
+  /* Tokens go first: the most granular column and the least often the reason
+     somebody opened this screen. */
+  .us-head > :nth-child(6), .us-row > :nth-child(6), .us-total > :nth-child(6) { display: none; }
+}
+@media (max-width: 860px) {
+  .us-head { display: none; }
+  .us-row, .us-total {
+    grid-template-columns: 1fr auto; gap: 4px 12px; padding: 10px 16px;
+  }
+  .us-row > .us-num, .us-total > .us-num { text-align: right; }
+  .us-rowbar { left: -16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .us-body, .us-seg { transition: none; }
+}

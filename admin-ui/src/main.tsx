@@ -9,6 +9,7 @@ import "./tenant-detail.css";
 import "./confirm.css";
 import "./licences.css";
 import "./audit.css";
+import "./usage.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {
