@@ -12,6 +12,7 @@ import { TenantDetail } from "./screens/TenantDetail";
 import { Licences } from "./screens/Licences";
 import { Audit } from "./screens/Audit";
 import { Usage } from "./screens/Usage";
+import { LicenceDetail } from "./screens/LicenceDetail";
 
 /**
  * The shell. Auth gate first, then providers, then routes.
@@ -47,7 +48,7 @@ export function App() {
                 <Route path="tenants/:clientId" element={<TenantDetail />} />
                 <Route path="sites/:siteId" element={<Placeholder title="Site detail" />} />
                 <Route path="licences" element={<Licences />} />
-                <Route path="licences/:licenceId" element={<Placeholder title="Licence detail" />} />
+                <Route path="licences/:licenceId" element={<LicenceDetail />} />
                 <Route path="products" element={<Placeholder title="Products" />} />
                 <Route path="plans" element={<Placeholder title="Plans" />} />
                 <Route path="usage" element={<Usage />} />

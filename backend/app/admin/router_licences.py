@@ -166,14 +166,26 @@ def licence_detail(
     if not row:
         raise HTTPException(status_code=404, detail="No such licence.")
 
-    # The timeline survives the licence row: issue_licence() DELETEs the licence
-    # it rotates out, so for a rotated key this is the only remaining record
-    # that it ever existed. Queried by licence_id, which is deliberately not a
-    # foreign key for exactly that reason.
-    events = q.rows(db, """
-        SELECT id, event, detail, key_prefix, actor_email, created_at
-        FROM licence_events WHERE licence_id = :id ORDER BY created_at DESC, id DESC
-    """, {"id": licence_id})
+    # THE WHOLE CHAIN, BY SUBSCRIPTION — not just this licence.
+    #
+    # issue_licence() DELETEs the licence it rotates out, so a superseded key's
+    # own events are keyed to a licence_id with no row behind it. Querying by
+    # licence_id alone would therefore show a "rotated" event with no trace of
+    # what it replaced, and the predecessor's history would exist in the table
+    # while being unreachable from every page in the console.
+    #
+    # subscription_id survives all of that, which is why the column is there.
+    # `is_this_licence` marks which rows belong to the key being viewed so the
+    # UI can show the chain without pretending it is all one key.
+    events = [
+        {**e, "is_this_licence": e["licence_id"] == licence_id}
+        for e in q.rows(db, """
+            SELECT id, licence_id, event, detail, key_prefix, actor_email, created_at
+            FROM licence_events
+            WHERE subscription_id = :sid
+            ORDER BY created_at DESC, id DESC
+        """, {"sid": row["subscription_id"]})
+    ]
 
     usage = q.one(db, f"""
         SELECT {q.BILLABLE_REQUESTS} AS requests,
@@ -206,7 +218,10 @@ def licence_detail(
         "events": [
             {"id": e["id"], "event": e["event"], "detail": e["detail"],
              "key_prefix": e["key_prefix"], "actor_email": e["actor_email"],
-             "created_at": q.iso(e["created_at"])}
+             "created_at": q.iso(e["created_at"]),
+             # False means this event describes a key that this subscription
+             # used to hold — usually one that no longer exists as a row.
+             "is_this_licence": e["is_this_licence"]}
             for e in events
         ],
         # Attributed to the SUBSCRIPTION, and the label says so. usage_events

@@ -1,0 +1,136 @@
+/* Licence detail. Prefixed .ld-.
+ *
+ * The timeline gets the space and the fields get a strip, because the question
+ * this page answers — "why did this key stop working" — lives in the history,
+ * not in seven columns. */
+
+.ld { display: flex; flex-direction: column; gap: 14px; }
+
+.ld-crumb {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--mono); font-size: 11px; color: var(--ash);
+}
+.ld-crumb .mono { font-family: var(--mono); color: var(--ink); }
+.ld-crumb span[aria-hidden] { opacity: .4; }
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+
+.ld-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 20px; flex-wrap: wrap;
+  background: linear-gradient(180deg, var(--slate) 0%, var(--void) 100%);
+  border: 1px solid var(--rule); border-radius: 10px; padding: 18px 20px;
+}
+.ld-head.is-dead { opacity: .68; border-color: rgba(242,109,109,.28); }
+
+/* The prefix is the identity of the page and gets the type to match. */
+.ld-prefix {
+  font-family: var(--mono); font-size: 20px; font-weight: 500;
+  margin: 0; color: var(--ink); letter-spacing: -.01em; word-break: break-all;
+}
+.ld-where {
+  margin: 6px 0 0; font-size: 12.5px; color: var(--ash);
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.ld-where a { color: var(--ash); }
+.ld-where a:hover { color: var(--signal); }
+.ld-head-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ── Fact strip ──────────────────────────────────────────────────────────── */
+
+.ld-facts {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px; background: var(--rule); margin: 0;
+  border: 1px solid var(--rule); border-radius: 10px; overflow: hidden;
+}
+.ld-fact { background: var(--slate); padding: 12px 15px; }
+.ld-fact dt { margin: 0; }
+.ld-fact dd {
+  margin: 5px 0 0; font-family: var(--mono); font-size: 13px; color: var(--ink);
+}
+.ld-fact dd span {
+  display: block; font-size: 10.5px; color: var(--ash); margin-top: 4px;
+}
+.ld-fact.is-absent dd { color: #4A5162; }
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+
+.ld-split {
+  display: grid; gap: 14px;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+}
+@media (max-width: 950px) { .ld-split { grid-template-columns: 1fr; } }
+
+.ld-side { display: flex; flex-direction: column; gap: 14px; }
+
+.ld-card {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; padding: 15px 16px;
+}
+.ld-note {
+  margin: 8px 0 0; font-size: 12px; color: var(--ash); max-width: 70ch;
+}
+.ld-sub-name { margin: 8px 0 10px; font-size: 13.5px; color: var(--ink); }
+
+.ld-kv { list-style: none; margin: 10px 0 0; padding: 0; }
+.ld-kv li {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 6px 0; border-bottom: 1px solid var(--rule);
+  font-size: 12px; color: var(--ash);
+}
+.ld-kv li:last-child { border-bottom: 0; }
+.ld-kv em {
+  font-family: var(--mono); font-style: normal; color: var(--ink); text-align: right;
+}
+.ld-kv em i { font-style: normal; color: var(--ember); font-size: 10.5px; margin-left: 6px; }
+
+.ld-reason {
+  margin: 12px 0 0; padding: 10px 12px; border-radius: 7px;
+  background: var(--void); border: 1px solid var(--rule);
+  font-size: 12.5px; color: var(--ink);
+}
+.ld-reason .eyebrow { display: block; margin-bottom: 5px; }
+
+/* ── Timeline ────────────────────────────────────────────────────────────── */
+
+.ld-timeline-card { padding-bottom: 6px; }
+.ld-timeline { list-style: none; margin: 16px 0 0; padding: 0; }
+
+.ld-ev {
+  display: grid; grid-template-columns: 16px 1fr; gap: 12px;
+  padding-bottom: 16px; position: relative;
+}
+/* The connecting rail, drawn on every entry but the last. */
+.ld-ev:not(:last-child)::before {
+  content: ""; position: absolute; left: 7px; top: 14px; bottom: 0;
+  width: 1px; background: var(--rule);
+}
+.ld-ev-dot {
+  width: 7px; height: 7px; border-radius: 50%; margin-top: 5px;
+  justify-self: center; background: #39404F; position: relative; z-index: 1;
+}
+/* Only THIS key's events are lit. The chain is context; the key you opened is
+   the subject, and the difference should not need reading to see. */
+.ld-ev.is-this .ld-ev-dot {
+  background: var(--signal); box-shadow: 0 0 0 3px rgba(94,234,212,.14);
+}
+.ld-ev:not(.is-this) { opacity: .72; }
+
+.ld-ev-top {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.ld-ev-word { font-size: 13px; color: var(--ink); }
+.ld-ev-key { font-family: var(--mono); font-size: 11px; color: var(--ash); }
+.ld-ev-time {
+  margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--ash);
+}
+.ld-ev-detail { margin: 5px 0 0; font-size: 12px; color: var(--ash); }
+.ld-ev-actor {
+  margin: 4px 0 0; font-family: var(--mono); font-size: 10.5px; color: var(--ash);
+}
+.ld-ev-actor.is-system { opacity: .6; font-style: italic; }
+
+@media (max-width: 700px) {
+  .ld-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ld-ev-time { margin-left: 0; width: 100%; }
+}
