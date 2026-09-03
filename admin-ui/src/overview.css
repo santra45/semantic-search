@@ -1,0 +1,214 @@
+/* Overview screen.
+ *
+ * Everything is prefixed .ov- so it cannot collide with the shell's classes —
+ * a .panel here and a .panel there is how two stylesheets quietly cancel each
+ * other's padding.
+ *
+ * TYPE: mono-forward. Labels, numerals, eyebrows and data are mono with tight
+ * tracking; system sans is reserved for prose. That inverts the usual
+ * sans-for-chrome / mono-for-code split on purpose — an instrument panel is
+ * labelled in mono, and it costs nothing, which matters because the no-CDN rule
+ * rules out webfonts.
+ *
+ * LIGHT: the page is deliberately dim. Luminance appears only where there is
+ * signal, so a mostly-dark screen is not a style choice, it is the reading.
+ */
+
+.ov { display: flex; flex-direction: column; gap: 14px; }
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ash);
+}
+
+/* ── Signature: telemetry coverage strip ─────────────────────────────────── */
+
+.ov-strip {
+  background: linear-gradient(180deg, var(--slate) 0%, var(--void) 100%);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 16px 18px 18px;
+}
+.ov-strip-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 16px; margin-bottom: 12px; flex-wrap: wrap;
+}
+.ov-strip-count { font-family: var(--mono); display: flex; align-items: baseline; gap: 8px; }
+.ov-strip-count strong {
+  font-size: 30px; font-weight: 500; color: var(--signal);
+  line-height: 1; letter-spacing: -.02em;
+}
+.ov-strip-of { font-size: 13px; color: var(--ash); }
+.ov-strip-word { font-size: 11px; color: var(--ash); letter-spacing: .1em; text-transform: uppercase; }
+
+.ov-bars { display: flex; gap: 3px; height: 58px; }
+.ov-bar {
+  flex: 1; min-width: 0; position: relative; border-radius: 3px;
+  display: flex; align-items: flex-end; padding: 6px 5px; overflow: hidden;
+  transition: transform .16s ease, filter .16s ease;
+}
+.ov-bar:hover { transform: translateY(-2px); }
+
+/* Lit: a measured site. The glow is the only place on the page that spends
+   real luminance, which is what makes the dark segments read as absence
+   rather than as a muted style. */
+.ov-bar.is-lit {
+  background:
+    linear-gradient(180deg, rgba(94,234,212,.06) 0%, rgba(94,234,212,.22) 100%);
+  border: 1px solid rgba(94,234,212,.45);
+  box-shadow: inset 0 -14px 20px -12px rgba(94,234,212,.55);
+}
+.ov-bar.is-lit .ov-bar-label { color: var(--signal); }
+
+/* Dark: no telemetry. HATCHED, not merely grey — a flat grey block reads as
+   "styled differently", while a hatch reads as "nothing here". That difference
+   is the whole point of the strip. */
+.ov-bar.is-dark {
+  background-color: rgba(255,255,255,.012);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent 0 5px,
+    rgba(255,255,255,.05) 5px 6px
+  );
+  border: 1px dashed var(--rule);
+}
+.ov-bar.is-dark .ov-bar-label { color: #5A6274; }
+
+.ov-bar-label {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  width: 100%; line-height: 1.2;
+}
+
+.ov-strip-note {
+  margin: 12px 0 0; font-size: 12.5px; color: var(--ash); max-width: 74ch;
+}
+.ov-strip-note strong { color: var(--ink); font-weight: 500; }
+
+/* ── Totals ──────────────────────────────────────────────────────────────── */
+
+.ov-totals {
+  display: grid; gap: 1px; background: var(--rule);
+  border: 1px solid var(--rule); border-radius: 10px; overflow: hidden;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+.ov-fig { background: var(--slate); padding: 14px 16px 15px; }
+.ov-fig-value {
+  font-family: var(--mono); font-size: 26px; font-weight: 500;
+  letter-spacing: -.02em; margin-top: 6px; color: var(--ink); line-height: 1.1;
+}
+/* An em dash is a statement, not a missing value, so it is dimmed rather than
+   styled like a number that happens to be short. */
+.ov-fig.is-absent .ov-fig-value { color: #4A5162; }
+.ov-fig-foot {
+  font-family: var(--mono); font-size: 11px; color: var(--ash); margin-top: 6px;
+}
+.ov-quota {
+  grid-column: 1 / -1; background: var(--slate); margin: 0;
+  padding: 11px 16px; font-size: 12.5px; color: var(--ember);
+  border-top: 1px solid var(--rule);
+}
+.ov-quota code { color: var(--ember); opacity: .85; }
+.ov-quota strong { font-weight: 600; }
+
+/* ── Panels ──────────────────────────────────────────────────────────────── */
+
+.ov-split {
+  display: grid; gap: 14px;
+  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+}
+@media (max-width: 900px) { .ov-split { grid-template-columns: 1fr; } }
+
+.ov-panel {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; overflow: hidden; min-width: 0;
+}
+.ov-panel > header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--rule);
+}
+.ov-panel-body { padding: 16px; }
+.ov-empty { margin: 0; font-size: 13px; color: var(--ash); max-width: 60ch; }
+
+/* ── Chart ───────────────────────────────────────────────────────────────── */
+
+.ov-chart { width: 100%; height: 150px; display: block; overflow: visible; }
+.ov-axis {
+  display: flex; justify-content: space-between; margin-top: 8px;
+  font-family: var(--mono); font-size: 10px; color: var(--ash);
+}
+.ov-peak { font-family: var(--mono); font-size: 11px; color: var(--ash); }
+
+/* ── Product bars ────────────────────────────────────────────────────────── */
+
+.ov-prod { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; }
+.ov-prod-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.ov-prod-name { font-size: 13px; color: var(--ink); }
+.ov-prod-cost { font-family: var(--mono); font-size: 13px; color: var(--ink); }
+.ov-prod-track {
+  height: 5px; background: rgba(255,255,255,.05);
+  border-radius: 3px; margin-top: 7px; overflow: hidden;
+}
+.ov-prod-fill {
+  height: 100%; border-radius: 3px;
+  background: linear-gradient(90deg, rgba(94,234,212,.5), var(--signal));
+}
+.ov-prod-foot { font-family: var(--mono); font-size: 10.5px; color: var(--ash); margin-top: 6px; }
+.ov-prod-note {
+  margin: 16px 0 0; padding-top: 13px; border-top: 1px solid var(--rule);
+  font-size: 12px; color: var(--ash);
+}
+
+/* ── Lists ───────────────────────────────────────────────────────────────── */
+
+.ov-list { list-style: none; margin: 0; padding: 0; }
+.ov-list li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 0; border-bottom: 1px solid var(--rule);
+}
+.ov-list li:last-child { border-bottom: 0; padding-bottom: 0; }
+.ov-list li:first-child { padding-top: 0; }
+.ov-list-main { font-size: 13px; color: var(--ink); flex-shrink: 0; }
+.ov-list-main.mono { font-family: var(--mono); font-size: 12px; }
+.ov-list-meta {
+  font-family: var(--mono); font-size: 11px; color: var(--ash);
+  margin-left: auto; text-align: right; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.ov-pct { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.ov-pct.is-ember { color: var(--ember); }
+.ov-pct.is-fault { color: var(--fault); }
+
+/* ── All clear ───────────────────────────────────────────────────────────── */
+
+.ov-clear {
+  display: flex; align-items: center; gap: 11px;
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; padding: 15px 18px; font-size: 13px; color: var(--ash);
+}
+.ov-clear-mark {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+  background: var(--signal); box-shadow: 0 0 0 3px rgba(94,234,212,.14);
+}
+
+/* ── Quality floor ───────────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .ov-bar { transition: none; }
+  .ov-bar:hover { transform: none; }
+}
+.ov a:focus-visible,
+.ov-bar:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+@media (max-width: 640px) {
+  .ov-bars { height: 44px; }
+  .ov-bar-label { display: none; }
+  .ov-strip-count strong { font-size: 24px; }
+  .ov-fig-value { font-size: 21px; }
+}

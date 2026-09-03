@@ -193,10 +193,49 @@ def overview(
         ORDER BY pct DESC
     """, env_params)
 
+    # ── Coverage: which sites can we actually SEE?
+    #
+    # The console's first honest question, and the one every headline figure
+    # depends on. Six of eight stores present v1 JWTs, which resolve no v2
+    # context, so usage_service.record() writes nothing for them — their spend
+    # is not zero, it is unobserved. Without this block the overview reports
+    # totals over an estate it silently only partly measures.
+    #
+    # Returned per site rather than as a ratio so the UI can name the dark ones.
+    coverage_sites = q.rows(db, f"""
+        SELECT si.id, si.domain, si.environment,
+               (SELECT COUNT(*) FROM usage_events ue
+                 WHERE ue.site_id = si.id
+                   AND ue.created_at >= UTC_TIMESTAMP() - INTERVAL :days DAY) AS event_rows,
+               (SELECT COUNT(*) FROM licences l
+                  JOIN subscriptions s2 ON s2.id = l.subscription_id
+                 WHERE s2.site_id = si.id AND l.is_active = 1) AS live_licences
+        FROM sites si
+        WHERE si.is_active = 1 {env_sql}
+        ORDER BY si.domain
+    """, params)
+
     return {
         "window_days": days,
         "environment": environment,
         "estate": estate,
+        "coverage": {
+            "sites": [
+                {"site_id": r["id"], "domain": r["domain"],
+                 "environment": r["environment"],
+                 "event_rows": q.i(r["event_rows"]),
+                 "live_licences": q.i(r["live_licences"]),
+                 # Reporting means "produced ledger rows in this window". A site
+                 # with a v2 licence and no traffic is NOT reporting either, and
+                 # that is correct: the console cannot distinguish it from one
+                 # that cannot report, and pretending otherwise would be the
+                 # same lie in the other direction.
+                 "reporting": q.i(r["event_rows"]) > 0}
+                for r in coverage_sites
+            ],
+            "sites_total": len(coverage_sites),
+            "sites_reporting": sum(1 for r in coverage_sites if q.i(r["event_rows"]) > 0),
+        },
         "totals": {
             "requests": q.i_or_none(totals.get("requests")),
             "cost": q.f_or_none(totals.get("cost")),

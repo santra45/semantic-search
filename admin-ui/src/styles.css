@@ -1,14 +1,31 @@
+/* Instrument palette. Named for what they mean, not what they look like, so a
+   later retune cannot quietly change a semantic. `signal` is reserved for
+   MEASURED things and is the only saturated colour on a quiet screen — spend it
+   anywhere else and the estate strip stops reading as the one lit thing. */
 :root {
-  --bg: #0f1115;
-  --panel: #171a21;
-  --panel2: #1c2029;
-  --line: #262b36;
-  --text: #e6e8ee;
-  --muted: #8b93a7;
-  --accent: #4f8cff;
-  --ok: #3ecf8e;
-  --warn: #ffb648;
-  --bad: #ff6b6b;
+  --void:   #0B0D11;   /* page ground */
+  --slate:  #14171E;   /* panel */
+  --slate2: #1A1E27;   /* raised */
+  --rule:   #232833;   /* hairline */
+  --ink:    #E8EBF2;   /* primary text */
+  --ash:    #7A8496;   /* secondary text */
+  --signal: #5EEAD4;   /* measured / live */
+  --ember:  #F5A524;   /* needs attention */
+  --fault:  #F26D6D;   /* broken */
+
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+
+  /* Aliases kept so the shell's existing rules resolve. */
+  --bg: var(--void);
+  --panel: var(--slate);
+  --panel2: var(--slate2);
+  --line: var(--rule);
+  --text: var(--ink);
+  --muted: var(--ash);
+  --accent: var(--signal);
+  --ok: var(--signal);
+  --warn: var(--ember);
+  --bad: var(--fault);
 }
 * { box-sizing: border-box; }
 body {
@@ -39,34 +56,39 @@ input, select {
 input:focus, select:focus { outline: none; border-color: var(--accent); }
 button {
   width: 100%; margin-top: 18px; padding: 10px; border: 0; border-radius: 6px;
-  background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  /* Dark ink on the signal colour: white on #5EEAD4 fails contrast badly. */
+  background: var(--signal); color: var(--void); font: inherit; font-weight: 600; cursor: pointer;
 }
 button:disabled { opacity: .55; cursor: not-allowed; }
 .err {
   margin-top: 14px; padding: 9px 11px; border-radius: 6px; font-size: 13px;
-  background: rgba(255,107,107,.12); border: 1px solid rgba(255,107,107,.3); color: var(--bad);
+  background: rgba(242,109,109,.1); border: 1px solid rgba(242,109,109,.28); color: var(--fault);
 }
 
 /* ── Shell ─────────────────────────────────────────────────────────────── */
 .banner {
   padding: 9px 16px; font-size: 13px;
-  background: rgba(255,182,72,.12); border-bottom: 1px solid rgba(255,182,72,.3);
-  color: var(--warn);
+  background: rgba(245,165,36,.1); border-bottom: 1px solid rgba(245,165,36,.28);
+  color: var(--ember);
 }
 .topbar {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
 }
-.brand { font-size: 14px; white-space: nowrap; }
+.brand {
+  font-family: var(--mono); font-size: 12.5px; letter-spacing: .04em;
+  white-space: nowrap; color: var(--ink);
+}
 .nav { display: flex; gap: 2px; flex-wrap: wrap; }
 .navlink {
   padding: 6px 10px; border-radius: 6px; color: var(--muted);
-  font-size: 13px; text-decoration: none;
+  font-family: var(--mono); font-size: 11.5px; letter-spacing: .02em;
+  text-decoration: none;
 }
 .navlink:hover { background: var(--panel2); text-decoration: none; color: var(--text); }
 .navlink.active { background: var(--panel2); color: var(--text); }
 .spacer { flex: 1; }
-.who { font-size: 13px; }
+.who { font-family: var(--mono); font-size: 11.5px; }
 .inline-field { display: flex; align-items: center; gap: 6px; margin: 0; }
 .inline-field span { font-size: 12px; color: var(--muted); }
 .inline-field select { width: auto; padding: 5px 8px; font-size: 13px; margin: 0; }
@@ -95,14 +117,17 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 
 /* ── Pills ─────────────────────────────────────────────────────────────── */
 .pill {
-  display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  display: inline-block; font-family: var(--mono); font-size: 10px; padding: 2px 8px; border-radius: 999px;
   border: 1px solid var(--line); color: var(--muted);
   text-transform: uppercase; letter-spacing: .04em; white-space: nowrap;
 }
-.pill-ok   { color: var(--ok);   border-color: rgba(62,207,142,.4);  background: rgba(62,207,142,.1); }
-.pill-warn { color: var(--warn); border-color: rgba(255,182,72,.4);  background: rgba(255,182,72,.1); }
-.pill-bad  { color: var(--bad);  border-color: rgba(255,107,107,.4); background: rgba(255,107,107,.1); }
-.pill-info { color: var(--accent); border-color: rgba(79,140,255,.4); background: rgba(79,140,255,.1); }
+.pill-ok   { color: var(--signal); border-color: rgba(94,234,212,.35); background: rgba(94,234,212,.08); }
+.pill-warn { color: var(--ember);  border-color: rgba(245,165,36,.35); background: rgba(245,165,36,.08); }
+.pill-bad  { color: var(--fault);  border-color: rgba(242,109,109,.35); background: rgba(242,109,109,.08); }
+/* `info` is a trial/neutral state and deliberately does NOT borrow --signal:
+   that colour means MEASURED, and lending it to a status pill would dilute the
+   one thing the estate strip relies on it for. */
+.pill-info { color: #9AA7BD; border-color: var(--rule); background: rgba(255,255,255,.03); }
 .pill-muted { color: var(--muted); }
 
 /* ── Notes ─────────────────────────────────────────────────────────────── */
@@ -134,4 +159,10 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .toast-close {
   width: auto; margin: 0; padding: 0 4px; background: transparent;
   color: var(--muted); font-size: 16px; line-height: 1;
+}
+
+/* Visible keyboard focus everywhere, not only where a component remembered. */
+a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
 }

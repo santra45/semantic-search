@@ -6,6 +6,7 @@ import { FiltersProvider } from "./lib/filters";
 import { ToastProvider } from "./lib/toast";
 import { Loading } from "./components/Bits";
 import { Placeholder } from "./screens/Placeholder";
+import { Overview } from "./screens/Overview";
 
 /**
  * The shell. Auth gate first, then providers, then routes.
@@ -36,7 +37,7 @@ export function App() {
           <BrowserRouter basename="/admin">
             <Routes>
               <Route element={<Layout />}>
-                <Route index element={<Placeholder title="Overview" />} />
+                <Route index element={<Overview />} />
                 <Route path="tenants" element={<Placeholder title="Tenants" />} />
                 <Route path="tenants/:clientId" element={<Placeholder title="Tenant detail" />} />
                 <Route path="sites/:siteId" element={<Placeholder title="Site detail" />} />
