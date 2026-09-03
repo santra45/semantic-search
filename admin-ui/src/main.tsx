@@ -6,6 +6,7 @@ import "./styles.css";
 import "./overview.css";
 import "./tenants.css";
 import "./tenant-detail.css";
+import "./confirm.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {

@@ -1,6 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api";
+import { useActions } from "../lib/actions";
+import type { Client, Licence, Site, Subscription, TenantDetailData } from "../lib/tenantTypes";
+import {
+  openClientDisable, openClientEnable, openIssue, openPause, openPromote,
+  openResume, openSiteDisable, openSiteEnable, type Act,
+} from "./tenantActions";
+import { useCan } from "../lib/session";
 import { useFilters } from "../lib/filters";
 import { ABSENT, cost, num, pct, productLabel, relative, when } from "../lib/format";
 import { ErrorNote, Loading } from "../components/Bits";
@@ -36,37 +43,10 @@ import { ErrorNote, Loading } from "../components/Bits";
  * ────────────────────────────────────────────────────────────────────────────
  */
 
-interface Site {
-  id: string; domain: string; platform: string; platform_version: string | null;
-  store_name: string | null; collection_name: string | null; environment: string;
-  index_plan: string; catalogue_limit: number; indexed_items: number;
-  catalogue_pct: number | null; is_active: boolean; created_at: string | null;
-}
-interface Subscription {
-  id: string; site_id: string; domain: string; environment: string;
-  product_code: string; status: string; plan: string; request_limit: number;
-  disabled_reason: string | null; expires_at: string | null; active_licences: number;
-}
-interface Licence {
-  id: string; key_prefix: string | null; has_plaintext: boolean; is_active: boolean;
-  product_code: string; domain: string; environment: string;
-  issued_at: string | null; expires_at: string | null; revoked_at: string | null;
-}
-interface TenantDetailData {
-  client: { id: string; name: string; email: string; company: string | null;
-            plan: string | null; is_active: boolean; created_at: string | null };
-  sites: Site[];
-  subscriptions: Subscription[];
-  licences: Licence[];
-  series: { day: string; requests: number; cost: number; tokens: number }[];
-  by_product: { product_code: string; requests: number; cost: number; tokens: number }[];
-  by_model: { provider: string; model: string; cost: number; tokens: number; calls: number }[];
-  window_days: number;
-}
 
 /** Is this thing actually usable right now, and if not, WHY. */
 function effectiveState(
-  client: TenantDetailData["client"],
+  client: Client,
   site: Site,
   sub: Subscription,
   licences: Licence[],
@@ -93,6 +73,9 @@ function effectiveState(
 export function TenantDetail() {
   const { clientId } = useParams();
   const { days } = useFilters();
+  const isOperator = useCan("operator");
+  const isOwner = useCan("owner");
+  const act = useActions([["tenant", clientId, days], ["tenants"], ["overview"]]);
 
   const { data, isLoading, error } = useQuery<TenantDetailData>({
     queryKey: ["tenant", clientId, days],
@@ -110,6 +93,7 @@ export function TenantDetail() {
 
   return (
     <div className="td">
+      {act.sheetNode}
       <nav className="td-crumb">
         <Link to="/tenants">Tenants</Link>
         <span aria-hidden="true">/</span>
@@ -133,6 +117,25 @@ export function TenantDetail() {
           <Fig label="Spend" value={measured ? cost(totalCost) : ABSENT} sub={`${days} days`} />
           <Fig label="Requests" value={measured ? num(totalReq) : ABSENT} sub="billable" />
           <Fig label="Sites" value={num(sites.length)} sub={`${subscriptions.length} subscriptions`} />
+          {isOperator && (
+            <div className="td-fig td-actions">
+              <dt className="eyebrow">Customer</dt>
+              <dd>
+                {client.is_active ? (
+                  <button
+                    className="td-btn is-danger"
+                    onClick={() => openClientDisable(act, client)}
+                  >
+                    Suspend customer
+                  </button>
+                ) : (
+                  <button className="td-btn" onClick={() => openClientEnable(act, client)}>
+                    Restore customer
+                  </button>
+                )}
+              </dd>
+            </div>
+          )}
         </dl>
       </header>
 
@@ -158,6 +161,9 @@ export function TenantDetail() {
             site={site}
             subs={subscriptions.filter((s) => s.site_id === site.id)}
             licences={licences}
+            act={act}
+            isOperator={isOperator}
+            isOwner={isOwner}
           />
         ))
       )}
@@ -194,10 +200,11 @@ function Fig({ label, value, sub }: { label: string; value: string; sub: string 
 /* ── A store install, with its modules inside it ─────────────────────────── */
 
 function SiteCard({
-  client, site, subs, licences,
+  client, site, subs, licences, act, isOperator, isOwner,
 }: {
-  client: TenantDetailData["client"]; site: Site;
+  client: Client; site: Site;
   subs: Subscription[]; licences: Licence[];
+  act: Act; isOperator: boolean; isOwner: boolean;
 }) {
   const parentOff = !client.is_active;
   const off = parentOff || !site.is_active;
@@ -247,6 +254,28 @@ function SiteCard({
             {pctUsed === null ? "no ceiling on this plan" : `${pct(pctUsed)} used · enforced`}
           </div>
         </div>
+
+        {isOperator && (
+          <div className="td-site-actions">
+            {site.is_active ? (
+              <button className="td-btn is-danger"
+                      disabled={parentOff}
+                      title={parentOff ? "The customer is already suspended" : undefined}
+                      onClick={() => openSiteDisable(act, site)}>
+                Suspend store
+              </button>
+            ) : (
+              <button className="td-btn" onClick={() => openSiteEnable(act, site)}>
+                Restore store
+              </button>
+            )}
+            {isOwner && site.environment !== "production" && (
+              <button className="td-btn" onClick={() => openPromote(act, site)}>
+                Promote to production
+              </button>
+            )}
+          </div>
+        )}
       </header>
 
       {subs.length === 0 ? (
@@ -263,6 +292,14 @@ function SiteCard({
               licences={licences.filter(
                 (l) => l.product_code === sub.product_code && l.domain === site.domain,
               )}
+              act={act}
+              // A pause button under a suspended customer would suggest the
+              // module is what is holding things up. Disabled, with the reason
+              // in the tooltip, rather than hidden — hiding it would make the
+              // control look like it does not exist at this level at all.
+              parentOff={off}
+              isOperator={isOperator}
+              isOwner={isOwner}
             />
           ))}
         </ul>
@@ -274,10 +311,11 @@ function SiteCard({
 /* ── One module on one store ─────────────────────────────────────────────── */
 
 function SubRow({
-  sub, licences, state,
+  sub, licences, state, act, parentOff, isOperator, isOwner,
 }: {
   sub: Subscription; licences: Licence[];
   state: ReturnType<typeof effectiveState>;
+  act: Act; parentOff: boolean; isOperator: boolean; isOwner: boolean;
 }) {
   const live = licences.filter((l) => l.is_active);
   const expiring = live.find(
@@ -324,6 +362,28 @@ function SubRow({
           <span className="td-sub-why is-ember">key expires {relative(expiring.expires_at)}</span>
         )}
       </span>
+
+      {(isOperator || isOwner) && (
+        <span className="td-sub-actions">
+          {isOperator && (sub.status === "active" || sub.status === "trial" ? (
+            <button className="td-btn is-danger" disabled={parentOff}
+                    title={parentOff ? "A parent scope is already suspended" : undefined}
+                    onClick={() => openPause(act, sub)}>
+              Pause
+            </button>
+          ) : (
+            <button className="td-btn" disabled={parentOff}
+                    onClick={() => openResume(act, sub)}>
+              Resume
+            </button>
+          ))}
+          {isOwner && (
+            <button className="td-btn" onClick={() => openIssue(act, sub, live.length > 0)}>
+              {live.length > 0 ? "Rotate key" : "Issue key"}
+            </button>
+          )}
+        </span>
+      )}
     </li>
   );
 }

@@ -1,0 +1,65 @@
+/* The confirm sheet. Prefixed .cs-. */
+
+.cs-scrim {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(5,7,10,.72);
+  display: grid; place-items: center; padding: 24px;
+  backdrop-filter: blur(2px);
+}
+.cs-sheet {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 12px; padding: 22px; width: 100%; max-width: 460px;
+  box-shadow: 0 24px 60px rgba(0,0,0,.55);
+  max-height: 90vh; overflow-y: auto;
+}
+/* Destructive actions get a coloured edge — the one place on the sheet that
+   spends colour, so it cannot be missed and cannot be mistaken for decoration. */
+.cs-sheet.is-danger { border-color: rgba(242,109,109,.4); }
+
+.cs-sheet h2 { font-size: 16px; margin: 0 0 10px; font-weight: 600; }
+.cs-body { font-size: 13px; color: var(--ash); line-height: 1.55; }
+.cs-body code { color: var(--ink); }
+.cs-body strong { color: var(--ink); font-weight: 600; }
+
+.cs-blast {
+  margin-top: 16px; padding: 12px 14px; border-radius: 8px;
+  background: var(--void); border: 1px solid var(--rule);
+}
+.cs-blast-figs {
+  display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px;
+  font-family: var(--mono); font-size: 11.5px; color: var(--ash);
+}
+.cs-blast-figs strong { color: var(--ink); font-weight: 600; font-size: 14px; }
+
+.cs-field { display: block; margin-top: 16px; }
+.cs-field > span {
+  display: block; font-family: var(--mono); font-size: 10.5px;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--ash);
+  margin-bottom: 6px;
+}
+.cs-field > span code {
+  text-transform: none; letter-spacing: 0; color: var(--ink);
+  background: var(--void); padding: 1px 5px; border-radius: 3px;
+}
+.cs-field textarea, .cs-field input {
+  width: 100%; padding: 9px 11px; border-radius: 6px;
+  border: 1px solid var(--rule); background: var(--void); color: var(--ink);
+  font: inherit; font-size: 13px; resize: vertical;
+}
+.cs-field textarea:focus, .cs-field input:focus {
+  outline: none; border-color: var(--signal);
+}
+.cs-err { margin-top: 14px; }
+
+.cs-actions {
+  display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px;
+}
+.cs-go {
+  width: auto; margin: 0; padding: 8px 16px; border-radius: 6px;
+  background: var(--signal); color: var(--void); border: 0;
+  font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
+}
+.cs-go.is-danger { background: var(--fault); color: #180A0A; }
+.cs-go:disabled { opacity: .35; cursor: not-allowed; }
+
+@media (prefers-reduced-motion: reduce) { .cs-scrim { backdrop-filter: none; } }
