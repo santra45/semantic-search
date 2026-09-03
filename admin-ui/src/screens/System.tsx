@@ -23,6 +23,13 @@ import { ErrorNote, Loading } from "../components/Bits";
  *                            console says "not enforced". Surfacing it here is
  *                            what connects that caveat to its cause.
  *
+ *   api_docs_public          /docs, /redoc and /openapi.json. Off by default.
+ *                            When on, the schema hands out every route in the
+ *                            API with its payload shape and its auth header.
+ *                            Read from the RUNNING APP rather than the env, so
+ *                            a process started before the variable changed
+ *                            cannot make this report a stale answer.
+ *
  * So findings come first and dependencies come second. A green tick is not
  * news; an unremoved break-glass key is.
  * ────────────────────────────────────────────────────────────────────────────
@@ -32,7 +39,11 @@ interface HealthData {
   checks: Record<string, { ok: boolean; error?: string; collections?: number }>;
   schema: Record<string, boolean>;
   migrations: { version: string; filename: string; applied_at: string | null }[];
-  flags: { quota_enforcement: string | null; operator_key_configured: boolean };
+  flags: {
+    quota_enforcement: string | null;
+    operator_key_configured: boolean;
+    api_docs_public: boolean;
+  };
 }
 
 export function System() {
@@ -75,6 +86,13 @@ export function System() {
       body: "Anyone holding AICHATBOT_OPERATOR_KEY has owner rights, and their actions are logged as 'break-glass' with no named actor. It exists to bootstrap the first owner account. Remove it from the production .env now that real accounts exist — while it is set, RBAC and the audit trail are decorative.",
     });
   }
+  if (data.flags.api_docs_public) {
+    findings.push({
+      tone: "warn",
+      title: "The interactive API docs are being served",
+      body: "/docs, /redoc and /openapi.json are mounted, which publishes every route in this API — licensing, sync, operator and admin — with its payload shape and the header that authenticates it. Unset AICHATBOT_ENABLE_DOCS and restart. Reported from the running app, not the env file, so it reflects what is actually mounted.",
+    });
+  }
   if (!data.flags.quota_enforcement) {
     findings.push({
       tone: "warn",
@@ -91,7 +109,8 @@ export function System() {
           <p className="sy-clear">
             <span className="sy-clear-mark" aria-hidden="true" />
             Nothing outstanding. Every dependency is reachable, every expected
-            table exists, and no configuration is left in a bootstrap state.
+            table exists, the API schema is not published, and no configuration
+            is left in a bootstrap state.
           </p>
         ) : (
           <ul className="sy-finding-list">

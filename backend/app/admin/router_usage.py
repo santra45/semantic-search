@@ -8,7 +8,7 @@ import logging
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -220,6 +220,7 @@ def audit_log(
 
 @router.get("/health")
 def health(
+    request: Request,
     actor: AdminActor = Depends(require_viewer),
     db: Session = Depends(get_db),
 ):
@@ -285,6 +286,13 @@ def health(
             # While this is set, anyone holding it has owner rights and their
             # actions log as 'break-glass'. The console should say so loudly.
             "operator_key_configured": bool(os.getenv("AICHATBOT_OPERATOR_KEY", "")),
+            # /docs, /redoc and /openapi.json. Off by default; when on, the
+            # schema publishes every route, payload shape and auth header in
+            # the API. Read from the app rather than the env so this reports
+            # what is actually MOUNTED — the env is only how it got that way,
+            # and a process started before the variable changed would lie.
+            "api_docs_public": bool(request.app.openapi_url or request.app.docs_url
+                                    or request.app.redoc_url),
         },
         "usage_source": usage_ledger_read.provenance(db),
     }

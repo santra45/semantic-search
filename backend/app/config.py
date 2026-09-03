@@ -19,3 +19,15 @@ FALLBACK_SCORE_THRESHOLD = float(os.getenv("FALLBACK_SCORE_THRESHOLD", 0.58))
 # until an operator key is configured. Set AICHATBOT_OPERATOR_KEY to a long
 # random secret; it's checked against the X-Operator-Key request header.
 OPERATOR_KEY = os.getenv("AICHATBOT_OPERATOR_KEY", "")
+
+# Interactive API docs — /docs (Swagger UI), /redoc, /openapi.json.
+#
+# OFF by default, which means FastAPI never REGISTERS the routes: they 404 the
+# same way a typo does, rather than 403-ing and confirming there is something
+# there. That matters more than it sounds — the schema is a complete map of
+# every licensing, sync and admin endpoint, their payload shapes and their
+# auth headers, handed to anyone who asks. It is a reconnaissance document.
+#
+# Set AICHATBOT_ENABLE_DOCS=1 for local development. Leaving it set in
+# production is reported as a finding on the console's System screen.
+ENABLE_API_DOCS = os.getenv("AICHATBOT_ENABLE_DOCS", "").lower() in ("1", "true", "on", "yes")

@@ -112,9 +112,19 @@ uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
-Once running, open the interactive docs:
+The interactive docs are **off by default** — `/docs`, `/redoc` and
+`/openapi.json` are not mounted, and 404 like any unknown path. The schema is a
+complete index of every licensing, sync, operator and admin route with its
+payload shape and its auth header, so it is not something to publish from a
+production box.
+
+To turn them on for local development, set `AICHATBOT_ENABLE_DOCS=1` and
+restart:
 - **Swagger UI**: http://localhost:8000/docs
 - **ReDoc**: http://localhost:8000/redoc
+
+The admin console's System screen reports it as an outstanding finding if it is
+ever left on in production.
 
 ---
 

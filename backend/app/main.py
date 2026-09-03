@@ -5,6 +5,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 
+from backend.app import config
 from backend.app.middleware.logging_middleware import APILoggingMiddleware
 from backend.app.services.licence_errors import LicenceDenied
 from backend.app.routers import (
@@ -32,9 +33,24 @@ from backend.app.wordpress.productqa.routers import (
     sync as wordpress_productqa_sync,
 )
 
+# The interactive docs are OFF unless AICHATBOT_ENABLE_DOCS is set.
+#
+# Passing None does not merely hide them — FastAPI never registers the routes,
+# so /docs, /redoc and /openapi.json 404 exactly like any other unknown path.
+# A 403 would confirm the endpoint exists; a 404 says nothing. The schema is a
+# complete index of every licensing, sync, operator and admin route with its
+# payload shape and its auth header, so it is worth not publishing.
+#
+# Swagger's oauth2-redirect route is registered only alongside docs_url, so it
+# disappears with them; nothing else in the app reads /openapi.json.
+_docs = config.ENABLE_API_DOCS
+
 app = FastAPI(
     title="Semantic Search API",
-    version="0.1.0"
+    version="0.1.0",
+    docs_url="/docs" if _docs else None,
+    redoc_url="/redoc" if _docs else None,
+    openapi_url="/openapi.json" if _docs else None,
 )
 
 # Unified request/response logger → logs/api.log
