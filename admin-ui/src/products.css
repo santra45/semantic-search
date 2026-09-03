@@ -1,0 +1,68 @@
+/* Products. Prefixed .pr-. */
+
+.pr { display: flex; flex-direction: column; gap: 14px; }
+
+.pr-withdrawn-note {
+  margin: 0; padding: 11px 14px; border-radius: 8px; font-size: 12.5px;
+  background: rgba(245,165,36,.08); border: 1px solid rgba(245,165,36,.25);
+  color: var(--ember); max-width: 92ch;
+}
+
+.pr-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+
+.pr-card {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; padding: 15px 16px;
+  display: flex; flex-direction: column; gap: 13px;
+}
+/* Withdrawn dims the CARD but never the running count inside it — the whole
+   point is that the two are independent. */
+.pr-card.is-withdrawn { border-color: rgba(245,165,36,.3); }
+
+.pr-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.pr-head h2 { font-size: 14px; margin: 0; font-weight: 600; }
+.pr-meta {
+  margin: 5px 0 0; display: flex; align-items: center; gap: 8px;
+  font-family: var(--mono); font-size: 10.5px; color: var(--ash);
+}
+.pr-seg {
+  border: 1px solid var(--rule); border-radius: 3px; padding: 1px 5px; opacity: .8;
+}
+
+/* ── The two states, adjacent ────────────────────────────────────────────── */
+
+.pr-states {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+  background: var(--rule); border: 1px solid var(--rule); border-radius: 8px;
+  overflow: hidden;
+}
+.pr-state { background: var(--void); padding: 10px 12px; }
+.pr-state strong {
+  display: block; font-family: var(--mono); font-size: 17px; font-weight: 500;
+  margin-top: 5px; color: var(--ash); line-height: 1.1;
+}
+.pr-state strong.is-yes { color: var(--signal); }
+.pr-state strong.is-no { color: var(--ember); }
+.pr-state-hint { display: block; font-size: 10.5px; color: var(--ash); margin-top: 5px; }
+
+.pr-stats { display: flex; gap: 20px; margin: 0; }
+.pr-stats dt { font-size: 10.5px; color: var(--ash); margin: 0; }
+.pr-stats dd {
+  margin: 3px 0 0; font-family: var(--mono); font-size: 13px; color: var(--ink);
+}
+
+.pr-spend-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.pr-cost { font-family: var(--mono); font-size: 13px; color: var(--ink); }
+.pr-track {
+  height: 4px; background: rgba(255,255,255,.05); border-radius: 2px;
+  margin-top: 7px; overflow: hidden;
+}
+.pr-fill { height: 100%; background: var(--signal); opacity: .7; border-radius: 2px; }
+.pr-spend-foot {
+  font-family: var(--mono); font-size: 10.5px; color: var(--ash); margin-top: 6px;
+}
+
+.pr-actions { display: flex; gap: 6px; }

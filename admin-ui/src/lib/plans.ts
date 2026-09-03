@@ -23,8 +23,15 @@ export interface PlanRung {
   code: string;
   name?: string;
   price?: string;
-  products?: number;
-  requests?: number;
+  period?: string;
+  features?: string[];
+  /** INDEX_PLANS only — catalogue items, bought once per site. */
+  catalogue_limit?: number;
+  /** MODULE_PLANS only — requests per month, bought per module. */
+  request_limit?: number;
+  /** False on `trial`: a rung the customer cannot choose. */
+  selectable?: boolean;
+  /** Counts added by the API, not by catalog.py. */
   sites?: number;
   subscriptions?: number;
   [k: string]: unknown;
@@ -46,12 +53,19 @@ export function usePlans() {
   });
 }
 
-/** `growth — 100,000 requests/mo` for a dropdown. Falls back to the bare code
- *  rather than inventing a label, so an unfamiliar rung is still selectable. */
+/** `Growth · 100,000 req/mo · $29` for a dropdown.
+ *
+ *  The limit fields are named catalogue_limit and request_limit, NOT `products`
+ *  and `requests` — an earlier version guessed those and silently rendered
+ *  name-and-price only, which made two rungs of the same price
+ *  indistinguishable in the picker. Falls back to the bare code rather than
+ *  inventing a label, so an unfamiliar rung stays selectable. */
 export function rungLabel(rung: PlanRung): string {
   const bits: string[] = [rung.name ? String(rung.name) : rung.code];
-  if (typeof rung.requests === "number") bits.push(`${rung.requests.toLocaleString()} req/mo`);
-  if (typeof rung.products === "number") bits.push(`${rung.products.toLocaleString()} items`);
+  if (typeof rung.request_limit === "number")
+    bits.push(`${rung.request_limit.toLocaleString()} req/mo`);
+  if (typeof rung.catalogue_limit === "number")
+    bits.push(`${rung.catalogue_limit.toLocaleString()} items`);
   if (rung.price) bits.push(String(rung.price));
   return bits.join(" · ");
 }

@@ -11,6 +11,8 @@ import "./licences.css";
 import "./audit.css";
 import "./usage.css";
 import "./licence-detail.css";
+import "./products.css";
+import "./plans.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {
