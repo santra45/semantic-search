@@ -10,6 +10,7 @@ import { Overview } from "./screens/Overview";
 import { Tenants } from "./screens/Tenants";
 import { TenantDetail } from "./screens/TenantDetail";
 import { Licences } from "./screens/Licences";
+import { Audit } from "./screens/Audit";
 
 /**
  * The shell. Auth gate first, then providers, then routes.
@@ -49,7 +50,7 @@ export function App() {
                 <Route path="products" element={<Placeholder title="Products" />} />
                 <Route path="plans" element={<Placeholder title="Plans" />} />
                 <Route path="usage" element={<Placeholder title="Usage explorer" />} />
-                <Route path="audit" element={<Placeholder title="Audit log" />} />
+                <Route path="audit" element={<Audit />} />
                 <Route path="system" element={<Placeholder title="System health" />} />
                 {/* The server hands index.html to ANY /admin/* path — it cannot
                     tell a typo from a route it does not know — so the SPA owns
