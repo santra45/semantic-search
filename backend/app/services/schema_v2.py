@@ -318,6 +318,35 @@ CREATE TABLE `subscriptions` (
 # Anything reading this column for a LOG LINE or a LIST VIEW must pass it
 # through license_key.prefix_of() first. The column swap turns every call site
 # that used to read a safe prefix into a credential dump otherwise.
+#
+# ── RETENTION: rotations are purged, revocations are kept ────────────────────
+#
+# Set 2026-09-03. The two ways a key stops working are stored differently, on
+# purpose, and code that treats them alike will be wrong about one of them:
+#
+#   ROTATION  - issue_licence() replaces a key. The old row is DELETED in the
+#               same transaction as the insert. No tombstone, no is_active = 0
+#               row, nothing left to list. A rotated key hashes to no row at
+#               all, so "rotated out" and "never issued" now produce the same
+#               403 and the same deny line. That was a deliberate trade: the
+#               retained row carried no plaintext and, once key_prefix was
+#               dropped, no readable label either, so it was findable only by
+#               hashing a key someone still had - while every rotation added
+#               another dead row to a table the operator console lists.
+#
+#   REVOCATION - revoke_licence() kills a key that is NOT being replaced. The
+#               row STAYS and revoked_at is set. Deleting it would leave the
+#               subscription indistinguishable from one that never had a
+#               licence, and would turn a repeat revoke of the same id from an
+#               idempotent no-op into a LookupError.
+#
+# So `is_active = 0` in this table means revoked, and only revoked. Do not
+# re-add tombstones for rotation without also fixing every list view that would
+# start showing them - and do not "tidy up" by deleting revoked rows, which is
+# the retention that is still load-bearing.
+#
+# The seven pre-2026-09-03 superseded rows were purged when this policy landed;
+# the backup is licences_pre_purge_20260903T100042Z.sql on the server.
 
 LICENCES_TABLE = """
 CREATE TABLE `licences` (
@@ -334,7 +363,7 @@ CREATE TABLE `licences` (
   -- term would hit TIMESTAMP's 2038 ceiling, after the key was already minted.
   `expires_at`      DATETIME NULL DEFAULT NULL,
   `revoked_at`      TIMESTAMP NULL DEFAULT NULL
-                    COMMENT 'Set on rotation. Kept rather than deleted so a support ticket about a dead key is answerable.',
+                    COMMENT 'Set by revoke_licence() only. A row with this set was killed deliberately and is kept; a rotated-out row is DELETED and never appears here.',
   PRIMARY KEY (`id`),
   -- REQUIRED INDEX 1, and the hottest index in the system: one probe per
   -- authenticated request, before anything else happens.

@@ -1048,21 +1048,37 @@ def issue_licence(
         ).fetchall()
     ]
 
-    # Deactivation and insertion share one transaction and one commit. Split
-    # across two commits, a crash in between leaves the subscription with zero
-    # active licences, which resolve_key() reads as a revoked key — the store
-    # stops working and the operator sees a rotation that "succeeded".
+    # Removal and insertion share one transaction and one commit. Split across
+    # two commits, a crash in between leaves the subscription with zero
+    # licences, which resolve_key() reads as a dead key — the store stops
+    # working and the operator sees a rotation that "succeeded".
     #
-    # revoked_at is set rather than left NULL: a support ticket six months later
-    # asking why a key stopped working is answerable from the row, and the
-    # distinction between "rotated out" and "never issued" is otherwise gone.
+    # DELETE, not UPDATE ... SET is_active = 0. Changed 2026-09-03; the previous
+    # behaviour kept the superseded row so that a support ticket six months
+    # later asking why a key stopped working was answerable, and so that
+    # "rotated out" and "never issued" stayed distinguishable. That is a real
+    # thing being given up and it is worth naming: a rotated key now hashes to
+    # nothing, so the two cases produce the same 403 and the same log line.
+    #
+    # It was given up because the retention was not paying for itself. The row
+    # it kept holds no plaintext and, since key_prefix was dropped, no
+    # human-readable label either — so the "match it against the licences table
+    # by eye" affordance _deny() describes was already gone, leaving a row
+    # findable only by hashing a key someone still has. Meanwhile every rotation
+    # left another dead row on a table the operator console lists.
+    #
+    # THIS IS ROTATION ONLY. revoke_licence() still keeps its row and still sets
+    # revoked_at, because a revoke is not replaced by anything: deleting there
+    # would leave the subscription looking like it never had a licence, and
+    # would turn a second revoke of the same id from an idempotent no-op into a
+    # LookupError. The two operations mean different things and now behave
+    # differently on purpose.
     db.execute(
         text("""
-            UPDATE licences
-            SET is_active = 0, revoked_at = :now
+            DELETE FROM licences
             WHERE subscription_id = :subscription_id AND is_active = 1
         """),
-        {"subscription_id": subscription_id, "now": _utcnow()},
+        {"subscription_id": subscription_id},
     )
 
     db.execute(
@@ -1131,10 +1147,13 @@ def revoke_licence(db: Session, licence_id: str) -> dict:
     twice is that the first eviction failed, and refusing to hand back the hash
     the second time would make that unrecoverable without a manual FLUSHDB.
 
-    The row is never deleted. licences.key_hash carries UNIQUE, so a deleted row
-    also frees its hash — and while a 192-bit collision is not a real risk, the
-    row is the only record that a key which a merchant may still have pasted
-    somewhere ever existed.
+    The row is never deleted, and this is the one place that is still true —
+    issue_licence() DELETES the row it rotates out (see the retention note above
+    LICENCES_TABLE). The difference is that a rotation replaces the key and a
+    revoke does not: keep this row and the subscription reads as "had a licence,
+    it was killed"; delete it and it reads as "never had one", which is what the
+    migration's placeholder trials look like. It is also what makes a second
+    revoke of the same id a no-op instead of a LookupError.
     """
     row = db.execute(
         text("""
@@ -1180,7 +1199,12 @@ def revoke_licence(db: Session, licence_id: str) -> dict:
 
 
 def list_licences(db: Session, subscription_id: str) -> list[dict]:
-    """Every licence ever issued for a subscription, newest first.
+    """Every licence a subscription still HOLDS, newest first.
+
+    Not every licence ever issued, and the difference matters: since 2026-09-03
+    issue_licence() deletes the licence it supersedes, so a rotation leaves no
+    trace here. What this returns is the live key plus any that were explicitly
+    revoked — revoke_licence() keeps its row.
 
     This exists because revoke_licence() takes a licence id and nothing else in
     the system hands one out, so without it the operator console has no way to
@@ -1225,8 +1249,12 @@ def _deny(presented_key: str, reason: str) -> None:
     mask() and nothing else. A denied key is still a valid credential for some
     other tenant more often than you would like — a merchant running two stores
     pastes the wrong one — and a log file is the least controlled surface in the
-    system. The prefix identifies the key well enough to match it against the
-    licences table by eye and is useless for authenticating anything.
+    system. The prefix is useless for authenticating anything.
+
+    It no longer matches "against the licences table by eye", as this said when
+    a key_prefix column existed. To find the row behind a denied key now, hash
+    the presented key and look up key_hash — and expect no row at all if it was
+    rotated out, since those are deleted rather than kept.
     """
     logger.info("licence denied (%s): %s", license_key.mask(presented_key), reason)
     return None
