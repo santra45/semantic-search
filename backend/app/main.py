@@ -70,12 +70,14 @@ try:
         router_licences as admin_router_licences,
         router_tenants as admin_router_tenants,
         router_usage as admin_router_usage,
+        router_write as admin_router_write,
     )
 
     app.include_router(admin_router_auth.router)
     app.include_router(admin_router_tenants.router)
     app.include_router(admin_router_licences.router)
     app.include_router(admin_router_usage.router)
+    app.include_router(admin_router_write.router)
 except Exception as _admin_exc:  # pragma: no cover
     import logging
 

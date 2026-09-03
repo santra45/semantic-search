@@ -3,34 +3,56 @@
     with mutate(db, actor,
                 action="subscription.pause",
                 target=("subscription", subscription_id),
-                reason=body.reason) as m:
-        m.before = snapshot_subscription(db, subscription_id)
-        result   = licensing_service.set_subscription_status(db, subscription_id, "paused")
+                reason=body.reason,
+                before=snapshot_subscription(db, subscription_id)) as m:
+        m.result = licensing_service.set_subscription_status(db, subscription_id, "paused")
         m.after  = snapshot_subscription(db, subscription_id)
-        m.evict  = result["key_hashes"]
 
-Three things happen together, and that is the whole point:
+Three things happen together:
 
-  1. the mutation and its admin_audit_log row commit in ONE transaction
+  1. the audit row is written BEFORE the mutation and commits WITH it
   2. auth_cache is evicted after that commit, with the count recorded
-  3. neither can be skipped, because the block raises if you try
+  3. the eviction list is taken from the mutator's own return value, so it
+     cannot be forgotten
 
 ────────────────────────────────────────────────────────────────────────────
-WHY THE EVICTION IS FORCED RATHER THAN TRUSTED.
+WHY THE AUDIT ROW GOES FIRST. (Corrected 2026-09-03 — the first version of this
+file had it the other way round and its docstring claimed a guarantee it did
+not provide.)
+
+Every mutator in tenancy_service and licensing_service calls db.commit() itself.
+set_client_active, set_site_active, set_site_environment, set_index_plan,
+create_subscription, set_subscription_{plan,status,term}, issue_licence and
+revoke_licence — all of them. So a wrapper that ran the mutation and THEN
+inserted its audit row was describing something already committed: if the INSERT
+failed, there was nothing left to roll back, and the promise that "an unlogged
+disable cannot happen" was decoration.
+
+It went unnoticed because the test used a fake session that never committed. A
+test double that is more transactional than the real thing will confirm any
+ordering you like.
+
+Inserting first inverts it. The row is written into the caller's open
+transaction and the service's own commit persists BOTH, atomically, with no
+extra commit here. If the service raises before committing, the rollback takes
+the audit row with it. If the audit INSERT itself fails, the mutation never runs.
+`after_json` and `evicted` are filled in afterwards by UPDATE, because neither
+value exists yet at insert time — but the ROW's existence, which is the part
+that matters, is already tied to the change it describes.
+
+WHY THE EVICTION LIST IS TAKEN, NOT GIVEN.
 
 auth_cache holds a resolved licence context for 300 seconds and eviction is
-deliberately the CALLER's job — every mutator in tenancy_service and
-licensing_service returns `key_hashes` and evicts nothing itself, so that a
-missing eviction is a visible omission at the call site.
+deliberately the caller's job. A missed eviction is visible to a READER and
+invisible to an OPERATOR, who sees 200 and a green toast while a disabled tenant
+keeps authorising for five more minutes.
 
-Visible to a reader. Not visible to an operator, who sees HTTP 200 and a green
-toast while the disabled tenant keeps authorising for five more minutes. That
-failure gets "tested" by someone who waits, refreshes, sees the key rejected,
-and concludes the toggle works.
-
-So: m.evict is mandatory. A block that exits without setting it raises, in
-tests and in production alike, and an endpoint that genuinely has nothing to
-evict says so with `m.evict = []`. Explicit nothing, never implicit nothing.
+The first version made `m.evict` mandatory and rolled back if it was unset —
+which, given the internal commits above, could not actually roll anything back.
+So instead of asking the endpoint to remember, `m.result` takes the mutator's
+return dict and this file reads `key_hashes` out of it. Every shipped mutator
+returns one. An endpoint whose action genuinely has no cached state behind it
+says so with `m.evict = []`, explicitly.
 ────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -63,16 +85,35 @@ _UNSET = object()
 
 
 class MutationContext:
-    """The handle yielded by mutate(). Fill in before/after/evict."""
+    """The handle yielded by mutate()."""
 
-    __slots__ = ("before", "after", "_evict", "detail")
+    __slots__ = ("after", "detail", "_evict", "_result")
 
     def __init__(self) -> None:
-        self.before: Optional[dict] = None
         self.after: Optional[dict] = None
         self.detail: Optional[str] = None
         self._evict: Any = _UNSET
+        self._result: Optional[dict] = None
 
+    # ── The normal path: hand over what the service returned ─────────────────
+    @property
+    def result(self) -> Optional[dict]:
+        return self._result
+
+    @result.setter
+    def result(self, value: Optional[dict]) -> None:
+        """Take the mutator's return dict and read `key_hashes` out of it.
+
+        This is the whole anti-forgetting mechanism. `key_hash` (singular, the
+        NEW key from issue_licence) is deliberately ignored — evicting it would
+        throw away the entry for the key that was just created, which is the one
+        thing a rotation must not do.
+        """
+        self._result = value
+        if isinstance(value, dict) and "key_hashes" in value:
+            self.evict = value["key_hashes"]
+
+    # ── The explicit path: for actions with no cached state ──────────────────
     @property
     def evict(self) -> Sequence[str]:
         return () if self._evict is _UNSET else self._evict
@@ -85,10 +126,8 @@ class MutationContext:
                 "m.evict = [] so the intent is in the diff."
             )
         if isinstance(hashes, str):
-            # A bare string is iterable, so this would otherwise evict one
-            # character at a time and report a healthy-looking count while
-            # forgetting nothing. licensing_service's own comments flag the same
-            # trap; catching it here means it cannot reach the cache at all.
+            # A bare string is iterable, so this would evict one character at a
+            # time and report a healthy-looking count while forgetting nothing.
             raise TypeError(
                 "m.evict wants a list of key hashes, not a single string. "
                 "A str would be iterated character by character."
@@ -103,10 +142,9 @@ class MutationContext:
 def _json(value: Optional[dict]) -> Optional[str]:
     """Snapshot to JSON, never raising.
 
-    default=str so a datetime or a Decimal from a database row serialises
-    instead of exploding — an audit row that fails to write rolls back the
-    mutation it describes, and losing a real disable because a timestamp would
-    not serialise is a bad trade for type purity.
+    default=str so a datetime or Decimal from a row serialises instead of
+    exploding — losing a real change because a timestamp would not serialise is
+    a bad trade for type purity.
     """
     if value is None:
         return None
@@ -125,12 +163,14 @@ def mutate(
     action: str,
     target: tuple[str, str],
     reason: Optional[str] = None,
+    before: Optional[dict] = None,
 ):
     """Run a mutation, log it, evict the cache it invalidates.
 
-    Raises ValueError before touching anything when a reason is required and
-    missing — the caller should have returned 422, and failing here is the
-    backstop for when it forgot.
+    `before` is a parameter rather than an attribute set inside the block,
+    because the audit row has to be INSERTed before the mutation runs — see the
+    module docstring. There is no point in the block at which this file could
+    read it otherwise.
     """
     target_type, target_id = target
 
@@ -140,13 +180,39 @@ def mutate(
             f"Reject the request with 422 rather than calling mutate()."
         )
 
+    # Written into the caller's OPEN transaction, uncommitted. The service
+    # mutator's own db.commit() is what persists this row, together with the
+    # change it describes.
+    db.execute(
+        text("""
+            INSERT INTO admin_audit_log
+                (admin_user_id, actor_email, action, target_type, target_id,
+                 before_json, reason, ip)
+            VALUES
+                (:uid, :email, :action, :ttype, :tid, :before, :reason, :ip)
+        """),
+        {
+            "uid": actor.admin_user_id,
+            "email": actor.email,
+            "action": action,
+            "ttype": target_type,
+            "tid": str(target_id),
+            "before": _json(before),
+            "reason": (reason or None),
+            "ip": actor.ip,
+        },
+    )
+    # Read now, on this connection, while it is still the last insert. Reading
+    # it after the service has run would return whatever IT last inserted.
+    audit_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+
     ctx = MutationContext()
     try:
         yield ctx
     except Exception:
-        # The mutation failed. Roll back so no half-change survives, and write
-        # NO audit row: this log is a record of what happened, and an entry for
-        # a change that did not happen is worse than no entry.
+        # Roll back: discards the audit row and any uncommitted part of the
+        # mutation. A change that did not happen must not leave a log entry
+        # saying it did.
         _safe_rollback(db)
         logger.exception(
             "admin audit: %s on %s/%s FAILED for %s — rolled back, nothing logged",
@@ -155,59 +221,38 @@ def mutate(
         raise
 
     if not ctx.evict_was_set:
-        _safe_rollback(db)
-        raise RuntimeError(
-            f"'{action}' finished without setting m.evict, so the mutation was "
-            f"rolled back.\n"
-            f"auth_cache holds a resolved context for 300s and eviction is the "
-            f"caller's job: every tenancy_service/licensing_service mutator "
-            f"returns 'key_hashes' for this. Set m.evict = result['key_hashes'], "
-            f"or m.evict = [] if this action genuinely has no cached state "
-            f"behind it."
+        # NOT recoverable by rollback: the service committed, so the change is
+        # live and so is the audit row. Loud rather than silent, and the message
+        # says the change stands — an operator who reads "failed" and retries
+        # would apply it twice.
+        logger.critical(
+            "admin audit: %s on %s/%s set neither m.result nor m.evict. The "
+            "mutation is COMMITTED and cached auth contexts were NOT evicted, "
+            "so it will not take effect for up to 300s. Set m.result to the "
+            "service's return value, or m.evict = [] if this action has no "
+            "cached state behind it.",
+            action, target_type, target_id,
         )
 
-    # The audit row goes in the SAME transaction as the mutation the caller just
-    # made. If this INSERT fails, the mutation goes with it — an unlogged
-    # disable is worse than a failed one.
-    db.execute(
-        text("""
-            INSERT INTO admin_audit_log
-                (admin_user_id, actor_email, action, target_type, target_id,
-                 before_json, after_json, reason, evicted, ip)
-            VALUES
-                (:uid, :email, :action, :ttype, :tid,
-                 :before, :after, :reason, :evicted, :ip)
-        """),
-        {
-            "uid": actor.admin_user_id,
-            "email": actor.email,
-            "action": action,
-            "ttype": target_type,
-            "tid": str(target_id),
-            "before": _json(ctx.before),
-            "after": _json(ctx.after),
-            "reason": (reason or None),
-            # Written as NULL now and updated after the eviction below, because
-            # the honest number is not known until the cache has been told.
-            "evicted": None,
-            "ip": actor.ip,
-        },
-    )
-    audit_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
-    db.commit()
+    # Ensure the audit row is durable even if the service somehow did not
+    # commit. A no-op when it did.
+    try:
+        db.commit()
+    except Exception:
+        _safe_rollback(db)
+        logger.exception("admin audit: commit failed after %s", action)
+        raise
 
     # AFTER the commit, never before. auth_cache repopulates from whatever the
     # database says at the moment it is asked, so evicting first races the
-    # commit and can pull the PRE-change row straight back into the cache — a
-    # correct-looking eviction that restores exactly what it was meant to clear.
+    # commit and can pull the PRE-change row straight back into the cache.
     evicted = 0
     if ctx.evict:
         try:
             evicted = auth_cache.invalidate_many(ctx.evict)
         except Exception:
             # Redis being down must not undo a committed mutation. Loud, because
-            # the write IS live and the cache is not: up to 300 seconds of stale
-            # authorisation, and this line is the only warning anyone gets.
+            # the write IS live and the cache is not.
             logger.exception(
                 "admin audit: %s on %s/%s COMMITTED but eviction FAILED for %d "
                 "key(s). Cached contexts stay valid for up to 300s.",
@@ -217,15 +262,16 @@ def mutate(
 
     try:
         db.execute(
-            text("UPDATE admin_audit_log SET evicted = :n WHERE id = :id"),
-            {"n": evicted, "id": audit_id},
+            text("UPDATE admin_audit_log SET after_json = :after, evicted = :n WHERE id = :id"),
+            {"after": _json(ctx.after), "n": evicted if ctx.evict_was_set else None,
+             "id": audit_id},
         )
         db.commit()
     except Exception:
-        # A missing count is a blemish on a row that is otherwise correct. Never
-        # let it undo the mutation.
+        # A missing after-snapshot is a blemish on a row that is otherwise
+        # correct. Never let it undo the mutation.
         _safe_rollback(db)
-        logger.exception("admin audit: could not record eviction count on row %s", audit_id)
+        logger.exception("admin audit: could not complete row %s", audit_id)
 
     if ctx.evict and evicted == 0:
         # Asked to forget specific keys and forgot none. Either they had already
