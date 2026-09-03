@@ -1,0 +1,66 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --line: #262b36;
+  --text: #e6e8ee;
+  --muted: #8b93a7;
+  --accent: #4f8cff;
+  --danger: #ff6b6b;
+  --warn: #ffb648;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.center { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 24px;
+  width: 100%;
+  max-width: 380px;
+}
+h1 { font-size: 18px; margin: 0 0 4px; }
+.muted { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
+input {
+  width: 100%; padding: 9px 11px; border-radius: 6px;
+  border: 1px solid var(--line); background: #0d0f14; color: var(--text);
+  font: inherit;
+}
+input:focus { outline: none; border-color: var(--accent); }
+button {
+  width: 100%; margin-top: 18px; padding: 10px; border: 0; border-radius: 6px;
+  background: var(--accent); color: #fff; font: inherit; font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { opacity: .55; cursor: not-allowed; }
+.err {
+  margin-top: 14px; padding: 9px 11px; border-radius: 6px; font-size: 13px;
+  background: rgba(255,107,107,.12); border: 1px solid rgba(255,107,107,.3);
+  color: var(--danger);
+}
+.banner {
+  padding: 9px 14px; font-size: 13px;
+  background: rgba(255,182,72,.12); border-bottom: 1px solid rgba(255,182,72,.3);
+  color: var(--warn);
+}
+.topbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.spacer { flex: 1; }
+.pill {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted); text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.linkbtn {
+  width: auto; margin: 0; padding: 6px 12px; background: transparent;
+  border: 1px solid var(--line); color: var(--muted); font-weight: 500;
+}
+main { padding: 24px; }

@@ -10,3 +10,9 @@ __pycache__
 /venv
 /logs
 /init
+# Admin console build output — produced on the server by the
+# admin-ui-build compose service, never committed. Committing it would mean
+# every build shows as a diff of minified bundles and the tree could disagree
+# with what is actually deployed.
+backend/app/static/admin/
+admin-ui/node_modules/

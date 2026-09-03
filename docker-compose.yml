@@ -103,6 +103,55 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ── Admin console build (Phase 7) ──────────────────────────────────────────
+  #
+  # ONE-SHOT. Never runs as part of the stack:
+  #
+  #     docker compose --profile build run --rm admin-ui-build
+  #
+  # `profiles` is what makes that true. Without it, `docker compose up -d` would
+  # start a Node container alongside the API on every deploy — on a box with
+  # ~690 MB of free RAM, next to a live uvicorn.
+  #
+  # It compiles admin-ui/ into backend/app/static/admin/, which the API serves
+  # as static files. Nothing about the api image changes: no Dockerfile edit, no
+  # rebuild, and the API keeps deploying by `git pull` exactly as it does today.
+  admin-ui-build:
+    image: node:20-alpine
+    container_name: admin_ui_build
+    profiles: ["build"]
+    working_dir: /app/admin-ui
+    volumes:
+      - .:/app
+      # NAMED VOLUME, and this one is load-bearing rather than an optimisation.
+      #
+      # It shadows admin-ui/node_modules so the ~30k files npm installs live in
+      # Docker's storage instead of the bind-mounted repo. uvicorn runs with
+      # --reload and its watcher walks that tree; dropping a node_modules into
+      # it would burn inotify watches and CPU on a 2 GB box permanently, not
+      # just during the build. It also keeps `git status` honest and survives
+      # between builds, so a re-run is an `npm ci` against a warm cache.
+      - admin_ui_node_modules:/app/admin-ui/node_modules
+    environment:
+      # The build is the memory-hungry step and it is sharing 1,967 MB with a
+      # live API, MySQL, Qdrant and Redis. Capping the heap makes Vite spill to
+      # swap (2 GB, 1.4 GB free) rather than get OOM-killed halfway through and
+      # leave a half-written bundle in static/admin.
+      NODE_OPTIONS: "--max-old-space-size=768"
+      CI: "true"
+    # Hard ceiling so a runaway build cannot starve uvicorn. Docker gives an
+    # equal amount of swap on top by default, which is the headroom that makes
+    # the cap safe rather than a new failure mode.
+    mem_limit: 1g
+    command: sh -lc "npm ci --no-audit --no-fund && npm run build"
+    # No healthcheck, no restart policy: this exits, and an exit code of 0 is
+    # the whole result. `restart: unless-stopped` here would loop the build.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
   phpmyadmin:
     image: phpmyadmin:latest
     container_name: phpmyadmin
@@ -129,6 +178,7 @@ volumes:
   qdrant_data:
   mysql_data:
   redis_data:
+  admin_ui_node_modules:
 
 networks:
   backend:

@@ -1,5 +1,7 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 
@@ -135,3 +137,56 @@ async def _licence_denied_handler(request, exc: LicenceDenied):
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Semantic Search API is running"}
+
+
+# ── Admin console SPA (ADMIN_CONSOLE_PLAN.md §10.4) ─────────────────────────
+#
+# REGISTERED LAST, AND THAT IS NOT A STYLE CHOICE. The catch-all below matches
+# /admin/<anything>; FastAPI resolves routes in registration order, so anything
+# declared after it that shares a prefix becomes unreachable. Every /api route
+# is declared above, which is what keeps them answering JSON instead of being
+# handed index.html — a failure that looks like "the whole console broke at
+# once" and reads as a frontend bug.
+#
+# The directory only exists after the build has run:
+#     docker compose --profile build run --rm admin-ui-build
+# so both the mount and the routes are conditional. A backend deployed without
+# a built frontend serves the API exactly as before and answers /admin with a
+# 503 that says what to run, rather than crashing at import time on a missing
+# directory.
+_ADMIN_DIST = Path(__file__).resolve().parent / "static" / "admin"
+_ADMIN_INDEX = _ADMIN_DIST / "index.html"
+
+# Created rather than checked. The mount is evaluated ONCE at import, and
+# static files do not trigger uvicorn's --reload (it filters to *.py) — so a
+# conditional mount that found no directory at boot would stay missing after the
+# build ran, serving index.html with every asset 404ing until someone restarted
+# the container. An empty directory mounts fine and 404s until the files land.
+(_ADMIN_DIST / "assets").mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/admin/assets",
+    StaticFiles(directory=str(_ADMIN_DIST / "assets")),
+    name="admin-assets",
+)
+
+
+@app.get("/admin")
+@app.get("/admin/{path:path}")
+def admin_spa(path: str = ""):
+    """Serve the SPA shell for every /admin route.
+
+    Client-side routing means /admin/tenants/abc is a real URL the user can
+    bookmark and reload, but the server has no such route — it returns the shell
+    and React Router reads the path. That is also why this cannot 404 on unknown
+    paths: it has no way to tell a mistyped URL from a route it does not know
+    about, and the SPA renders its own not-found.
+    """
+    if not _ADMIN_INDEX.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The admin console has not been built. Run: "
+                "docker compose --profile build run --rm admin-ui-build"
+            ),
+        )
+    return FileResponse(str(_ADMIN_INDEX))
