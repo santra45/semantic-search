@@ -21,6 +21,7 @@ previews rather than one /disable that guesses.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -145,6 +146,44 @@ def _snap_product(db: Session, code: str) -> dict:
                  {"code": code})
 
 
+@contextlib.contextmanager
+def service_errors():
+    """Turn a service's refusal into the status code it deserves.
+
+    tenancy_service and licensing_service raise ValueError for "you asked for
+    something incoherent" and LookupError for "no such id". Left alone both
+    become a 500, which tells an operator the console is broken when in fact
+    they were told something useful and specific — set_subscription_status'
+    "Activating a trial needs the plan they bought. Call set_subscription_plan
+    instead" is better guidance than anything this layer would write, and it
+    should reach the screen rather than the log.
+
+    Wraps mutate() from OUTSIDE, so mutate has already rolled back and logged by
+    the time this converts the exception.
+    """
+    try:
+        yield
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _resumed_status(plan: Optional[str]) -> str:
+    """The status a paused subscription should return to.
+
+    NOT a hardcoded 'active'. status and plan are coupled: the service refuses
+    to make a trial-plan subscription active, because doing so would bill a
+    paying customer against trial limits and there is no defensible way to guess
+    which plan they actually bought. So a subscription still on the trial plan
+    resumes to 'trial'; one on a paid plan resumes to 'active'.
+
+    Found by a 500 in testing, not by reading — the first version sent every
+    resume to 'active' and worked only for subscriptions that had been upgraded.
+    """
+    return "trial" if (plan or catalog.TRIAL_MODULE_PLAN) == catalog.TRIAL_MODULE_PLAN else "active"
+
+
 def _licence_event(db: Session, *, licence_id: str, subscription_id: str,
                    event: str, key_prefix: Optional[str], actor: AdminActor,
                    detail: Optional[str] = None) -> None:
@@ -249,7 +288,7 @@ def disable_client(
 ):
     if not _snap_client(db, client_id):
         raise HTTPException(status_code=404, detail="No such tenant.")
-    with mutate(db, actor, action="client.disable", target=("client", client_id),
+    with service_errors(), mutate(db, actor, action="client.disable", target=("client", client_id),
                 reason=body.reason, before=_snap_client(db, client_id)) as m:
         m.result = tenancy_service.set_client_active(db, client_id, False)
         m.after = _snap_client(db, client_id)
@@ -265,7 +304,7 @@ def enable_client(
 ):
     if not _snap_client(db, client_id):
         raise HTTPException(status_code=404, detail="No such tenant.")
-    with mutate(db, actor, action="client.enable", target=("client", client_id),
+    with service_errors(), mutate(db, actor, action="client.enable", target=("client", client_id),
                 reason=body.reason, before=_snap_client(db, client_id)) as m:
         m.result = tenancy_service.set_client_active(db, client_id, True)
         m.after = _snap_client(db, client_id)
@@ -283,7 +322,7 @@ def disable_site(
 ):
     if not _snap_site(db, site_id):
         raise HTTPException(status_code=404, detail="No such site.")
-    with mutate(db, actor, action="site.disable", target=("site", site_id),
+    with service_errors(), mutate(db, actor, action="site.disable", target=("site", site_id),
                 reason=body.reason, before=_snap_site(db, site_id)) as m:
         m.result = tenancy_service.set_site_active(db, site_id, False)
         m.after = _snap_site(db, site_id)
@@ -299,7 +338,7 @@ def enable_site(
 ):
     if not _snap_site(db, site_id):
         raise HTTPException(status_code=404, detail="No such site.")
-    with mutate(db, actor, action="site.enable", target=("site", site_id),
+    with service_errors(), mutate(db, actor, action="site.enable", target=("site", site_id),
                 reason=body.reason, before=_snap_site(db, site_id)) as m:
         m.result = tenancy_service.set_site_active(db, site_id, True)
         m.after = _snap_site(db, site_id)
@@ -344,7 +383,7 @@ def set_site_index_plan(
                    f"over its ceiling. Reduce the catalogue first.",
         )
 
-    with mutate(db, actor, action="site.index_plan", target=("site", site_id),
+    with service_errors(), mutate(db, actor, action="site.index_plan", target=("site", site_id),
                 reason=body.reason, before=site) as m:
         m.result = tenancy_service.set_index_plan(db, site_id, body.index_plan)
         m.after = _snap_site(db, site_id)
@@ -384,7 +423,7 @@ def promote_site(
         WHERE s.site_id = :id AND l.is_active = 1
     """, {"id": site_id}))
 
-    with mutate(db, actor, action="site.environment", target=("site", site_id),
+    with service_errors(), mutate(db, actor, action="site.environment", target=("site", site_id),
                 reason=body.reason, before=site) as m:
         m.result = tenancy_service.set_site_environment(db, site_id, body.environment)
         m.after = _snap_site(db, site_id)
@@ -428,7 +467,7 @@ def create_subscription(
     if body.status:
         kwargs["status"] = body.status
 
-    with mutate(db, actor, action="subscription.create",
+    with service_errors(), mutate(db, actor, action="subscription.create",
                 target=("subscription", f"{body.site_id}:{body.product_code}"),
                 before=None) as m:
         result = licensing_service.create_subscription(db, **kwargs)
@@ -458,7 +497,7 @@ def pause_subscription(
     if not before:
         raise HTTPException(status_code=404, detail="No such subscription.")
 
-    with mutate(db, actor, action="subscription.pause",
+    with service_errors(), mutate(db, actor, action="subscription.pause",
                 target=("subscription", subscription_id),
                 reason=body.reason, before=before) as m:
         m.result = licensing_service.set_subscription_status(db, subscription_id, "suspended")
@@ -480,10 +519,11 @@ def resume_subscription(
     before = _snap_subscription(db, subscription_id)
     if not before:
         raise HTTPException(status_code=404, detail="No such subscription.")
-    with mutate(db, actor, action="subscription.resume",
+    target_status = _resumed_status(before.get("plan"))
+    with service_errors(), mutate(db, actor, action="subscription.resume",
                 target=("subscription", subscription_id),
                 reason=body.reason, before=before) as m:
-        m.result = licensing_service.set_subscription_status(db, subscription_id, "active")
+        m.result = licensing_service.set_subscription_status(db, subscription_id, target_status)
         # Cleared on resume: a stale reason would otherwise keep showing in the
         # merchant's storefront after the module came back.
         db.execute(
@@ -491,7 +531,7 @@ def resume_subscription(
             {"id": subscription_id},
         )
         m.after = _snap_subscription(db, subscription_id)
-    return {"success": True, "subscription_id": subscription_id, "status": "active"}
+    return {"success": True, "subscription_id": subscription_id, "status": target_status}
 
 
 @router.patch("/subscriptions/{subscription_id}/plan")
@@ -511,7 +551,7 @@ def set_subscription_plan(
             detail=f"Unknown module plan '{body.plan}'. "
                    f"Expected one of: {', '.join(catalog.MODULE_PLANS)}.",
         )
-    with mutate(db, actor, action="subscription.plan",
+    with service_errors(), mutate(db, actor, action="subscription.plan",
                 target=("subscription", subscription_id),
                 reason=body.reason, before=before) as m:
         m.result = licensing_service.set_subscription_plan(db, subscription_id, body.plan)
@@ -551,7 +591,7 @@ def set_subscription_term(
     else:
         expires_at = body.expires_at
 
-    with mutate(db, actor, action="subscription.term",
+    with service_errors(), mutate(db, actor, action="subscription.term",
                 target=("subscription", subscription_id),
                 reason=body.reason, before=before) as m:
         m.result = licensing_service.set_subscription_term(db, subscription_id, expires_at)
@@ -583,7 +623,7 @@ def issue_licence(
 
     existing = [l for l in licensing_service.list_licences(db, subscription_id) if l["is_active"]]
 
-    with mutate(db, actor,
+    with service_errors(), mutate(db, actor,
                 action="licence.rotate" if existing else "licence.issue",
                 target=("subscription", subscription_id),
                 reason=body.reason,
@@ -654,7 +694,7 @@ def revoke_licence(
             detail="confirm_prefix does not match this licence's prefix.",
         )
 
-    with mutate(db, actor, action="licence.revoke", target=("licence", licence_id),
+    with service_errors(), mutate(db, actor, action="licence.revoke", target=("licence", licence_id),
                 reason=body.reason, before=before) as m:
         m.result = licensing_service.revoke_licence(db, licence_id)
         _licence_event(db, licence_id=licence_id,
@@ -694,7 +734,7 @@ def withdraw_product(
                    f"subscriptions ({affected}). Read the blast radius first.",
         )
 
-    with mutate(db, actor, action="product.withdraw", target=("product", code),
+    with service_errors(), mutate(db, actor, action="product.withdraw", target=("product", code),
                 reason=body.reason, before=before) as m:
         db.execute(text("UPDATE products SET is_sellable = 0 WHERE code = :c"), {"c": code})
         m.after = _snap_product(db, code)
@@ -716,7 +756,7 @@ def restore_product(
     before = _snap_product(db, code)
     if not before:
         raise HTTPException(status_code=404, detail="No such product.")
-    with mutate(db, actor, action="product.restore", target=("product", code),
+    with service_errors(), mutate(db, actor, action="product.restore", target=("product", code),
                 reason=body.reason, before=before) as m:
         db.execute(text("UPDATE products SET is_sellable = 1 WHERE code = :c"), {"c": code})
         m.after = _snap_product(db, code)
