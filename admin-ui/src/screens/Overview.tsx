@@ -94,7 +94,7 @@ function EstateStrip({ coverage }: { coverage: OverviewData["coverage"] }) {
         <span className="eyebrow">Telemetry coverage</span>
         <span className="ov-strip-count">
           <strong>{sites_reporting}</strong>
-          <span className="ov-strip-of">of {sites_total}</span>
+          <span className="ov-strip-of">{" "}of {sites_total}{" "}</span>
           <span className="ov-strip-word">sites reporting</span>
         </span>
       </div>
@@ -161,9 +161,9 @@ function Totals({ data }: { data: OverviewData }) {
       />
       <Figure label="Tokens" value={num(totals.tokens)} />
       <Figure
-        label="Estate"
+        label="Live licences"
         value={num(estate.licences)}
-        foot={`live licences · ${num(estate.subscriptions)} subscriptions · ${num(estate.clients)} clients`}
+        foot={`${num(estate.subscriptions)} subscriptions · ${num(estate.clients)} clients`}
       />
       {!quota_enforced && (
         <p className="ov-quota">
