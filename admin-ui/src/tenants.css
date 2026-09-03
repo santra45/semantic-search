@@ -82,7 +82,10 @@
    as absence, which is the fact. */
 .tn-row.is-dark .tn-rail {
   background-image: repeating-linear-gradient(
-    -45deg, transparent 0 3px, rgba(255,255,255,.14) 3px 4px);
+    -45deg, transparent 0 3px, rgba(255,255,255,.24) 3px 4px);
+  /* An inset edge so an unlit rail reads as a channel with nothing in it,
+     rather than as a row that simply lacks a border. */
+  box-shadow: inset 1px 0 0 rgba(255,255,255,.05);
 }
 
 /* Disabled tenants are dimmed but never hidden. */

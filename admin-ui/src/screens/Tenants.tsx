@@ -154,7 +154,13 @@ export function Tenants() {
               <span className="eyebrow tn-r">Spend</span>
             </div>
 
-            {data.tenants.map((t) => <Row key={t.client_id} t={t} />)}
+            {/* A badge on every single row teaches nothing. When the whole list is
+                development — which is every list today — the tag is pure
+                repetition; it only becomes information once there is something
+                to contrast it with. */}
+            {data.tenants.map((t) => (
+              <Row key={t.client_id} t={t} mixed={hasProduction(data.tenants)} />
+            ))}
           </div>
 
           <div className="tn-foot">
@@ -178,7 +184,12 @@ export function Tenants() {
   );
 }
 
-function Row({ t }: { t: Tenant }) {
+/** Does this page hold at least one production tenant? */
+function hasProduction(tenants: Tenant[]): boolean {
+  return tenants.some((t) => t.environments.includes("production"));
+}
+
+function Row({ t, mixed }: { t: Tenant; mixed: boolean }) {
   // null means the tenant produces no ledger rows at all — a v1 key resolves no
   // v2 context, so nothing is recorded. Distinct from 0, which is a real
   // measurement of no traffic, and the rail is what carries that distinction
@@ -201,12 +212,16 @@ function Row({ t }: { t: Tenant }) {
       <span className="tn-who">
         <span className="tn-name">
           {t.name}
-          {/* Disabled tenants stay VISIBLE and greyed rather than being filtered
-              out — a tenant that vanishes from the list is one nobody
-              remembers to turn back on. */}
-          {!t.is_active && <span className="pill pill-bad">disabled</span>}
-          {t.environments.length === 1 && t.environments[0] === "development" && (
-            <span className="pill pill-muted">dev</span>
+          {/* {" "} before every pill, deliberately. Flex gap separates them
+              visually but not textually — without it a screen reader and a
+              copy-paste both get "Fuel Transferdev". */}
+          {!t.is_active && <>{" "}<span className="pill pill-bad">disabled</span></>}
+          {t.environments.includes("production") && (
+            <>{" "}<span className="pill pill-ok">prod</span></>
+          )}
+          {/* Only when the list has something to contrast against. */}
+          {mixed && t.environments.includes("development") && (
+            <>{" "}<span className="pill pill-muted">dev</span></>
           )}
         </span>
         <span className="tn-email">{t.email}</span>
