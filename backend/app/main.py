@@ -65,9 +65,17 @@ app.include_router(operator.router)
 # tenant, which at module scope is exactly what it would do. Admin routes go
 # missing (404); merchants notice nothing.
 try:
-    from backend.app.admin import router_auth as admin_router_auth
+    from backend.app.admin import (
+        router_auth as admin_router_auth,
+        router_licences as admin_router_licences,
+        router_tenants as admin_router_tenants,
+        router_usage as admin_router_usage,
+    )
 
     app.include_router(admin_router_auth.router)
+    app.include_router(admin_router_tenants.router)
+    app.include_router(admin_router_licences.router)
+    app.include_router(admin_router_usage.router)
 except Exception as _admin_exc:  # pragma: no cover
     import logging
 
