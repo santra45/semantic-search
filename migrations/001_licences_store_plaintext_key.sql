@@ -53,26 +53,16 @@ PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 -- That is a real loss, it is small, and it ends the moment those licences are
 -- reissued (ADMIN_CONSOLE_PLAN.md §4.1). Printing the mapping first means it
 -- costs a scrollback search rather than being gone. Keep this output.
-
-SELECT
-  l.id            AS licence_id,
-  l.key_prefix    AS label_being_dropped,
-  s.product_code  AS product,
-  si.domain       AS domain,
-  l.is_active     AS active
-FROM licences l
-JOIN subscriptions s ON s.id = l.subscription_id
-JOIN sites si        ON si.id = s.site_id
-WHERE l.licence_key IS NULL
-ORDER BY si.domain, s.product_code;
-
--- ── 3. Drop the prefix column ────────────────────────────────────────────────
 --
--- Separate guard rather than one combined ALTER: on a re-run after a partial
--- failure the two halves may legitimately be in different states, and a single
--- statement would then either skip the outstanding half or error on the done
--- one. Everything that displayed this value now derives it from the plaintext
--- via license_key.prefix_of().
+-- ITSELF GUARDED, and it was not on the first pass — which is precisely how the
+-- omission was found. A bare SELECT naming key_prefix is fine the first time
+-- and dies with "Unknown column" on every run after the drop, so this file
+-- claimed to be idempotent while having exactly one statement that was not.
+-- The ALTERs were guarded and the diagnostic reading the column was not.
+--
+-- The lesson generalises to every migration here: idempotency has to cover
+-- EVERY statement, not just the ones that change something. A read of a column
+-- the same file drops is as fragile as the drop.
 
 SET @prefix_exists := (
   SELECT COUNT(*) FROM information_schema.COLUMNS
@@ -80,6 +70,29 @@ SET @prefix_exists := (
     AND TABLE_NAME   = 'licences'
     AND COLUMN_NAME  = 'key_prefix'
 );
+
+SET @sql := IF(@prefix_exists = 1,
+  'SELECT
+     l.id            AS licence_id,
+     l.key_prefix    AS label_being_dropped,
+     s.product_code  AS product,
+     si.domain       AS domain,
+     l.is_active     AS active
+   FROM licences l
+   JOIN subscriptions s ON s.id = l.subscription_id
+   JOIN sites si        ON si.id = s.site_id
+   WHERE l.licence_key IS NULL
+   ORDER BY si.domain, s.product_code',
+  'SELECT ''key_prefix already dropped - nothing left to report'' AS note'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- ── 3. Drop the prefix column ────────────────────────────────────────────────
+--
+-- Reuses @prefix_exists from step 2 rather than re-reading information_schema:
+-- the two must agree about whether the column is there, and reading twice is
+-- how they end up disagreeing. Everything that displayed this value now derives
+-- it from the plaintext via license_key.prefix_of().
 
 SET @sql := IF(@prefix_exists = 1,
   'ALTER TABLE `licences` DROP COLUMN `key_prefix`',
