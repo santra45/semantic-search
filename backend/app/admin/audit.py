@@ -260,11 +260,21 @@ def mutate(
             )
             evicted = -1
 
+    # NULL means "this action had no cached state behind it"; 0 means "it had
+    # some and forgot none". Those are opposite facts and the column previously
+    # collapsed them: an explicit `m.evict = []` and a mutator that returned
+    # three hashes none of which were evicted both stored 0.
+    #
+    # That made the number unreadable exactly where it matters. 0 is the
+    # five-minute-stale-toggle bug and should be alarming; a create with nothing
+    # cached is routine and should not be. Distinguishing them here is what lets
+    # the audit screen flag one without crying wolf about the other.
+    evicted_recorded = evicted if ctx.evict else None
+
     try:
         db.execute(
             text("UPDATE admin_audit_log SET after_json = :after, evicted = :n WHERE id = :id"),
-            {"after": _json(ctx.after), "n": evicted if ctx.evict_was_set else None,
-             "id": audit_id},
+            {"after": _json(ctx.after), "n": evicted_recorded, "id": audit_id},
         )
         db.commit()
     except Exception:

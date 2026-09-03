@@ -69,12 +69,6 @@ const ACTIONS = [
   "product.withdraw", "product.restore",
 ];
 
-/** Actions where evicting nothing is genuinely fine — they touch no cached
- *  context. Anything else reporting 0 is worth a second look. */
-const NO_CACHE_ACTIONS = new Set([
-  "product.withdraw", "product.restore", "subscription.create",
-]);
-
 export function Audit() {
   const { days } = useFilters();
   const [actor, setActor] = useState("");
@@ -184,9 +178,12 @@ function EntryCard({ e, stale }: { e: Entry; stale: boolean }) {
     }
   }
 
+  // No guessing from the action name: the backend records NULL when there was
+  // nothing cached to forget and 0 only when hashes were handed over and none
+  // were evicted. So a 0 here is unambiguously the stale-toggle bug.
   const evictionProblem =
-    e.evicted === 0 && !NO_CACHE_ACTIONS.has(e.action)
-      ? "evicted nothing — if a key was live, this took up to 5 minutes to bite"
+    e.evicted === 0
+      ? "hashes were handed over and none were evicted — this change did not take effect for up to 5 minutes"
       : e.evicted === -1
       ? "the eviction itself failed — the change is live, the cache is not"
       : null;
