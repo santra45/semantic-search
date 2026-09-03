@@ -3,10 +3,13 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useActions } from "../lib/actions";
 import type { Client, Licence, Site, Subscription, TenantDetailData } from "../lib/tenantTypes";
+import type { PlanRung } from "../lib/plans";
 import {
-  openClientDisable, openClientEnable, openIssue, openPause, openPromote,
-  openResume, openSiteDisable, openSiteEnable, type Act,
+  openClientDisable, openClientEnable, openIndexPlanEdit, openIssue, openPause,
+  openPlanEdit, openPromote, openResume, openSiteDisable, openSiteEnable,
+  openTermEdit, type Act,
 } from "./tenantActions";
+import { usePlans } from "../lib/plans";
 import { useCan } from "../lib/session";
 import { useFilters } from "../lib/filters";
 import { ABSENT, cost, num, pct, productLabel, relative, when } from "../lib/format";
@@ -76,6 +79,9 @@ export function TenantDetail() {
   const isOperator = useCan("operator");
   const isOwner = useCan("owner");
   const act = useActions([["tenant", clientId, days], ["tenants"], ["overview"]]);
+  // Fetched once and shared by every plan dropdown on the page, so the two
+  // ladders always offer what catalog.py actually defines.
+  const plans = usePlans();
 
   const { data, isLoading, error } = useQuery<TenantDetailData>({
     queryKey: ["tenant", clientId, days],
@@ -164,6 +170,8 @@ export function TenantDetail() {
             act={act}
             isOperator={isOperator}
             isOwner={isOwner}
+            indexRungs={plans.data?.index_plans ?? []}
+            moduleRungs={plans.data?.module_plans ?? []}
           />
         ))
       )}
@@ -200,11 +208,12 @@ function Fig({ label, value, sub }: { label: string; value: string; sub: string 
 /* ── A store install, with its modules inside it ─────────────────────────── */
 
 function SiteCard({
-  client, site, subs, licences, act, isOperator, isOwner,
+  client, site, subs, licences, act, isOperator, isOwner, indexRungs, moduleRungs,
 }: {
   client: Client; site: Site;
   subs: Subscription[]; licences: Licence[];
   act: Act; isOperator: boolean; isOwner: boolean;
+  indexRungs: PlanRung[]; moduleRungs: PlanRung[];
 }) {
   const parentOff = !client.is_active;
   const off = parentOff || !site.is_active;
@@ -257,6 +266,10 @@ function SiteCard({
 
         {isOperator && (
           <div className="td-site-actions">
+            <button className="td-btn" disabled={!indexRungs.length}
+                    onClick={() => openIndexPlanEdit(act, site, indexRungs)}>
+              Catalogue plan
+            </button>
             {site.is_active ? (
               <button className="td-btn is-danger"
                       disabled={parentOff}
@@ -293,6 +306,7 @@ function SiteCard({
                 (l) => l.product_code === sub.product_code && l.domain === site.domain,
               )}
               act={act}
+              moduleRungs={moduleRungs}
               // A pause button under a suspended customer would suggest the
               // module is what is holding things up. Disabled, with the reason
               // in the tooltip, rather than hidden — hiding it would make the
@@ -311,11 +325,12 @@ function SiteCard({
 /* ── One module on one store ─────────────────────────────────────────────── */
 
 function SubRow({
-  sub, licences, state, act, parentOff, isOperator, isOwner,
+  sub, licences, state, act, parentOff, isOperator, isOwner, moduleRungs,
 }: {
   sub: Subscription; licences: Licence[];
   state: ReturnType<typeof effectiveState>;
   act: Act; parentOff: boolean; isOperator: boolean; isOwner: boolean;
+  moduleRungs: PlanRung[];
 }) {
   const live = licences.filter((l) => l.is_active);
   const expiring = live.find(
@@ -365,6 +380,17 @@ function SubRow({
 
       {(isOperator || isOwner) && (
         <span className="td-sub-actions">
+          {isOperator && (
+            <>
+              <button className="td-btn" disabled={!moduleRungs.length}
+                      onClick={() => openPlanEdit(act, sub, moduleRungs)}>
+                Plan
+              </button>
+              <button className="td-btn" onClick={() => openTermEdit(act, sub)}>
+                Extend
+              </button>
+            </>
+          )}
           {isOperator && (sub.status === "active" || sub.status === "trial" ? (
             <button className="td-btn is-danger" disabled={parentOff}
                     title={parentOff ? "A parent scope is already suspended" : undefined}

@@ -38,12 +38,12 @@ export function useActions(invalidateKeys: unknown[][]) {
   /** Describe the action, and what to do when it succeeds. */
   function open(
     config: Omit<ConfirmConfig, "onConfirm">,
-    perform: (reason: string) => Promise<ActionResult>,
+    perform: (reason: string, values: Record<string, string>) => Promise<ActionResult>,
   ) {
     setSheet({
       ...config,
-      onConfirm: async (reason) => {
-        const result = await perform(reason);
+      onConfirm: async (reason, values) => {
+        const result = await perform(reason, values);
         refresh();
         toast.push({
           kind: "success",

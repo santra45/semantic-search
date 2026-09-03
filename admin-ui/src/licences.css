@@ -1,0 +1,104 @@
+/* Licences list. Prefixed .lc-.
+ *
+ * Cards rather than a grid table: a key carries five facts of different shapes
+ * (identity, owner, dates, activity, controls) and forcing them into equal
+ * columns made the prefix — the thing you scan for — no more prominent than the
+ * date beside it. */
+
+.lc { display: flex; flex-direction: column; gap: 12px; }
+
+.lc-controls {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; padding: 10px 12px;
+}
+.lc-search {
+  flex: 1 1 240px; min-width: 190px; margin: 0;
+  font-family: var(--mono); font-size: 12.5px;
+}
+.lc-controls select { width: auto; margin: 0; font-size: 12.5px; padding: 8px 10px; }
+
+.lc-note { margin: 0; font-size: 12px; color: var(--ash); padding: 0 2px; }
+.lc-none { margin: 0; padding: 6px 2px; font-size: 13px; color: var(--ash); }
+
+.lc-table {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; overflow: hidden; transition: opacity .12s ease;
+}
+.lc-table.is-stale { opacity: .55; }
+
+.lc-row {
+  display: grid;
+  grid-template-columns:
+    9px minmax(190px, 1.5fr) minmax(140px, 1fr) minmax(150px, 1fr) minmax(150px, 1fr) auto;
+  align-items: center; gap: 14px;
+  padding: 12px 16px 12px 12px; border-bottom: 1px solid var(--rule);
+}
+.lc-row:last-child { border-bottom: 0; }
+/* Revoked and expired keys stay listed — a key that vanishes is one nobody can
+   answer a support ticket about. */
+.lc-row.is-dead { opacity: .55; }
+
+.lc-dot { width: 7px; height: 7px; border-radius: 50%; justify-self: center; }
+.lc-dot.is-ok  { background: var(--signal); box-shadow: 0 0 0 3px rgba(94,234,212,.13); }
+.lc-dot.is-bad { background: var(--fault); }
+
+.lc-key { min-width: 0; }
+.lc-prefix {
+  font-family: var(--mono); font-size: 12.5px; color: var(--signal);
+  text-decoration: none;
+}
+.lc-prefix:hover { text-decoration: underline; }
+.lc-where {
+  display: block; font-size: 11px; color: var(--ash); margin-top: 3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.lc-owner { font-size: 12.5px; min-width: 0; }
+.lc-owner a { color: var(--ink); }
+
+.lc-dates { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.lc-when, .lc-seen { font-family: var(--mono); font-size: 10.5px; color: var(--ash); }
+
+.lc-actions { display: flex; gap: 6px; align-items: center; justify-content: flex-end; }
+
+/* A key whose plaintext was never stored: a state, not a failure. */
+.lc-nokey {
+  font-family: var(--mono); font-size: 10px; color: #5A6274;
+  border: 1px dashed var(--rule); border-radius: 3px; padding: 3px 7px;
+  white-space: nowrap;
+}
+.lc-failed { font-size: 11px; color: var(--fault); }
+
+/* Revealed. Bordered in signal so it is obviously the sensitive thing on the
+   row, and never wider than its column — a key that reflows the table draws
+   the eye of everyone in the room. */
+.lc-shown { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.lc-shown code {
+  font-family: var(--mono); font-size: 11px; color: var(--ink);
+  background: var(--void); border: 1px solid rgba(94,234,212,.35);
+  border-radius: 4px; padding: 4px 8px;
+  max-width: 260px; overflow-x: auto; white-space: nowrap;
+}
+
+.lc-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  font-family: var(--mono); font-size: 11.5px; color: var(--ash); padding: 0 2px;
+}
+.lc-pager { display: flex; gap: 6px; }
+
+@media (max-width: 1200px) {
+  .lc-row { grid-template-columns: 9px minmax(180px,1.4fr) minmax(130px,1fr) minmax(140px,1fr) auto; }
+  .lc-seen { display: none; }
+}
+@media (max-width: 900px) {
+  .lc-row {
+    grid-template-columns: 9px 1fr; grid-auto-rows: min-content;
+    gap: 8px 12px; padding: 12px;
+  }
+  .lc-row > :not(.lc-dot) { grid-column: 2; }
+  .lc-dates { flex-direction: row; align-items: center; gap: 8px; }
+  .lc-actions { justify-content: flex-start; flex-wrap: wrap; }
+  .lc-shown code { max-width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) { .lc-table { transition: none; } }

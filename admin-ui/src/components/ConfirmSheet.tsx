@@ -23,6 +23,17 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
  * ────────────────────────────────────────────────────────────────────────────
  */
 
+/** A single form control on the sheet. Deliberately a tiny vocabulary: these
+ *  are confirmations that happen to need one value, not a form builder. */
+export interface SheetField {
+  name: string;
+  label: string;
+  type: "select" | "number";
+  options?: { value: string; label: string }[];
+  value: string;
+  hint?: string;
+}
+
 export interface ConfirmConfig {
   title: string;
   /** Plain description of what happens. Present tense, no "are you sure". */
@@ -36,7 +47,9 @@ export interface ConfirmConfig {
   confirmLabel?: string;
   /** Rendered above the form. Fetch it before opening. */
   blastRadius?: ReactNode;
-  onConfirm: (reason: string) => Promise<unknown>;
+  /** Edits that need a value — a plan, a term. Empty for pure confirmations. */
+  fields?: SheetField[];
+  onConfirm: (reason: string, values: Record<string, string>) => Promise<unknown>;
 }
 
 export function ConfirmSheet({
@@ -44,9 +57,12 @@ export function ConfirmSheet({
 }: { config: ConfirmConfig; onClose: () => void }) {
   const [reason, setReason] = useState("");
   const [typed, setTyped] = useState("");
+  const [values, setValues] = useState<Record<string, string>>(() =>
+    Object.fromEntries((config.fields ?? []).map((f) => [f.name, f.value])),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const firstField = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
+  const firstField = useRef<HTMLTextAreaElement | HTMLInputElement | HTMLSelectElement | null>(null);
   const sheet = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -75,14 +91,19 @@ export function ConfirmSheet({
 
   const reasonOk = !config.reasonRequired || reason.trim().length >= 3;
   const typedOk = !config.confirmText || typed === config.confirmText;
-  const ready = reasonOk && typedOk && !busy;
+  // An edit that has not changed anything is not an edit. Disabling it stops a
+  // no-op write landing in the audit log as though something happened.
+  const changed =
+    !config.fields?.length ||
+    config.fields.some((f) => values[f.name] !== f.value);
+  const ready = reasonOk && typedOk && changed && !busy;
 
   async function run() {
     if (!ready) return;
     setBusy(true);
     setError(null);
     try {
-      await config.onConfirm(reason.trim());
+      await config.onConfirm(reason.trim(), values);
       onClose();
     } catch (e) {
       // The server's own message, verbatim. licensing_service says things like
@@ -106,6 +127,31 @@ export function ConfirmSheet({
         <div className="cs-body">{config.body}</div>
 
         {config.blastRadius && <div className="cs-blast">{config.blastRadius}</div>}
+
+        {config.fields?.map((f, i) => (
+          <label className="cs-field" key={f.name}>
+            <span>{f.label}</span>
+            {f.type === "select" ? (
+              <select
+                ref={i === 0 && !config.reasonRequired
+                  ? (firstField as React.RefObject<HTMLSelectElement>) : undefined}
+                value={values[f.name]}
+                onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
+              >
+                {f.options?.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="number"
+                value={values[f.name]}
+                onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
+              />
+            )}
+            {f.hint && <em className="cs-hint">{f.hint}</em>}
+          </label>
+        ))}
 
         {config.reasonRequired && (
           <label className="cs-field">

@@ -1,7 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api";
 import type { useActions } from "../lib/actions";
-import { num, productLabel } from "../lib/format";
+import { num, productLabel, when } from "../lib/format";
+import { rungLabel, type PlanRung } from "../lib/plans";
 import type { Client, Site, Subscription } from "../lib/tenantTypes";
 
 /**
@@ -274,5 +275,153 @@ function BlastRadius({ path }: { path: string }) {
         <span><strong>{num(data.requests_per_day)}</strong> requests/day</span>
       </div>
     </>
+  );
+}
+
+/* ── Edits ───────────────────────────────────────────────────────────────────
+ *
+ * These carry a value rather than only a confirmation, and the two plan ladders
+ * are deliberately edited from different places: catalogue size lives on the
+ * SITE because a store's modules share one Qdrant collection, request quota
+ * lives on the SUBSCRIPTION because it is bought per module. One combined
+ * "plan" control would silently change the wrong one.
+ */
+
+export function openPlanEdit(act: Act, sub: Subscription, rungs: PlanRung[]) {
+  act.open(
+    {
+      title: `Change the plan for ${productLabel(sub.product_code)}`,
+      verb: "Change plan",
+      fields: [{
+        name: "plan",
+        label: "Request quota — bought per module",
+        type: "select",
+        value: sub.plan,
+        options: rungs.map((r) => ({ value: r.code, label: rungLabel(r) })),
+        hint: "Moving off trial also moves the subscription to active.",
+      }],
+      body: (
+        <>
+          Changes the monthly request allowance on <code>{sub.domain}</code>.
+          Nothing enforces it today — <code>AICHATBOT_QUOTA_ENFORCEMENT</code> is
+          unset — so this records what they bought rather than capping what they
+          can do.
+        </>
+      ),
+    },
+    async (reason, values) => {
+      const r = await api.patch<{ plan: string; request_limit: number }>(
+        `/api/admin/subscriptions/${sub.id}/plan`,
+        { plan: values.plan, reason },
+      );
+      return {
+        message: `${productLabel(sub.product_code)} is now ${r.plan}`,
+        detail: `${r.request_limit.toLocaleString()} requests/mo · still not enforced`,
+      };
+    },
+  );
+}
+
+export function openTermEdit(act: Act, sub: Subscription) {
+  act.open(
+    {
+      title: `Extend ${productLabel(sub.product_code)}`,
+      verb: "Extend term",
+      fields: [{
+        name: "extend_days",
+        label: "Extend by",
+        type: "select",
+        value: "365",
+        options: [
+          { value: "30", label: "30 days" },
+          { value: "90", label: "90 days" },
+          { value: "365", label: "1 year" },
+        ],
+      }],
+      body: (
+        <>
+          Extends from the current expiry, not from today — a term with three
+          months left gains the extension on top rather than restarting the
+          clock and losing them.
+        </>
+      ),
+    },
+    async (reason, values) => {
+      const r = await api.patch<{ expires_at: string | null }>(
+        `/api/admin/subscriptions/${sub.id}/term`,
+        { extend_days: Number(values.extend_days), reason },
+      );
+      return {
+        message: `Extended ${productLabel(sub.product_code)}`,
+        detail: r.expires_at ? `now expires ${when(r.expires_at)}` : undefined,
+      };
+    },
+  );
+}
+
+export function openIndexPlanEdit(act: Act, site: Site, rungs: PlanRung[]) {
+  act.open(
+    {
+      title: `Change the catalogue plan for ${site.domain}`,
+      verb: "Change catalogue plan",
+      fields: [{
+        name: "index_plan",
+        label: "Catalogue size — bought once per store",
+        type: "select",
+        value: site.index_plan,
+        options: rungs.map((r) => ({ value: r.code, label: rungLabel(r) })),
+        hint: `${site.indexed_items.toLocaleString()} items are already indexed.`,
+      }],
+      body: (
+        <>
+          This ceiling <strong>is</strong> enforced — writes past it are refused.
+          A downgrade below what is already indexed will be rejected, because a
+          store sitting over its own ceiling has no clean way out: nothing
+          deletes the catalogue, and every later sync fails a check the merchant
+          cannot act on.
+        </>
+      ),
+    },
+    async (reason, values) => {
+      const r = await api.patch<{ catalogue_limit: number }>(
+        `/api/admin/sites/${site.id}/index-plan`,
+        { index_plan: values.index_plan, reason },
+      );
+      return {
+        message: `${site.domain} is now on ${values.index_plan}`,
+        detail: `ceiling ${r.catalogue_limit.toLocaleString()} items`,
+      };
+    },
+  );
+}
+
+export function openRevoke(act: Act, licence: { id: string; key_prefix: string | null; domain: string; product_code: string }) {
+  act.open(
+    {
+      title: `Revoke ${licence.key_prefix ?? "this key"}`,
+      tone: "danger",
+      verb: "Revoke permanently",
+      reasonRequired: true,
+      confirmText: licence.key_prefix ?? undefined,
+      confirmLabel: "Type the key prefix to confirm",
+      body: (
+        <>
+          <strong>There is no undo.</strong> The key stops working immediately on{" "}
+          <code>{licence.domain}</code> and cannot be re-enabled — a revoked
+          licence stays revoked. If the module needs to keep running, rotate the
+          key instead: that issues a replacement in the same step.
+        </>
+      ),
+    },
+    async (reason) => {
+      await api.post(`/api/admin/licences/${licence.id}/revoke`, {
+        reason,
+        confirm_prefix: licence.key_prefix ?? "",
+      });
+      return {
+        message: `Revoked ${licence.key_prefix ?? "the key"}`,
+        detail: `${productLabel(licence.product_code)} on ${licence.domain} can no longer authenticate.`,
+      };
+    },
   );
 }
