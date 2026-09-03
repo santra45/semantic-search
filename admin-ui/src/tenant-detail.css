@@ -1,0 +1,189 @@
+/* Tenant detail. Prefixed .td-.
+ *
+ * The layout IS the argument: a subscription sits physically inside its site,
+ * which sits inside the client header, because v2's three disable scopes are a
+ * containment and tabs would have flattened it. Indentation and nesting carry
+ * that; nothing else has to explain it. */
+
+.td { display: flex; flex-direction: column; gap: 14px; }
+
+.td-crumb {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--mono); font-size: 11px; color: var(--ash);
+}
+.td-crumb span[aria-hidden] { opacity: .4; }
+
+/* ── Client header ───────────────────────────────────────────────────────── */
+
+.td-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap;
+  background: linear-gradient(180deg, var(--slate) 0%, var(--void) 100%);
+  border: 1px solid var(--rule); border-radius: 10px; padding: 18px 20px;
+}
+/* Suspended is dimmed, never hidden — and the whole card dims, so the state of
+   the OUTERMOST scope is unmissable before reading anything inside it. */
+.td-head.is-off { opacity: .62; border-color: rgba(242,109,109,.3); }
+.td-head-main h1 {
+  font-size: 19px; margin: 0; display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap; font-weight: 600;
+}
+.td-head-meta {
+  margin: 5px 0 0; font-family: var(--mono); font-size: 11.5px; color: var(--ash);
+}
+
+.td-head-figs { display: flex; gap: 28px; margin: 0; }
+.td-fig dt { margin: 0; }
+.td-fig dd {
+  margin: 5px 0 0; font-family: var(--mono); font-size: 20px;
+  color: var(--ink); line-height: 1.1; letter-spacing: -.01em;
+}
+.td-fig dd span {
+  display: block; font-size: 10.5px; color: var(--ash);
+  margin-top: 4px; letter-spacing: 0;
+}
+.td-fig.is-absent dd { color: #4A5162; }
+
+.td-suspended {
+  margin: 0; padding: 11px 14px; border-radius: 8px; font-size: 12.5px;
+  background: rgba(242,109,109,.08); border: 1px solid rgba(242,109,109,.25);
+  color: var(--fault); max-width: 88ch;
+}
+
+/* ── Site card ───────────────────────────────────────────────────────────── */
+
+.td-site {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; overflow: hidden;
+  /* The inset left edge is the containment cue: everything in this card belongs
+     to this store, and the modules below indent from it. */
+  box-shadow: inset 3px 0 0 rgba(94,234,212,.28);
+}
+.td-site.is-off { opacity: .6; box-shadow: inset 3px 0 0 rgba(242,109,109,.35); }
+
+.td-site-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap;
+  padding: 14px 16px 14px 18px; border-bottom: 1px solid var(--rule);
+}
+.td-site-head h2 {
+  font-size: 14.5px; display: flex; align-items: center; gap: 7px;
+  flex-wrap: wrap; font-weight: 600;
+}
+.td-site-meta {
+  margin: 5px 0 0; font-family: var(--mono); font-size: 11px; color: var(--ash);
+}
+.td-site-meta code { color: var(--ash); }
+
+/* ── Catalogue gauge ─────────────────────────────────────────────────────── */
+
+.td-gauge { min-width: 230px; flex: 0 1 300px; }
+.td-gauge-top {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+}
+.td-gauge-num { font-family: var(--mono); font-size: 13px; color: var(--ink); }
+.td-gauge-num span { color: var(--ash); font-size: 11px; }
+.td-gauge-track {
+  height: 6px; background: rgba(255,255,255,.05); border-radius: 3px;
+  margin-top: 8px; overflow: hidden;
+}
+.td-gauge-fill {
+  height: 100%; border-radius: 3px; background: var(--signal); opacity: .75;
+  transition: width .3s ease;
+}
+.td-gauge-fill.is-ember { background: var(--ember); }
+.td-gauge-fill.is-fault { background: var(--fault); }
+.td-gauge-foot {
+  font-family: var(--mono); font-size: 10px; color: var(--ash); margin-top: 6px;
+}
+
+/* ── Subscriptions ───────────────────────────────────────────────────────── */
+
+.td-subs { list-style: none; margin: 0; padding: 0; }
+.td-sub {
+  display: grid;
+  grid-template-columns: 10px minmax(180px, 1.4fr) minmax(140px, 1fr) minmax(150px, 1fr);
+  align-items: center; gap: 14px;
+  padding: 12px 16px 12px 18px; border-bottom: 1px solid var(--rule);
+}
+.td-sub:last-child { border-bottom: 0; }
+.td-sub.is-off { opacity: .6; }
+
+.td-sub-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #39404F; justify-self: center;
+}
+.td-sub-dot.is-live {
+  background: var(--signal); box-shadow: 0 0 0 3px rgba(94,234,212,.13);
+}
+
+.td-sub-name { font-size: 13px; color: var(--ink); min-width: 0; }
+.td-sub-plan {
+  display: block; font-family: var(--mono); font-size: 10.5px;
+  color: var(--ash); margin-top: 4px;
+}
+.td-sub-plan em { color: var(--ember); font-style: normal; }
+
+.td-sub-keys { display: flex; flex-wrap: wrap; gap: 5px; }
+.td-key {
+  font-family: var(--mono); font-size: 10.5px; padding: 3px 7px;
+  border-radius: 3px; border: 1px solid rgba(94,234,212,.3);
+  background: rgba(94,234,212,.07); color: var(--signal); text-decoration: none;
+}
+.td-key:hover { text-decoration: none; background: rgba(94,234,212,.14); }
+/* A key whose plaintext was never stored can never be shown again; the marker
+   says so without a second line of prose on every row. */
+.td-key-nokey { opacity: .55; margin-left: 3px; }
+.td-key.is-none {
+  border: 1px dashed var(--rule); background: transparent; color: #5A6274;
+}
+
+.td-sub-state { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.td-sub-why { font-size: 11px; color: var(--ash); }
+.td-sub-why.is-ember { color: var(--ember); }
+
+.td-nosub, .td-none {
+  margin: 0; padding: 14px 18px; font-size: 12.5px; color: var(--ash); max-width: 70ch;
+}
+.td-none {
+  background: var(--slate); border: 1px solid var(--rule); border-radius: 10px;
+}
+
+/* ── Model spend ─────────────────────────────────────────────────────────── */
+
+.td-panel {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; overflow: hidden;
+}
+.td-panel > header { padding: 12px 16px; border-bottom: 1px solid var(--rule); }
+.td-model {
+  display: grid; grid-template-columns: minmax(160px, 1.6fr) 100px 1fr 1fr 100px;
+  gap: 14px; align-items: center;
+  padding: 10px 16px; border-bottom: 1px solid var(--rule);
+}
+.td-model:last-child { border-bottom: 0; }
+.td-model-name { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+.td-model-prov, .td-model-num {
+  font-family: var(--mono); font-size: 11px; color: var(--ash);
+}
+.td-model-cost {
+  font-family: var(--mono); font-size: 12px; color: var(--ink); text-align: right;
+}
+
+/* ── Narrow ──────────────────────────────────────────────────────────────── */
+
+@media (max-width: 860px) {
+  .td-head-figs { gap: 20px; }
+  .td-sub {
+    grid-template-columns: 10px 1fr;
+    grid-auto-rows: min-content; gap: 8px 14px;
+  }
+  .td-sub > .td-sub-keys, .td-sub > .td-sub-state { grid-column: 2; }
+  .td-sub-state { flex-direction: row; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .td-model { grid-template-columns: 1fr auto; row-gap: 4px; }
+  .td-model-prov, .td-model-num { grid-column: 1; }
+  .td-gauge { flex: 1 1 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .td-gauge-fill { transition: none; }
+}

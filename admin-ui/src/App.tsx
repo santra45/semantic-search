@@ -8,6 +8,7 @@ import { Loading } from "./components/Bits";
 import { Placeholder } from "./screens/Placeholder";
 import { Overview } from "./screens/Overview";
 import { Tenants } from "./screens/Tenants";
+import { TenantDetail } from "./screens/TenantDetail";
 
 /**
  * The shell. Auth gate first, then providers, then routes.
@@ -40,7 +41,7 @@ export function App() {
               <Route element={<Layout />}>
                 <Route index element={<Overview />} />
                 <Route path="tenants" element={<Tenants />} />
-                <Route path="tenants/:clientId" element={<Placeholder title="Tenant detail" />} />
+                <Route path="tenants/:clientId" element={<TenantDetail />} />
                 <Route path="sites/:siteId" element={<Placeholder title="Site detail" />} />
                 <Route path="licences" element={<Placeholder title="Licences" />} />
                 <Route path="licences/:licenceId" element={<Placeholder title="Licence detail" />} />

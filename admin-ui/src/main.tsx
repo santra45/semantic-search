@@ -5,6 +5,7 @@ import { App } from "./App";
 import "./styles.css";
 import "./overview.css";
 import "./tenants.css";
+import "./tenant-detail.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {
