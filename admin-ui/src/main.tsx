@@ -13,6 +13,8 @@ import "./usage.css";
 import "./licence-detail.css";
 import "./products.css";
 import "./plans.css";
+import "./site-detail.css";
+import "./system.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {

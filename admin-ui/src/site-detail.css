@@ -1,0 +1,115 @@
+/* Site detail. Prefixed .sd-.
+ *
+ * The enforced ceiling is solid; the observational quotas are ghosted. Same
+ * data shape, different epistemic status, and the drawing carries it — four
+ * identical bars would imply four identical ceilings, and an operator would
+ * reasonably conclude they had capped something. */
+
+.sd { display: flex; flex-direction: column; gap: 14px; }
+
+.sd-crumb {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-family: var(--mono); font-size: 11px; color: var(--ash);
+}
+.sd-crumb span[aria-hidden] { opacity: .4; }
+
+.sd-head {
+  background: linear-gradient(180deg, var(--slate) 0%, var(--void) 100%);
+  border: 1px solid var(--rule); border-radius: 10px; padding: 18px 20px;
+}
+.sd-head.is-off { opacity: .62; border-color: rgba(242,109,109,.3); }
+.sd-head h1 {
+  font-size: 18px; margin: 0; display: flex; align-items: center;
+  gap: 8px; flex-wrap: wrap; font-weight: 600;
+}
+.sd-meta {
+  margin: 6px 0 0; font-family: var(--mono); font-size: 11.5px; color: var(--ash);
+}
+.sd-collection { margin: 10px 0 0; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.sd-collection code {
+  font-family: var(--mono); font-size: 11px; color: var(--ink);
+  background: var(--void); border: 1px solid var(--rule);
+  border-radius: 4px; padding: 3px 8px; word-break: break-all;
+}
+
+/* ── The one real gauge ──────────────────────────────────────────────────── */
+
+.sd-gauge-card {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; padding: 16px 18px;
+}
+.sd-gauge-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 20px; flex-wrap: wrap; margin-bottom: 12px;
+}
+.sd-gauge-note { margin: 7px 0 0; font-size: 12px; color: var(--ash); max-width: 68ch; }
+.sd-gauge-num { font-family: var(--mono); font-size: 20px; color: var(--ink); }
+.sd-gauge-num span { color: var(--ash); font-size: 13px; }
+
+.sd-track {
+  height: 7px; background: rgba(255,255,255,.05);
+  border-radius: 4px; overflow: hidden;
+}
+.sd-fill { height: 100%; border-radius: 4px; background: var(--signal); opacity: .8; }
+.sd-fill.is-ember { background: var(--ember); }
+.sd-fill.is-fault { background: var(--fault); }
+.sd-gauge-foot {
+  font-family: var(--mono); font-size: 10.5px; color: var(--ash); margin-top: 8px;
+}
+
+/* Ghosted: a limit that RECORDS rather than refuses. Dashed outline and a
+   hatched fill, so it cannot be mistaken at a glance for the gauge above. */
+.sd-track.is-ghost {
+  background: transparent; border: 1px dashed var(--rule); height: 7px;
+}
+.sd-fill.is-ghost {
+  background: repeating-linear-gradient(
+    -45deg, transparent 0 3px, rgba(122,132,150,.4) 3px 4px);
+  opacity: 1;
+}
+
+/* ── Subscriptions ───────────────────────────────────────────────────────── */
+
+.sd-subs-card {
+  background: var(--slate); border: 1px solid var(--rule);
+  border-radius: 10px; overflow: hidden;
+}
+.sd-subs-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--rule);
+}
+.sd-empty { margin: 0; padding: 16px; font-size: 12.5px; color: var(--ash); max-width: 70ch; }
+
+.sd-subs { list-style: none; margin: 0; padding: 0; }
+.sd-sub { padding: 14px 16px; border-bottom: 1px solid var(--rule); }
+.sd-sub:last-child { border-bottom: 0; }
+.sd-sub.is-off { opacity: .6; }
+
+.sd-sub-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sd-sub-name { font-size: 13.5px; color: var(--ink); }
+.sd-sub-plan, .sd-sub-keys {
+  font-family: var(--mono); font-size: 11px; color: var(--ash);
+}
+.sd-sub-keys { margin-left: auto; }
+
+.sd-quota { margin-top: 11px; max-width: 460px; }
+.sd-quota-top {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-bottom: 6px;
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink);
+}
+.sd-quota-top em { font-style: normal; color: var(--ash); }
+.sd-quota-tag {
+  font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ash);
+}
+.sd-quota-none { margin: 7px 0 0; font-size: 11.5px; color: var(--ash); }
+
+.sd-sub-reason {
+  margin: 11px 0 0; padding: 9px 12px; border-radius: 7px;
+  background: var(--void); border: 1px solid var(--rule);
+  font-size: 12.5px; color: var(--ink); max-width: 70ch;
+}
+.sd-sub-reason .eyebrow { display: block; margin-bottom: 5px; }
+.sd-sub-foot {
+  margin: 10px 0 0; font-family: var(--mono); font-size: 10.5px; color: var(--ash);
+}

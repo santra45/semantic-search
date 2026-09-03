@@ -5,7 +5,6 @@ import { MeProvider, useSession, Unauthenticated } from "./lib/session";
 import { FiltersProvider } from "./lib/filters";
 import { ToastProvider } from "./lib/toast";
 import { Loading } from "./components/Bits";
-import { Placeholder } from "./screens/Placeholder";
 import { Overview } from "./screens/Overview";
 import { Tenants } from "./screens/Tenants";
 import { TenantDetail } from "./screens/TenantDetail";
@@ -15,6 +14,8 @@ import { Usage } from "./screens/Usage";
 import { LicenceDetail } from "./screens/LicenceDetail";
 import { Products } from "./screens/Products";
 import { Plans } from "./screens/Plans";
+import { SiteDetail } from "./screens/SiteDetail";
+import { System } from "./screens/System";
 
 /**
  * The shell. Auth gate first, then providers, then routes.
@@ -48,14 +49,14 @@ export function App() {
                 <Route index element={<Overview />} />
                 <Route path="tenants" element={<Tenants />} />
                 <Route path="tenants/:clientId" element={<TenantDetail />} />
-                <Route path="sites/:siteId" element={<Placeholder title="Site detail" />} />
+                <Route path="sites/:siteId" element={<SiteDetail />} />
                 <Route path="licences" element={<Licences />} />
                 <Route path="licences/:licenceId" element={<LicenceDetail />} />
                 <Route path="products" element={<Products />} />
                 <Route path="plans" element={<Plans />} />
                 <Route path="usage" element={<Usage />} />
                 <Route path="audit" element={<Audit />} />
-                <Route path="system" element={<Placeholder title="System health" />} />
+                <Route path="system" element={<System />} />
                 {/* The server hands index.html to ANY /admin/* path — it cannot
                     tell a typo from a route it does not know — so the SPA owns
                     not-found. Redirecting rather than 404-ing, since the only
